@@ -10,8 +10,8 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::events::{DeviceEvent, DeviceEventHandler};
 use crate::protocol::{
-    decode_message, encode_ack, FrameDecoder, Gt06Message, ProtocolError, PROTOCOL_HEARTBEAT,
-    PROTOCOL_LOGIN,
+    decode_message, encode_ack, format_bytes_hex, Frame, FrameDecoder, Gt06Message, ProtocolError,
+    PROTOCOL_HEARTBEAT, PROTOCOL_LOGIN,
 };
 
 pub struct Gt06TcpServer {
@@ -78,6 +78,15 @@ async fn handle_connection(
                         let ack = encode_ack(PROTOCOL_LOGIN, frame.serial);
                         stream.write_all(&ack).await?;
 
+                        if !packet.extra_data.is_empty() {
+                            debug!(
+                                %peer_addr,
+                                imei = %packet.imei,
+                                login_extra_data = %format_bytes_hex(&packet.extra_data),
+                                "login packet included additional bytes"
+                            );
+                        }
+
                         device_id = Some(packet.imei.clone());
                         event_handler
                             .handle_event(DeviceEvent::Login {
@@ -116,17 +125,32 @@ async fn handle_connection(
                             "unsupported GT06 packet ignored"
                         );
                     }
-                    Err(error) => log_protocol_error(peer_addr, &error),
+                    Err(error) => log_protocol_error(peer_addr, Some(&frame), &error),
                 },
                 Ok(None) => break,
                 Err(error) => {
-                    log_protocol_error(peer_addr, &error);
+                    log_protocol_error(peer_addr, None, &error);
                 }
             }
         }
     }
 }
 
-fn log_protocol_error(peer_addr: SocketAddr, error: &ProtocolError) {
-    warn!(%peer_addr, error = %error, "failed to process GT06 packet");
+fn log_protocol_error(peer_addr: SocketAddr, frame: Option<&Frame>, error: &ProtocolError) {
+    match frame {
+        Some(frame) => {
+            warn!(
+                %peer_addr,
+                protocol_number = format_args!("0x{:02X}", frame.protocol_number),
+                serial = frame.serial,
+                payload_len = frame.payload.len(),
+                payload_hex = %format_bytes_hex(&frame.payload),
+                error = %error,
+                "failed to process GT06 packet"
+            );
+        }
+        None => {
+            warn!(%peer_addr, error = %error, "failed to process GT06 packet");
+        }
+    }
 }

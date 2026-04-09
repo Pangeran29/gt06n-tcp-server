@@ -53,7 +53,7 @@ async fn accepts_login_heartbeat_and_location_packets() -> io::Result<()> {
 
     let login_frame = build_frame(
         PROTOCOL_LOGIN,
-        &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45],
+        &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45, 0x42],
         1,
     );
     client.write_all(&login_frame).await?;

@@ -18,6 +18,7 @@ pub struct Frame {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginPacket {
     pub imei: String,
+    pub extra_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,8 +67,6 @@ pub enum Gt06Message {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
-    #[error("frame is truncated")]
-    Truncated,
     #[error("invalid frame length {0}")]
     InvalidLength(usize),
     #[error("invalid frame stop bytes")]
@@ -183,16 +182,41 @@ pub fn crc16_x25(data: &[u8]) -> u16 {
 }
 
 fn decode_login(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
-    if frame.payload.len() != 8 {
+    if frame.payload.len() < 8 {
         return Err(ProtocolError::InvalidPayload {
             protocol_number: frame.protocol_number,
-            message: "login payload must be exactly 8 bytes",
+            message: "login payload must be at least 8 bytes",
         });
     }
 
     Ok(Gt06Message::Login(LoginPacket {
-        imei: decode_bcd_imei(&frame.payload),
+        imei: decode_bcd_imei(&frame.payload[..8]),
+        extra_data: frame.payload[8..].to_vec(),
     }))
+}
+
+pub fn format_bytes_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len().saturating_mul(3).saturating_sub(1));
+
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        let hi = byte >> 4;
+        let lo = byte & 0x0F;
+        output.push(nibble_to_hex(hi));
+        output.push(nibble_to_hex(lo));
+    }
+
+    output
+}
+
+fn nibble_to_hex(nibble: u8) -> char {
+    match nibble {
+        0..=9 => char::from(b'0' + nibble),
+        10..=15 => char::from(b'A' + (nibble - 10)),
+        _ => unreachable!("nibble must be in range 0..=15"),
+    }
 }
 
 fn decode_heartbeat(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
@@ -292,7 +316,8 @@ mod tests {
     use bytes::BytesMut;
 
     use super::{
-        crc16_x25, decode_message, encode_ack, FrameDecoder, Gt06Message, ProtocolError,
+        crc16_x25, decode_message, encode_ack, format_bytes_hex, FrameDecoder, Gt06Message,
+        ProtocolError,
         PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
     };
 
@@ -322,7 +347,32 @@ mod tests {
         let message = decode_message(&parsed).unwrap();
 
         match message {
-            Gt06Message::Login(packet) => assert_eq!(packet.imei, "123456789012345"),
+            Gt06Message::Login(packet) => {
+                assert_eq!(packet.imei, "123456789012345");
+                assert!(packet.extra_data.is_empty());
+            }
+            other => panic!("expected login packet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_login_frame_with_extra_data() {
+        let frame = build_frame(
+            PROTOCOL_LOGIN,
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45, 0x42, 0x01],
+            1,
+        );
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let parsed = FrameDecoder::next_frame(&mut buffer)
+            .unwrap()
+            .expect("expected frame");
+        let message = decode_message(&parsed).unwrap();
+
+        match message {
+            Gt06Message::Login(packet) => {
+                assert_eq!(packet.imei, "123456789012345");
+                assert_eq!(packet.extra_data, vec![0x42, 0x01]);
+            }
             other => panic!("expected login packet, got {other:?}"),
         }
     }
@@ -406,5 +456,10 @@ mod tests {
         let mut buffer = BytesMut::from(&frame[..frame.len() - 2]);
         let result = FrameDecoder::next_frame(&mut buffer).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn formats_bytes_as_hex() {
+        assert_eq!(format_bytes_hex(&[0x78, 0x78, 0x0D, 0x01]), "78 78 0D 01");
     }
 }
