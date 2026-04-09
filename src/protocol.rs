@@ -50,6 +50,7 @@ pub struct LocationPacket {
     pub speed_kph: u8,
     pub course: u16,
     pub course_status: u16,
+    pub extra_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,17 +59,11 @@ pub struct UnknownPacket {
     pub payload: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtendedLocationPacket {
-    pub payload: Vec<u8>,
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gt06Message {
     Login(LoginPacket),
     Heartbeat(HeartbeatPacket),
     Location(LocationPacket),
-    ExtendedLocation(ExtendedLocationPacket),
     Unknown(UnknownPacket),
 }
 
@@ -151,9 +146,7 @@ pub fn decode_message(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
         PROTOCOL_LOGIN => decode_login(frame),
         PROTOCOL_HEARTBEAT => decode_heartbeat(frame),
         PROTOCOL_LOCATION => decode_location(frame),
-        PROTOCOL_EXTENDED_LOCATION => Ok(Gt06Message::ExtendedLocation(ExtendedLocationPacket {
-            payload: frame.payload.clone(),
-        })),
+        PROTOCOL_EXTENDED_LOCATION => decode_extended_location(frame),
         other => Ok(Gt06Message::Unknown(UnknownPacket {
             protocol_number: other,
             payload: frame.payload.clone(),
@@ -246,6 +239,17 @@ fn decode_heartbeat(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
 }
 
 fn decode_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
+    decode_location_payload(frame, false)
+}
+
+fn decode_extended_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
+    decode_location_payload(frame, true)
+}
+
+fn decode_location_payload(
+    frame: &Frame,
+    allow_extra_data: bool,
+) -> Result<Gt06Message, ProtocolError> {
     if frame.payload.len() < 18 {
         return Err(ProtocolError::InvalidPayload {
             protocol_number: frame.protocol_number,
@@ -280,6 +284,11 @@ fn decode_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
     ]);
     let speed_kph = frame.payload[15];
     let course_status = u16::from_be_bytes([frame.payload[16], frame.payload[17]]);
+    let extra_data = if allow_extra_data {
+        frame.payload[18..].to_vec()
+    } else {
+        Vec::new()
+    };
 
     let mut latitude = raw_latitude as f64 / 1_800_000.0;
     let mut longitude = raw_longitude as f64 / 1_800_000.0;
@@ -300,6 +309,7 @@ fn decode_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
         speed_kph,
         course: course_status & 0x03FF,
         course_status,
+        extra_data,
     }))
 }
 
@@ -408,8 +418,13 @@ mod tests {
     }
 
     #[test]
-    fn surfaces_extended_location_frame() {
-        let frame = build_frame(PROTOCOL_EXTENDED_LOCATION, &[0x01, 0x02, 0x03, 0x04], 7);
+    fn decodes_extended_location_frame() {
+        let payload = [
+            0x1A, 0x04, 0x09, 0x12, 0x29, 0x18, 0xC8, 0x00, 0xAA, 0x66, 0xA7, 0x0B, 0x74,
+            0xF3, 0xDD, 0x00, 0x10, 0x00, 0x01, 0xFE, 0x0A, 0x05, 0x06, 0x00, 0x42, 0x46,
+            0x00, 0x05, 0x00,
+        ];
+        let frame = build_frame(PROTOCOL_EXTENDED_LOCATION, &payload, 7);
         let mut buffer = BytesMut::from(frame.as_slice());
         let parsed = FrameDecoder::next_frame(&mut buffer)
             .unwrap()
@@ -417,8 +432,24 @@ mod tests {
         let message = decode_message(&parsed).unwrap();
 
         match message {
-            Gt06Message::ExtendedLocation(packet) => {
-                assert_eq!(packet.payload, vec![0x01, 0x02, 0x03, 0x04]);
+            Gt06Message::Location(packet) => {
+                assert_eq!(packet.timestamp.year, 2020);
+                assert_eq!(packet.timestamp.month, 4);
+                assert_eq!(packet.timestamp.day, 9);
+                assert_eq!(packet.timestamp.hour, 12);
+                assert_eq!(packet.timestamp.minute, 29);
+                assert_eq!(packet.timestamp.second, 18);
+                assert_eq!(packet.gps_info_length, 12);
+                assert_eq!(packet.satellite_count, 8);
+                assert!((packet.latitude - 6.204_110_6).abs() < 0.001);
+                assert!((packet.longitude - 106.785_789_4).abs() < 0.001);
+                assert_eq!(packet.speed_kph, 0);
+                assert_eq!(packet.course_status, 0x1000);
+                assert_eq!(packet.course, 0);
+                assert_eq!(
+                    packet.extra_data,
+                    vec![0x01, 0xFE, 0x0A, 0x05, 0x06, 0x00, 0x42, 0x46, 0x00, 0x05, 0x00]
+                );
             }
             other => panic!("expected extended location packet, got {other:?}"),
         }
@@ -452,6 +483,7 @@ mod tests {
                 assert!((packet.longitude - 10.864_364_4).abs() < 0.001);
                 assert_eq!(packet.speed_kph, 60);
                 assert_eq!(packet.course, 30);
+                assert!(packet.extra_data.is_empty());
             }
             other => panic!("expected location packet, got {other:?}"),
         }

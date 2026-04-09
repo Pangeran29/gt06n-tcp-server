@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::events::{DeviceEvent, DeviceEventHandler};
 use crate::protocol::{
     decode_message, encode_ack, format_bytes_hex, Frame, FrameDecoder, Gt06Message, ProtocolError,
-    PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT, PROTOCOL_LOGIN,
+    PROTOCOL_HEARTBEAT, PROTOCOL_LOGIN,
 };
 
 pub struct Gt06TcpServer {
@@ -116,16 +116,6 @@ async fn handle_connection(
                                 packet,
                             })
                             .await;
-                    }
-                    Ok(Gt06Message::ExtendedLocation(packet)) => {
-                        debug!(
-                            %peer_addr,
-                            device_id = device_id.as_deref().unwrap_or("unknown"),
-                            protocol_number = format_args!("0x{:02X}", PROTOCOL_EXTENDED_LOCATION),
-                            payload_len = packet.payload.len(),
-                            payload_hex = %format_bytes_hex(&packet.payload),
-                            "received unsupported Concox extended location/status packet"
-                        );
                     }
                     Ok(Gt06Message::Unknown(packet)) => {
                         debug!(
