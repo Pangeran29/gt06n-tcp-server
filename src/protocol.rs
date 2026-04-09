@@ -7,6 +7,7 @@ const STOP_BYTES: [u8; 2] = [0x0D, 0x0A];
 pub const PROTOCOL_LOGIN: u8 = 0x01;
 pub const PROTOCOL_LOCATION: u8 = 0x12;
 pub const PROTOCOL_HEARTBEAT: u8 = 0x13;
+pub const PROTOCOL_EXTENDED_LOCATION: u8 = 0x22;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
@@ -57,11 +58,17 @@ pub struct UnknownPacket {
     pub payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtendedLocationPacket {
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Gt06Message {
     Login(LoginPacket),
     Heartbeat(HeartbeatPacket),
     Location(LocationPacket),
+    ExtendedLocation(ExtendedLocationPacket),
     Unknown(UnknownPacket),
 }
 
@@ -144,6 +151,9 @@ pub fn decode_message(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
         PROTOCOL_LOGIN => decode_login(frame),
         PROTOCOL_HEARTBEAT => decode_heartbeat(frame),
         PROTOCOL_LOCATION => decode_location(frame),
+        PROTOCOL_EXTENDED_LOCATION => Ok(Gt06Message::ExtendedLocation(ExtendedLocationPacket {
+            payload: frame.payload.clone(),
+        })),
         other => Ok(Gt06Message::Unknown(UnknownPacket {
             protocol_number: other,
             payload: frame.payload.clone(),
@@ -317,8 +327,8 @@ mod tests {
 
     use super::{
         crc16_x25, decode_message, encode_ack, format_bytes_hex, FrameDecoder, Gt06Message,
-        ProtocolError,
-        PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
+        ProtocolError, PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION,
+        PROTOCOL_LOGIN,
     };
 
     fn build_frame(protocol_number: u8, payload: &[u8], serial: u16) -> Vec<u8> {
@@ -394,6 +404,23 @@ mod tests {
                 assert_eq!(packet.alarm_language, 0x0002);
             }
             other => panic!("expected heartbeat packet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn surfaces_extended_location_frame() {
+        let frame = build_frame(PROTOCOL_EXTENDED_LOCATION, &[0x01, 0x02, 0x03, 0x04], 7);
+        let mut buffer = BytesMut::from(frame.as_slice());
+        let parsed = FrameDecoder::next_frame(&mut buffer)
+            .unwrap()
+            .expect("expected frame");
+        let message = decode_message(&parsed).unwrap();
+
+        match message {
+            Gt06Message::ExtendedLocation(packet) => {
+                assert_eq!(packet.payload, vec![0x01, 0x02, 0x03, 0x04]);
+            }
+            other => panic!("expected extended location packet, got {other:?}"),
         }
     }
 
