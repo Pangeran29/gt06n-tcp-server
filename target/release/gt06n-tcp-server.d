@@ -1,1 +1,0 @@
-D:\jonathan\gps-tracker\tcp-server\target\release\gt06n-tcp-server.exe: D:\jonathan\gps-tracker\tcp-server\src\config.rs D:\jonathan\gps-tracker\tcp-server\src\events.rs D:\jonathan\gps-tracker\tcp-server\src\lib.rs D:\jonathan\gps-tracker\tcp-server\src\main.rs D:\jonathan\gps-tracker\tcp-server\src\protocol.rs D:\jonathan\gps-tracker\tcp-server\src\server.rs
