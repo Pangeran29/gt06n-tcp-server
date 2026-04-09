@@ -1,0 +1,85 @@
+use std::collections::HashMap;
+use std::env;
+use std::net::SocketAddr;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    pub bind_addr: SocketAddr,
+    pub log_filter: String,
+    pub read_buffer_capacity: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            bind_addr: "0.0.0.0:5000".parse().expect("default bind address must be valid"),
+            log_filter: "info".to_string(),
+            read_buffer_capacity: 4096,
+        }
+    }
+}
+
+impl Config {
+    pub fn from_env() -> Self {
+        let _ = dotenvy::dotenv();
+        Self::from_pairs(env::vars())
+    }
+
+    pub fn from_pairs<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars: HashMap<String, String> = pairs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect();
+
+        let mut config = Self::default();
+
+        if let Some(bind_addr) = vars.get("GT06_BIND_ADDR") {
+            if let Ok(parsed) = bind_addr.parse() {
+                config.bind_addr = parsed;
+            }
+        }
+
+        if let Some(log_filter) = vars.get("RUST_LOG") {
+            if !log_filter.trim().is_empty() {
+                config.log_filter = log_filter.clone();
+            }
+        }
+
+        if let Some(capacity) = vars.get("GT06_READ_BUFFER_CAPACITY") {
+            if let Ok(parsed) = capacity.parse() {
+                config.read_buffer_capacity = parsed;
+            }
+        }
+
+        config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn uses_defaults_when_env_is_empty() {
+        let config = Config::from_pairs(Vec::<(String, String)>::new());
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn reads_expected_environment_overrides() {
+        let config = Config::from_pairs([
+            ("GT06_BIND_ADDR", "127.0.0.1:6000"),
+            ("RUST_LOG", "debug"),
+            ("GT06_READ_BUFFER_CAPACITY", "8192"),
+        ]);
+
+        assert_eq!(config.bind_addr, "127.0.0.1:6000".parse().unwrap());
+        assert_eq!(config.log_filter, "debug");
+        assert_eq!(config.read_buffer_capacity, 8192);
+    }
+}
