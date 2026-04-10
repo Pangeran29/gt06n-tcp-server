@@ -30,6 +30,26 @@ pub struct HeartbeatPacket {
     pub alarm_language: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStatus {
+    On,
+    Off,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalInfoFlags {
+    pub raw: u8,
+    pub binary: String,
+    pub oil_and_electricity_connected: bool,
+    pub gps_tracking_on: bool,
+    pub alarm_active: bool,
+    pub charge_connected: bool,
+    pub acc_high: Option<bool>,
+    pub defense_active: bool,
+    pub engine_status_guess: EngineStatus,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GpsTimestamp {
     pub year: u16,
@@ -214,6 +234,38 @@ pub fn format_bytes_hex(bytes: &[u8]) -> String {
     output
 }
 
+pub fn format_byte_bits(byte: u8) -> String {
+    format!("{byte:08b}")
+}
+
+pub fn decode_terminal_info_flags(raw: u8) -> TerminalInfoFlags {
+    let acc_high = if raw & 0x40 != 0 {
+        Some(true)
+    } else if raw & 0x04 != 0 {
+        Some(false)
+    } else {
+        None
+    };
+
+    let engine_status_guess = match acc_high {
+        Some(true) => EngineStatus::On,
+        Some(false) => EngineStatus::Off,
+        None => EngineStatus::Unknown,
+    };
+
+    TerminalInfoFlags {
+        raw,
+        binary: format_byte_bits(raw),
+        oil_and_electricity_connected: raw & 0x01 != 0,
+        gps_tracking_on: raw & 0x02 != 0,
+        alarm_active: raw & 0x04 != 0,
+        charge_connected: raw & 0x08 != 0,
+        acc_high,
+        defense_active: raw & 0x10 != 0,
+        engine_status_guess,
+    }
+}
+
 fn nibble_to_hex(nibble: u8) -> char {
     match nibble {
         0..=9 => char::from(b'0' + nibble),
@@ -336,9 +388,9 @@ mod tests {
     use bytes::BytesMut;
 
     use super::{
-        crc16_x25, decode_message, encode_ack, format_bytes_hex, FrameDecoder, Gt06Message,
-        ProtocolError, PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION,
-        PROTOCOL_LOGIN,
+        crc16_x25, decode_message, decode_terminal_info_flags, encode_ack, format_byte_bits,
+        format_bytes_hex, EngineStatus, FrameDecoder, Gt06Message, ProtocolError,
+        PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
     };
 
     fn build_frame(protocol_number: u8, payload: &[u8], serial: u16) -> Vec<u8> {
@@ -415,6 +467,24 @@ mod tests {
             }
             other => panic!("expected heartbeat packet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn formats_terminal_info_bits() {
+        assert_eq!(format_byte_bits(69), "01000101");
+    }
+
+    #[test]
+    fn decodes_terminal_info_flags() {
+        let on_flags = decode_terminal_info_flags(69);
+        assert_eq!(on_flags.binary, "01000101");
+        assert_eq!(on_flags.acc_high, Some(true));
+        assert_eq!(on_flags.engine_status_guess, EngineStatus::On);
+
+        let off_flags = decode_terminal_info_flags(5);
+        assert_eq!(off_flags.binary, "00000101");
+        assert_eq!(off_flags.acc_high, Some(false));
+        assert_eq!(off_flags.engine_status_guess, EngineStatus::Off);
     }
 
     #[test]
