@@ -9,6 +9,18 @@ pub const PROTOCOL_LOCATION: u8 = 0x12;
 pub const PROTOCOL_HEARTBEAT: u8 = 0x13;
 pub const PROTOCOL_EXTENDED_LOCATION: u8 = 0x22;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimestampEncoding {
+    Bcd,
+    ConcoxExtended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HemisphereEncoding {
+    ClassicGt06,
+    ConcoxExtended,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub protocol_number: u8,
@@ -291,16 +303,28 @@ fn decode_heartbeat(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
 }
 
 fn decode_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
-    decode_location_payload(frame, false)
+    decode_location_payload(
+        frame,
+        false,
+        TimestampEncoding::Bcd,
+        HemisphereEncoding::ClassicGt06,
+    )
 }
 
 fn decode_extended_location(frame: &Frame) -> Result<Gt06Message, ProtocolError> {
-    decode_location_payload(frame, true)
+    decode_location_payload(
+        frame,
+        true,
+        TimestampEncoding::ConcoxExtended,
+        HemisphereEncoding::ConcoxExtended,
+    )
 }
 
 fn decode_location_payload(
     frame: &Frame,
     allow_extra_data: bool,
+    timestamp_encoding: TimestampEncoding,
+    hemisphere_encoding: HemisphereEncoding,
 ) -> Result<Gt06Message, ProtocolError> {
     if frame.payload.len() < 18 {
         return Err(ProtocolError::InvalidPayload {
@@ -309,14 +333,7 @@ fn decode_location_payload(
         });
     }
 
-    let timestamp = GpsTimestamp {
-        year: 2000 + bcd_to_decimal(frame.payload[0]) as u16,
-        month: bcd_to_decimal(frame.payload[1]),
-        day: bcd_to_decimal(frame.payload[2]),
-        hour: bcd_to_decimal(frame.payload[3]),
-        minute: bcd_to_decimal(frame.payload[4]),
-        second: bcd_to_decimal(frame.payload[5]),
-    };
+    let timestamp = decode_timestamp(&frame.payload[..6], timestamp_encoding);
 
     let gps_info = frame.payload[6];
     let gps_info_length = gps_info >> 4;
@@ -342,15 +359,8 @@ fn decode_location_payload(
         Vec::new()
     };
 
-    let mut latitude = raw_latitude as f64 / 1_800_000.0;
-    let mut longitude = raw_longitude as f64 / 1_800_000.0;
-
-    if course_status & 0x0400 != 0 {
-        latitude = -latitude;
-    }
-    if course_status & 0x0800 != 0 {
-        longitude = -longitude;
-    }
+    let (latitude, longitude) =
+        decode_coordinates(raw_latitude, raw_longitude, course_status, hemisphere_encoding);
 
     Ok(Gt06Message::Location(LocationPacket {
         timestamp,
@@ -377,6 +387,55 @@ fn decode_bcd_imei(bytes: &[u8]) -> String {
     }
 
     digits
+}
+
+fn decode_timestamp(bytes: &[u8], encoding: TimestampEncoding) -> GpsTimestamp {
+    match encoding {
+        TimestampEncoding::Bcd => GpsTimestamp {
+            year: 2000 + bcd_to_decimal(bytes[0]) as u16,
+            month: bcd_to_decimal(bytes[1]),
+            day: bcd_to_decimal(bytes[2]),
+            hour: bcd_to_decimal(bytes[3]),
+            minute: bcd_to_decimal(bytes[4]),
+            second: bcd_to_decimal(bytes[5]),
+        },
+        TimestampEncoding::ConcoxExtended => GpsTimestamp {
+            year: 2000 + bytes[0] as u16,
+            month: bytes[1],
+            day: bytes[2],
+            hour: bytes[3],
+            minute: bcd_to_decimal(bytes[4]),
+            second: bcd_to_decimal(bytes[5]),
+        },
+    }
+}
+
+fn decode_coordinates(
+    raw_latitude: u32,
+    raw_longitude: u32,
+    course_status: u16,
+    encoding: HemisphereEncoding,
+) -> (f64, f64) {
+    let mut latitude = raw_latitude as f64 / 1_800_000.0;
+    let mut longitude = raw_longitude as f64 / 1_800_000.0;
+
+    match encoding {
+        HemisphereEncoding::ClassicGt06 => {
+            if course_status & 0x0400 != 0 {
+                latitude = -latitude;
+            }
+            if course_status & 0x0800 != 0 {
+                longitude = -longitude;
+            }
+        }
+        HemisphereEncoding::ConcoxExtended => {
+            if course_status & 0x2000 == 0 {
+                latitude = -latitude;
+            }
+        }
+    }
+
+    (latitude, longitude)
 }
 
 fn bcd_to_decimal(byte: u8) -> u8 {
@@ -503,15 +562,15 @@ mod tests {
 
         match message {
             Gt06Message::Location(packet) => {
-                assert_eq!(packet.timestamp.year, 2020);
+                assert_eq!(packet.timestamp.year, 2026);
                 assert_eq!(packet.timestamp.month, 4);
                 assert_eq!(packet.timestamp.day, 9);
-                assert_eq!(packet.timestamp.hour, 12);
+                assert_eq!(packet.timestamp.hour, 18);
                 assert_eq!(packet.timestamp.minute, 29);
                 assert_eq!(packet.timestamp.second, 18);
                 assert_eq!(packet.gps_info_length, 12);
                 assert_eq!(packet.satellite_count, 8);
-                assert!((packet.latitude - 6.204_110_6).abs() < 0.001);
+                assert!((packet.latitude - (-6.204_110_6)).abs() < 0.001);
                 assert!((packet.longitude - 106.785_789_4).abs() < 0.001);
                 assert_eq!(packet.speed_kph, 0);
                 assert_eq!(packet.course_status, 0x1000);
