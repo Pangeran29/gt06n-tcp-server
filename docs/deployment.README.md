@@ -231,6 +231,8 @@ cd /root/gt06n-tcp-server
 git pull
 cargo build --release
 sudo systemctl restart gt06n.service
+sudo systemctl status gt06n.service
+sudo journalctl -u gt06n.service -f
 ```
 
 Then verify:
