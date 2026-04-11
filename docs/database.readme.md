@@ -1,59 +1,89 @@
-# Database Design
+# Database README
 
-This document describes the first PostgreSQL storage layer for the GT06 / Concox TCP server.
+## Overview
 
-## Goals
+This backend uses PostgreSQL as the first production storage layer for tracker data.
 
-- preserve live tracker data without losing raw protocol evidence
-- support fast inserts for location and heartbeat history
-- support straightforward queries for latest device state
-- avoid overcomplicating the first production schema
+The database design is built around three tables:
 
-## Tables
+- `devices`
+- `device_locations`
+- `device_heartbeats`
+
+The design is intentionally simple:
+
+- one device master table
+- one append-only table for location history
+- one append-only table for heartbeat history
+
+It also stores both:
+
+- normalized fields for fast application queries
+- raw protocol evidence for future reinterpretation
+
+That matters because some protocol fields are still evolving, especially:
+
+- `engine_status_guess`
+- packet `0x26`
+- extended Concox extra bytes
+
+## Table Overview
 
 ### `devices`
 
-Purpose:
+Business meaning:
 
-- one stable row per IMEI
-- holds current/latest-known summary state for fast reads
+- this is the main identity table for a tracker
+- one row represents one physical device, identified by IMEI
 
-Examples of stored state:
+What it stores:
 
-- latest location
-- latest heartbeat status
-- latest peer address
-- last seen timestamps
+- IMEI
+- first seen / last seen
+- last login / last heartbeat / last location time
+- latest known location summary
+- latest known heartbeat summary
+- latest known peer address
 - latest engine status guess
+
+Why it exists:
+
+- fast lookup of the latest state of a device
+- avoids scanning history tables for the most recent status every time
 
 ### `device_locations`
 
-Purpose:
+Business meaning:
 
-- append-only history table for decoded location events
-- keeps one row per received location packet
+- this is the historical tracking table
+- every decoded location packet becomes one row here
 
-Stored fields include:
+What it stores:
 
 - device reference
 - IMEI copy
 - server receive time
-- GPS timestamp
+- GPS timestamp from the packet
 - protocol number / packet family
 - latitude / longitude
 - speed / course / course status
 - satellite count / GPS info length
-- extra packet data hex
+- extra packet bytes in hex
 - peer address
+
+Why it exists:
+
+- keeps the full movement history of the device
+- supports later features such as map history, route playback, and trip analysis
 
 ### `device_heartbeats`
 
-Purpose:
+Business meaning:
 
-- append-only history table for heartbeat/status packets
-- keeps one row per received heartbeat event
+- this is the historical device-status table
+- every decoded heartbeat packet becomes one row here
 
-Stored fields include:
+What it stores:
 
 - device reference
 - IMEI copy
@@ -67,75 +97,44 @@ Stored fields include:
 - alarm/language field
 - peer address
 
-## Why Store Both Parsed And Raw Fields
+Why it exists:
 
-The current protocol parser is good enough for real production traffic, but some fields are still evolving.
+- keeps the full heartbeat/status history
+- supports later investigation of ignition state, charging state, signal quality, and other operational conditions
 
-Examples:
+## Business Relationship Between Tables
 
-- `engine_status_guess` is still heuristic
-- packet `0x26` is not decoded yet
-- extra bytes in extended Concox packets may gain meaning later
+The relationship is:
 
-Because of that, the schema stores:
+- one row in `devices`
+- many rows in `device_locations`
+- many rows in `device_heartbeats`
 
-- normalized fields for product queries
-- raw evidence for future reinterpretation
+In business terms:
 
-This avoids losing useful data when the parser improves later.
+- `devices` = current device identity and latest summary
+- `device_locations` = tracking history for that device
+- `device_heartbeats` = status history for that device
 
-## Insert / Update Flow
+So:
 
-### Login
+- the `devices` table tells you the latest known state
+- the history tables tell you how the device got there over time
 
-- upsert the `devices` row by IMEI
-- update first seen / last seen / last login / latest peer address
+## Why Raw And Parsed Data Are Stored Together
 
-### Heartbeat
+Some fields are already reliable enough for use, such as:
 
-- ensure the device row exists
-- insert a row into `device_heartbeats`
-- update latest heartbeat summary fields in `devices`
+- IMEI
+- latitude / longitude
+- speed
+- course
+- satellite count
 
-### Location
+Some fields are still not fully final, such as:
 
-- ensure the device row exists
-- insert a row into `device_locations`
-- update latest location summary fields in `devices`
+- `engine_status_guess`
+- future interpretation of `extra_data_hex`
+- future handling of packet `0x26`
 
-## Current Limitations
-
-- `engine_status_guess` should not yet be treated as authoritative ignition truth
-- packet `0x26` is still pending parser support
-- no partitioning or retention jobs are implemented yet
-- no PostGIS or advanced timeseries extensions are used in v1
-
-## Example Query Use Cases
-
-Latest known device position:
-
-```sql
-SELECT imei, latest_latitude, latest_longitude, latest_gps_timestamp, last_seen_at
-FROM devices
-WHERE imei = '866221070478388';
-```
-
-Recent location history for one device:
-
-```sql
-SELECT gps_timestamp, latitude, longitude, speed_kph, course
-FROM device_locations
-WHERE imei = '866221070478388'
-ORDER BY server_received_at DESC
-LIMIT 100;
-```
-
-Recent heartbeat history for one device:
-
-```sql
-SELECT server_received_at, terminal_info_raw, terminal_info_bits, engine_status_guess
-FROM device_heartbeats
-WHERE imei = '866221070478388'
-ORDER BY server_received_at DESC
-LIMIT 100;
-```
+Because of that, the schema stores both parsed and raw values so the backend can improve later without losing historical meaning.
