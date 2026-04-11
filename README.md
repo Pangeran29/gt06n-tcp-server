@@ -1,8 +1,8 @@
 # GT06 / Concox TCP Server
 
-This project is a Rust TCP server for `GT06` / `Concox`-family GPS trackers. It accepts raw tracker TCP connections, validates and parses the device protocol, sends the required ACK packets, and logs decoded device events.
+This project is a Rust TCP server for `GT06` / `Concox`-family GPS trackers. It accepts raw tracker TCP connections, validates and parses the device protocol, sends the required ACK packets, logs decoded device events, and can now persist those events into PostgreSQL.
 
-Right now, this project is a device-facing TCP backend. It is not yet a full GPS tracking platform with database storage, API endpoints, or a map UI.
+Right now, this project is a device-facing TCP backend plus a first production-oriented storage layer. It is not yet a full GPS tracking platform with public API endpoints or a map UI.
 
 ## Current Functionality
 
@@ -21,7 +21,9 @@ The server currently does these things:
   - heartbeat
 - accepts login packets where the first 8 bytes contain the IMEI and additional trailing login bytes may be present
 - logs parsed device events through the built-in logging event handler
-- logs packet payload hex when parsing fails, to make real-device protocol tuning easier
+- persists login, location, and heartbeat events into PostgreSQL when `DATABASE_URL` is configured
+- stores both normalized fields and raw protocol evidence for later reinterpretation
+- runs database schema migrations automatically at startup when PostgreSQL persistence is enabled
 
 ## What Data Is Already Decoded
 
@@ -79,22 +81,41 @@ When decoding succeeds, the current logger writes:
   - satellite count
   - extra data hex for extended location packets
 
+## What Is Already Stored In PostgreSQL
+
+When PostgreSQL is enabled, the backend stores:
+
+- `devices`
+  - one row per IMEI with latest-known summary state
+- `device_locations`
+  - append-only history table for location packets
+- `device_heartbeats`
+  - append-only history table for heartbeat/status packets
+
+Stored data includes both query-friendly parsed values and raw evidence fields such as:
+
+- raw `terminal_info`
+- `terminal_info_bits`
+- `engine_status_guess`
+- `extra_data_hex`
+- packet/protocol type
+- peer address
+
 ## What This Project Does Not Have Yet
 
 This server does not yet provide:
 
-- a database
 - a REST API
 - a dashboard or frontend
 - map visualization
-- historical trip storage
+- historical trip aggregation/business reporting
 - user authentication
 - geofence/business logic
 - alert notification delivery
 - finalized alarm/status decoding for all Concox packet variants
 - a fully validated ACC/engine-state mapping for every firmware variant
 
-At the moment, the server is mainly the TCP ingestion layer for the tracker.
+At the moment, the server is the TCP ingestion layer plus the first persistence layer for the tracker.
 
 ## Project Layout
 
@@ -107,16 +128,23 @@ At the moment, the server is mainly the TCP ingestion layer for the tracker.
 - `src/protocol.rs`
   - frame parsing, CRC validation, packet decoding, ACK generation, heartbeat flag decoding, and hex formatting helpers
 - `src/events.rs`
-  - normalized event models and the logging event handler
+  - normalized event models, logging handler, and handler composition
+- `src/db.rs`
+  - PostgreSQL connection setup, migrations, and persistence-backed event handling
+- `migrations/`
+  - SQL schema migrations for the storage layer
 - `tests/integration.rs`
   - integration test that simulates a tracker session
 - `docs/deployment.readme.md`
   - Ubuntu VPS deployment and `systemd` guide
+- `docs/database.readme.md`
+  - database design overview and example queries
 
 ## Requirements
 
 - Rust toolchain installed
 - network access the first time Cargo downloads dependencies
+- PostgreSQL if you want persistence enabled
 
 ## Configuration
 
@@ -131,6 +159,15 @@ The server reads runtime settings from environment variables and also loads a lo
 - `RUST_LOG`
   - log filter level
   - default: `info`
+- `DATABASE_URL`
+  - PostgreSQL connection string
+  - default: disabled when unset
+- `DATABASE_MAX_CONNECTIONS`
+  - connection pool size
+  - default: `5`
+- `DATABASE_WRITE_TIMEOUT_MS`
+  - connection acquire/write timeout in milliseconds
+  - default: `5000`
 
 ## Where To Set The Port
 
@@ -150,6 +187,7 @@ If your real GPS device must connect from outside your machine or VPS, use `0.0.
 ```powershell
 $env:GT06_BIND_ADDR="0.0.0.0:5000"
 $env:RUST_LOG="info"
+$env:DATABASE_URL="postgres://postgres:postgres@localhost:5432/gt06n_tcp_server"
 ```
 
 ### Option 2: `.env`
@@ -160,6 +198,9 @@ Create a `.env` file in the project root:
 GT06_BIND_ADDR=0.0.0.0:5000
 GT06_READ_BUFFER_CAPACITY=4096
 RUST_LOG=info
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/gt06n_tcp_server
+DATABASE_MAX_CONNECTIONS=5
+DATABASE_WRITE_TIMEOUT_MS=5000
 ```
 
 ## How To Run
@@ -176,7 +217,7 @@ For production-style local verification:
 cargo run --release
 ```
 
-If the server starts correctly, you should see a startup log with the bind address.
+If the server starts correctly, you should see a startup log with the bind address. If `DATABASE_URL` is configured, the app will also run migrations and start persisting events.
 
 ## How To Confirm The Server Is Listening
 
@@ -234,7 +275,14 @@ The automated tests currently cover:
 - partial/truncated frame buffering
 - hex formatting helper
 - terminal-info bit formatting helper
+- PostgreSQL migration bootstrap
+- PostgreSQL persistence of login, heartbeat, and location events
 - simulated device TCP session
+
+Note:
+
+- database integration tests run when `GT06_TEST_DATABASE_URL` is set
+- otherwise they exit successfully without touching a database
 
 ## How To Check With A Real Device
 
@@ -257,7 +305,6 @@ If the device connects but repeatedly retries or disconnects, that usually means
 - the current implementation is focused on `0x7878` frames
 - some Concox firmware variants may send different payload layouts
 - engine-state classification is still a best-effort guess until it is validated against controlled on/off tests
-- there is no persistence layer yet
 - there is no downstream API yet
 - there is no dashboard yet
 
@@ -268,12 +315,12 @@ Recommended next work items:
 1. Validate heartbeat `terminal_info` bits against real ACC on/off tests.
 2. Decode packet `0x26` and determine whether it represents alarm, status, or alternate location data.
 3. Add support for more alarm and status packet types.
-4. Persist decoded events to a database such as PostgreSQL.
-5. Add an HTTP API for latest location and device history.
-6. Build a simple dashboard or map view for device positions.
-7. Track device last-seen state and online/offline health.
-8. Add metrics and health endpoints for production monitoring.
-9. Support more GT06 / Concox firmware variations, including extended frame types if needed.
+4. Add an HTTP API for latest location and device history.
+5. Build a simple dashboard or map view for device positions.
+6. Track device last-seen state and online/offline health.
+7. Add metrics and health endpoints for production monitoring.
+8. Support more GT06 / Concox firmware variations, including extended frame types if needed.
+9. Add retention and archival strategy for long-term location history.
 10. Harden production deployment by running under a dedicated Linux user instead of `/root`.
 
 ## Notes On Real Devices
@@ -285,7 +332,7 @@ GT06 / Concox devices often vary a little by model and firmware. The safest way 
 - add tests for those real packet examples
 - then update the decoder based on the actual observed traffic
 
-That approach is already reflected in the current backend design, which keeps the TCP session handling separate from packet decoding.
+That approach is already reflected in the current backend design, which keeps the TCP session handling separate from packet decoding and now also stores raw evidence in the database for future reinterpretation.
 
 ## Patch History
 
@@ -400,6 +447,21 @@ Next needed:
 - decode packet `0x26`
 - prepare the event model for persistence
 
+### 0.8
+
+Implemented:
+
+- added PostgreSQL persistence for devices, locations, and heartbeat history
+- added automatic SQL migrations at startup
+- added a composed event-handler path so logging and database persistence run together
+- added database integration tests and persistence helpers
+- documented the first production storage model
+
+Next needed:
+
+- validate the persistence model against long-running real traffic
+- add API/query surfaces on top of the new tables
+
 ### Current State
 
 Implemented:
@@ -407,10 +469,11 @@ Implemented:
 - real Concox device can connect to the server over the internet
 - login, heartbeat, and location data are being received and decoded
 - current logs are rich enough to inspect movement, status, GPS quality, and protocol variations
-- the server is stable enough to serve as the TCP ingestion layer for the next backend phase
+- PostgreSQL can now persist current device state plus location and heartbeat history
+- the server is stable enough to serve as the ingestion layer for the next backend phase
 
 Next needed:
 
 - finalize engine-state interpretation
 - decode remaining important packet variants
-- start storing normalized device events in a database
+- expose the stored data through an API and operational queries

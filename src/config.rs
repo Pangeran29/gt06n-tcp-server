@@ -7,6 +7,9 @@ pub struct Config {
     pub bind_addr: SocketAddr,
     pub log_filter: String,
     pub read_buffer_capacity: usize,
+    pub database_url: Option<String>,
+    pub database_max_connections: u32,
+    pub database_write_timeout_ms: u64,
 }
 
 impl Default for Config {
@@ -15,6 +18,9 @@ impl Default for Config {
             bind_addr: "0.0.0.0:5000".parse().expect("default bind address must be valid"),
             log_filter: "info".to_string(),
             read_buffer_capacity: 4096,
+            database_url: None,
+            database_max_connections: 5,
+            database_write_timeout_ms: 5_000,
         }
     }
 }
@@ -56,6 +62,24 @@ impl Config {
             }
         }
 
+        if let Some(database_url) = vars.get("DATABASE_URL") {
+            if !database_url.trim().is_empty() {
+                config.database_url = Some(database_url.clone());
+            }
+        }
+
+        if let Some(max_connections) = vars.get("DATABASE_MAX_CONNECTIONS") {
+            if let Ok(parsed) = max_connections.parse() {
+                config.database_max_connections = parsed;
+            }
+        }
+
+        if let Some(timeout_ms) = vars.get("DATABASE_WRITE_TIMEOUT_MS") {
+            if let Ok(parsed) = timeout_ms.parse() {
+                config.database_write_timeout_ms = parsed;
+            }
+        }
+
         config
     }
 }
@@ -76,10 +100,19 @@ mod tests {
             ("GT06_BIND_ADDR", "127.0.0.1:6000"),
             ("RUST_LOG", "debug"),
             ("GT06_READ_BUFFER_CAPACITY", "8192"),
+            ("DATABASE_URL", "postgres://postgres:postgres@localhost/gt06"),
+            ("DATABASE_MAX_CONNECTIONS", "8"),
+            ("DATABASE_WRITE_TIMEOUT_MS", "9000"),
         ]);
 
         assert_eq!(config.bind_addr, "127.0.0.1:6000".parse().unwrap());
         assert_eq!(config.log_filter, "debug");
         assert_eq!(config.read_buffer_capacity, 8192);
+        assert_eq!(
+            config.database_url.as_deref(),
+            Some("postgres://postgres:postgres@localhost/gt06")
+        );
+        assert_eq!(config.database_max_connections, 8);
+        assert_eq!(config.database_write_timeout_ms, 9000);
     }
 }

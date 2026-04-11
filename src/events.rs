@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tracing::{info, warn};
@@ -29,6 +30,26 @@ pub enum DeviceEvent {
 #[async_trait]
 pub trait DeviceEventHandler: Send + Sync {
     async fn handle_event(&self, event: DeviceEvent);
+}
+
+#[derive(Default)]
+pub struct CompositeEventHandler {
+    handlers: Vec<Arc<dyn DeviceEventHandler>>,
+}
+
+impl CompositeEventHandler {
+    pub fn new(handlers: Vec<Arc<dyn DeviceEventHandler>>) -> Self {
+        Self { handlers }
+    }
+}
+
+#[async_trait]
+impl DeviceEventHandler for CompositeEventHandler {
+    async fn handle_event(&self, event: DeviceEvent) {
+        for handler in &self.handlers {
+            handler.handle_event(event.clone()).await;
+        }
+    }
 }
 
 #[derive(Debug, Default)]

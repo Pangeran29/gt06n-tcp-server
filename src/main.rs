@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use gt06n_tcp_server::config::Config;
-use gt06n_tcp_server::events::LoggingEventHandler;
+use gt06n_tcp_server::db::build_event_handler;
 use gt06n_tcp_server::server::Gt06TcpServer;
 use tracing_subscriber::EnvFilter;
 
@@ -19,7 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .compact()
         .init();
 
-    let server = Gt06TcpServer::bind(config.clone(), Arc::new(LoggingEventHandler)).await?;
+    let event_handler = build_event_handler(&config)
+        .await
+        .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
+
+    let server = Gt06TcpServer::bind(config.clone(), Arc::clone(&event_handler)).await?;
     tracing::info!(bind_addr = %server.local_addr()?, "GT06N TCP server started");
     server.run().await?;
 

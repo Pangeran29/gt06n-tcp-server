@@ -1,6 +1,6 @@
 # VPS Deployment Guide
 
-This guide explains how to deploy the GT06N TCP server to an Ubuntu VPS, verify that it is reachable, and run it safely with `systemd`.
+This guide explains how to deploy the GT06 / Concox TCP server to an Ubuntu VPS, verify that it is reachable, and run it safely with `systemd`.
 
 ## Current Assumptions
 
@@ -40,6 +40,9 @@ Example:
 GT06_BIND_ADDR=0.0.0.0:5000
 GT06_READ_BUFFER_CAPACITY=4096
 RUST_LOG=info
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/gt06n_tcp_server
+DATABASE_MAX_CONNECTIONS=5
+DATABASE_WRITE_TIMEOUT_MS=5000
 ```
 
 ### Important Setting
@@ -63,6 +66,8 @@ Expected startup log:
 ```text
 GT06N TCP server started bind_addr=0.0.0.0:5000
 ```
+
+If PostgreSQL is configured, startup will also run database migrations automatically before the server begins accepting tracker connections.
 
 ## 4. Confirm The Server Is Listening
 
@@ -185,6 +190,12 @@ This is where you should see:
 - heartbeat packets
 - location packets
 
+With PostgreSQL enabled, these tracker events are also persisted into:
+
+- `devices`
+- `device_locations`
+- `device_heartbeats`
+
 ## 9. Common systemd Commands
 
 Restart the service:
@@ -248,4 +259,5 @@ You know deployment is working when all of these are true:
 - `ss -ltn | grep 5000` shows the service listening
 - `Test-NetConnection` from your local machine reports `TcpTestSucceeded : True`
 - `systemctl status gt06n.service` shows `active (running)`
-- `journalctl -u gt06n.service -f` shows GT06N device traffic after the tracker is configured
+- `journalctl -u gt06n.service -f` shows GT06 / Concox device traffic after the tracker is configured
+- PostgreSQL migrations complete successfully when `DATABASE_URL` is set
