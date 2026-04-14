@@ -53,12 +53,12 @@ pub enum EngineStatus {
 pub struct TerminalInfoFlags {
     pub raw: u8,
     pub binary: String,
-    pub oil_and_electricity_connected: bool,
     pub gps_tracking_on: bool,
-    pub alarm_active: bool,
-    pub charge_connected: bool,
+    pub bit_1_guess: bool,
     pub acc_high: Option<bool>,
-    pub defense_active: bool,
+    pub bit_3_guess: bool,
+    pub bit_4_guess: bool,
+    pub vibration_detected: bool,
     pub engine_status_guess: EngineStatus,
 }
 
@@ -251,30 +251,31 @@ pub fn format_byte_bits(byte: u8) -> String {
 }
 
 pub fn decode_terminal_info_flags(raw: u8) -> TerminalInfoFlags {
-    let acc_high = if raw & 0x40 != 0 {
-        Some(true)
-    } else if raw & 0x04 != 0 {
-        Some(false)
-    } else {
-        None
-    };
-
-    let engine_status_guess = match acc_high {
-        Some(true) => EngineStatus::On,
-        Some(false) => EngineStatus::Off,
-        None => EngineStatus::Unknown,
-    };
+    let acc_high = Some(raw & 0x04 != 0);
+    let engine_status_guess = resolve_engine_status_guess(acc_high);
 
     TerminalInfoFlags {
         raw,
         binary: format_byte_bits(raw),
-        oil_and_electricity_connected: raw & 0x01 != 0,
-        gps_tracking_on: raw & 0x02 != 0,
-        alarm_active: raw & 0x04 != 0,
-        charge_connected: raw & 0x08 != 0,
+        gps_tracking_on: raw & 0x01 != 0,
+        bit_1_guess: raw & 0x02 != 0,
         acc_high,
-        defense_active: raw & 0x10 != 0,
+        bit_3_guess: raw & 0x08 != 0,
+        bit_4_guess: raw & 0x10 != 0,
+        vibration_detected: raw & 0x40 != 0,
         engine_status_guess,
+    }
+}
+
+pub fn resolve_acc_high(current: Option<bool>, previous: Option<bool>) -> Option<bool> {
+    current.or(previous)
+}
+
+pub fn resolve_engine_status_guess(acc_high: Option<bool>) -> EngineStatus {
+    match acc_high {
+        Some(true) => EngineStatus::On,
+        Some(false) => EngineStatus::Off,
+        None => EngineStatus::Unknown,
     }
 }
 
@@ -448,8 +449,9 @@ mod tests {
 
     use super::{
         crc16_x25, decode_message, decode_terminal_info_flags, encode_ack, format_byte_bits,
-        format_bytes_hex, EngineStatus, FrameDecoder, Gt06Message, ProtocolError,
-        PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
+        format_bytes_hex, resolve_acc_high, resolve_engine_status_guess, EngineStatus,
+        FrameDecoder, Gt06Message, ProtocolError, PROTOCOL_EXTENDED_LOCATION,
+        PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
     };
 
     fn build_frame(protocol_number: u8, payload: &[u8], serial: u16) -> Vec<u8> {
@@ -535,15 +537,25 @@ mod tests {
 
     #[test]
     fn decodes_terminal_info_flags() {
-        let on_flags = decode_terminal_info_flags(69);
-        assert_eq!(on_flags.binary, "01000101");
-        assert_eq!(on_flags.acc_high, Some(true));
-        assert_eq!(on_flags.engine_status_guess, EngineStatus::On);
+        let flags = decode_terminal_info_flags(69);
+        assert_eq!(flags.binary, "01000101");
+        assert!(flags.gps_tracking_on);
+        assert!(!flags.bit_1_guess);
+        assert_eq!(flags.acc_high, Some(true));
+        assert!(!flags.bit_3_guess);
+        assert!(!flags.bit_4_guess);
+        assert!(flags.vibration_detected);
+        assert_eq!(flags.engine_status_guess, EngineStatus::On);
+    }
 
-        let off_flags = decode_terminal_info_flags(5);
-        assert_eq!(off_flags.binary, "00000101");
-        assert_eq!(off_flags.acc_high, Some(false));
-        assert_eq!(off_flags.engine_status_guess, EngineStatus::Off);
+    #[test]
+    fn resolves_acc_high_and_engine_status_guess() {
+        assert_eq!(resolve_acc_high(Some(true), Some(false)), Some(true));
+        assert_eq!(resolve_acc_high(None, Some(false)), Some(false));
+        assert_eq!(resolve_acc_high(None, None), None);
+        assert_eq!(resolve_engine_status_guess(Some(true)), EngineStatus::On);
+        assert_eq!(resolve_engine_status_guess(Some(false)), EngineStatus::Off);
+        assert_eq!(resolve_engine_status_guess(None), EngineStatus::Unknown);
     }
 
     #[test]

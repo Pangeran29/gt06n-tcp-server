@@ -13,7 +13,8 @@ The recommended setup is:
 - redeploy by pulling code, rebuilding, and restarting the service
 
 `systemd` is the process manager that keeps each service alive.
-
+tcp sysmtemd config: `/etc/systemd/system/gt06n.service`
+telegram bot systemd config: `/etc/systemd/system/gt06n-telegram-bot.service`
 It is responsible for:
 
 - starting the service at boot
@@ -29,8 +30,11 @@ cd /root/gt06n-tcp-server
 git pull
 cargo build --release
 sudo systemctl restart gt06n.service
+sudo systemctl restart gt06n-telegram-bot.service
 sudo systemctl status gt06n.service
+sudo systemctl status gt06n-telegram-bot.service
 sudo journalctl -u gt06n.service -f
+sudo journalctl -u gt06n-telegram-bot.service -f
 ```
 
 ## systemd Service

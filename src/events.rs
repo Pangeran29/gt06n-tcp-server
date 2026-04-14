@@ -4,8 +4,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
+use crate::db::Database;
 use crate::protocol::{
-    decode_terminal_info_flags, format_bytes_hex, EngineStatus, HeartbeatPacket, LocationPacket,
+    decode_terminal_info_flags, format_bytes_hex, resolve_acc_high, resolve_engine_status_guess,
+    EngineStatus, HeartbeatPacket, LocationPacket,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,8 +54,16 @@ impl DeviceEventHandler for CompositeEventHandler {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LoggingEventHandler;
+#[derive(Debug, Clone, Default)]
+pub struct LoggingEventHandler {
+    database: Option<Database>,
+}
+
+impl LoggingEventHandler {
+    pub fn new(database: Option<Database>) -> Self {
+        Self { database }
+    }
+}
 
 #[async_trait]
 impl DeviceEventHandler for LoggingEventHandler {
@@ -72,7 +82,14 @@ impl DeviceEventHandler for LoggingEventHandler {
                 packet,
             } => {
                 let flags = decode_terminal_info_flags(packet.terminal_info);
-                let engine_status = match flags.engine_status_guess {
+                let previous_acc_high = match (&self.database, device_id.as_deref()) {
+                    (Some(database), Some(imei)) => {
+                        database.fetch_previous_acc_high(imei).await.unwrap_or(None)
+                    }
+                    _ => None,
+                };
+                let effective_acc_high = resolve_acc_high(flags.acc_high, previous_acc_high);
+                let engine_status = match resolve_engine_status_guess(effective_acc_high) {
                     EngineStatus::On => "on",
                     EngineStatus::Off => "off",
                     EngineStatus::Unknown => "unknown",
@@ -83,12 +100,12 @@ impl DeviceEventHandler for LoggingEventHandler {
                     device_id = device_id.unwrap_or_else(|| "unknown".to_string()),
                     terminal_info = packet.terminal_info,
                     terminal_info_bits = flags.binary,
-                    oil_and_electricity_connected = flags.oil_and_electricity_connected,
                     gps_tracking_on = flags.gps_tracking_on,
-                    alarm_active = flags.alarm_active,
-                    charge_connected = flags.charge_connected,
-                    acc_high = flags.acc_high,
-                    defense_active = flags.defense_active,
+                    bit_1_guess = flags.bit_1_guess,
+                    acc_high = effective_acc_high,
+                    bit_3_guess = flags.bit_3_guess,
+                    vibration_detected = flags.vibration_detected,
+                    bit_4_guess = flags.bit_4_guess,
                     engine_status_guess = engine_status,
                     voltage_level = packet.voltage_level,
                     gsm_signal_strength = packet.gsm_signal_strength,

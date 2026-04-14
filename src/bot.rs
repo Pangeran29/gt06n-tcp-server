@@ -304,6 +304,9 @@ pub struct StoredHeartbeat {
     pub server_received_at: DateTime<Utc>,
     pub terminal_info_raw: i32,
     pub terminal_info_bits: String,
+    pub gps_tracking_on: bool,
+    pub acc_high: Option<bool>,
+    pub vibration_detected: bool,
     pub engine_status_guess: String,
     pub voltage_level: i32,
     pub gsm_signal_strength: i32,
@@ -331,6 +334,11 @@ pub fn format_heartbeat_notification(heartbeat: &StoredHeartbeat) -> String {
         heartbeat.terminal_info_bits,
         heartbeat.voltage_level,
         heartbeat.gsm_signal_strength
+    ) + &format!(
+        "\nGPS tracking: {}\nACC high: {}\nVibration detected: {}",
+        heartbeat.gps_tracking_on,
+        option_bool(heartbeat.acc_high),
+        heartbeat.vibration_detected
     )
 }
 
@@ -364,6 +372,12 @@ fn option_f64(value: Option<f64>) -> String {
 }
 
 fn option_i32(value: Option<i32>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn option_bool(value: Option<bool>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "unknown".to_string())
@@ -407,7 +421,8 @@ pub async fn fetch_new_heartbeats(
     let rows = sqlx::query(
         r#"
         SELECT id, imei, server_received_at, terminal_info_raw, terminal_info_bits,
-               engine_status_guess, voltage_level, gsm_signal_strength
+               gps_tracking_on, acc_high, vibration_detected, engine_status_guess,
+               voltage_level, gsm_signal_strength
         FROM device_heartbeats
         WHERE id > $1
         ORDER BY id ASC
@@ -426,6 +441,9 @@ pub async fn fetch_new_heartbeats(
             server_received_at: row.get("server_received_at"),
             terminal_info_raw: row.get("terminal_info_raw"),
             terminal_info_bits: row.get("terminal_info_bits"),
+            gps_tracking_on: row.get("gps_tracking_on"),
+            acc_high: row.get("acc_high"),
+            vibration_detected: row.get("vibration_detected"),
             engine_status_guess: row.get("engine_status_guess"),
             voltage_level: row.get("voltage_level"),
             gsm_signal_strength: row.get("gsm_signal_strength"),
@@ -439,7 +457,8 @@ pub async fn fetch_latest_heartbeat(
     let row = sqlx::query(
         r#"
         SELECT id, imei, server_received_at, terminal_info_raw, terminal_info_bits,
-               engine_status_guess, voltage_level, gsm_signal_strength
+               gps_tracking_on, acc_high, vibration_detected, engine_status_guess,
+               voltage_level, gsm_signal_strength
         FROM device_heartbeats
         ORDER BY id DESC
         LIMIT 1
@@ -454,6 +473,9 @@ pub async fn fetch_latest_heartbeat(
         server_received_at: row.get("server_received_at"),
         terminal_info_raw: row.get("terminal_info_raw"),
         terminal_info_bits: row.get("terminal_info_bits"),
+        gps_tracking_on: row.get("gps_tracking_on"),
+        acc_high: row.get("acc_high"),
+        vibration_detected: row.get("vibration_detected"),
         engine_status_guess: row.get("engine_status_guess"),
         voltage_level: row.get("voltage_level"),
         gsm_signal_strength: row.get("gsm_signal_strength"),
@@ -522,6 +544,9 @@ mod tests {
             server_received_at: Utc.with_ymd_and_hms(2026, 4, 13, 12, 0, 0).unwrap(),
             terminal_info_raw: 69,
             terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
             engine_status_guess: "on".to_string(),
             voltage_level: 6,
             gsm_signal_strength: 3,
@@ -594,13 +619,13 @@ mod tests {
             r#"
             INSERT INTO device_heartbeats (
                 device_id, imei, server_received_at, protocol_number, peer_addr, terminal_info_raw,
-                terminal_info_bits, oil_and_electricity_connected, gps_tracking_on, alarm_active,
-                charge_connected, acc_high, defense_active, engine_status_guess, voltage_level,
+                terminal_info_bits, gps_tracking_on, bit_1_guess, acc_high, bit_3_guess,
+                vibration_detected, bit_4_guess, engine_status_guess, voltage_level,
                 gsm_signal_strength, alarm_language
             )
             VALUES
                 (1, '866221070478388', NOW(), 19, '127.0.0.1:5000', 69, '01000101', true, false, true, false, true, false, 'on', 6, 3, 2),
-                (1, '866221070478388', NOW(), 19, '127.0.0.1:5000', 5, '00000101', true, false, true, false, false, false, 'off', 6, 2, 2)
+                (1, '866221070478388', NOW(), 19, '127.0.0.1:5000', 65, '01000001', true, false, false, false, true, false, 'off', 6, 2, 2)
             "#,
         )
         .execute(database.pool())

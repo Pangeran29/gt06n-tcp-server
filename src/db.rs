@@ -11,7 +11,8 @@ use crate::config::Config;
 use crate::events::DeviceEventHandler;
 use crate::events::{CompositeEventHandler, DeviceEvent, LoggingEventHandler};
 use crate::protocol::{
-    decode_terminal_info_flags, format_bytes_hex, EngineStatus, GpsTimestamp,
+    decode_terminal_info_flags, format_bytes_hex, resolve_acc_high,
+    resolve_engine_status_guess, EngineStatus, GpsTimestamp,
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -54,6 +55,23 @@ impl Database {
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
+
+    pub async fn fetch_previous_acc_high(&self, imei: &str) -> Result<Option<bool>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            SELECT acc_high
+            FROM device_heartbeats
+            WHERE imei = $1 AND acc_high IS NOT NULL
+            ORDER BY id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(imei)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|row| row.try_get::<Option<bool>, _>("acc_high").ok().flatten()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -79,15 +97,14 @@ impl DeviceEventHandler for DatabaseEventHandler {
 pub async fn build_event_handler(
     config: &Config,
 ) -> Result<std::sync::Arc<dyn DeviceEventHandler>, DatabaseError> {
-    let logging = std::sync::Arc::new(LoggingEventHandler);
-
     if let Some(database) = Database::connect(config).await? {
+        let logging = std::sync::Arc::new(LoggingEventHandler::new(Some(database.clone())));
         let database_handler = std::sync::Arc::new(DatabaseEventHandler::new(database));
         let composite = CompositeEventHandler::new(vec![logging, database_handler]);
         Ok(std::sync::Arc::new(composite))
     } else {
         warn!("DATABASE_URL is not set; running without PostgreSQL persistence");
-        Ok(logging)
+        Ok(std::sync::Arc::new(LoggingEventHandler::new(None)))
     }
 }
 
@@ -129,6 +146,7 @@ async fn persist_event(pool: &PgPool, event: DeviceEvent) -> Result<(), sqlx::Er
             update_device_latest_heartbeat(
                 &mut tx,
                 device_pk,
+                &imei,
                 &peer_addr.to_string(),
                 server_received_at,
                 &packet,
@@ -324,13 +342,18 @@ async fn insert_heartbeat(
     packet: &crate::protocol::HeartbeatPacket,
 ) -> Result<PgQueryResult, sqlx::Error> {
     let flags = decode_terminal_info_flags(packet.terminal_info);
+    let effective_acc_high = resolve_acc_high(
+        flags.acc_high,
+        fetch_previous_acc_high(tx, imei).await?,
+    );
+    let engine_status_guess = resolve_engine_status_guess(effective_acc_high);
 
     sqlx::query(
         r#"
         INSERT INTO device_heartbeats (
             device_id, imei, server_received_at, protocol_number, peer_addr, terminal_info_raw,
-            terminal_info_bits, oil_and_electricity_connected, gps_tracking_on, alarm_active,
-            charge_connected, acc_high, defense_active, engine_status_guess, voltage_level,
+            terminal_info_bits, gps_tracking_on, bit_1_guess, acc_high, bit_3_guess,
+            vibration_detected, bit_4_guess, engine_status_guess, voltage_level,
             gsm_signal_strength, alarm_language
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
@@ -343,13 +366,13 @@ async fn insert_heartbeat(
     .bind(peer_addr)
     .bind(i32::from(packet.terminal_info))
     .bind(flags.binary)
-    .bind(flags.oil_and_electricity_connected)
     .bind(flags.gps_tracking_on)
-    .bind(flags.alarm_active)
-    .bind(flags.charge_connected)
-    .bind(flags.acc_high)
-    .bind(flags.defense_active)
-    .bind(engine_status_as_str(flags.engine_status_guess))
+    .bind(flags.bit_1_guess)
+    .bind(effective_acc_high)
+    .bind(flags.bit_3_guess)
+    .bind(flags.vibration_detected)
+    .bind(flags.bit_4_guess)
+    .bind(engine_status_as_str(engine_status_guess))
     .bind(i32::from(packet.voltage_level))
     .bind(i32::from(packet.gsm_signal_strength))
     .bind(i32::from(packet.alarm_language))
@@ -360,11 +383,17 @@ async fn insert_heartbeat(
 async fn update_device_latest_heartbeat(
     tx: &mut Transaction<'_, Postgres>,
     device_pk: i64,
+    imei: &str,
     peer_addr: &str,
     server_received_at: DateTime<Utc>,
     packet: &crate::protocol::HeartbeatPacket,
 ) -> Result<PgQueryResult, sqlx::Error> {
     let flags = decode_terminal_info_flags(packet.terminal_info);
+    let effective_acc_high = resolve_acc_high(
+        flags.acc_high,
+        fetch_previous_acc_high(tx, imei).await?,
+    );
+    let engine_status_guess = resolve_engine_status_guess(effective_acc_high);
 
     sqlx::query(
         r#"
@@ -376,12 +405,12 @@ async fn update_device_latest_heartbeat(
             latest_packet_family = $5,
             latest_terminal_info_raw = $6,
             latest_terminal_info_bits = $7,
-            latest_oil_and_electricity_connected = $8,
-            latest_gps_tracking_on = $9,
-            latest_alarm_active = $10,
-            latest_charge_connected = $11,
-            latest_acc_high = $12,
-            latest_defense_active = $13,
+            latest_gps_tracking_on = $8,
+            latest_bit_1_guess = $9,
+            latest_acc_high = $10,
+            latest_bit_3_guess = $11,
+            latest_vibration_detected = $12,
+            latest_bit_4_guess = $13,
             latest_engine_status_guess = $14,
             latest_voltage_level = $15,
             latest_gsm_signal_strength = $16,
@@ -397,18 +426,38 @@ async fn update_device_latest_heartbeat(
     .bind("heartbeat")
     .bind(i32::from(packet.terminal_info))
     .bind(flags.binary)
-    .bind(flags.oil_and_electricity_connected)
     .bind(flags.gps_tracking_on)
-    .bind(flags.alarm_active)
-    .bind(flags.charge_connected)
-    .bind(flags.acc_high)
-    .bind(flags.defense_active)
-    .bind(engine_status_as_str(flags.engine_status_guess))
+    .bind(flags.bit_1_guess)
+    .bind(effective_acc_high)
+    .bind(flags.bit_3_guess)
+    .bind(flags.vibration_detected)
+    .bind(flags.bit_4_guess)
+    .bind(engine_status_as_str(engine_status_guess))
     .bind(i32::from(packet.voltage_level))
     .bind(i32::from(packet.gsm_signal_strength))
     .bind(i32::from(packet.alarm_language))
     .execute(&mut **tx)
     .await
+}
+
+pub async fn fetch_previous_acc_high(
+    tx: &mut Transaction<'_, Postgres>,
+    imei: &str,
+) -> Result<Option<bool>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT acc_high
+        FROM device_heartbeats
+        WHERE imei = $1 AND acc_high IS NOT NULL
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    Ok(row.and_then(|row| row.try_get::<Option<bool>, _>("acc_high").ok().flatten()))
 }
 
 fn packet_family(packet: &crate::protocol::LocationPacket) -> &'static str {
@@ -607,7 +656,7 @@ mod tests {
         assert_eq!(location_count, 1);
 
         let device_row = sqlx::query(
-            "SELECT imei, latest_engine_status_guess, latest_latitude, latest_longitude, latest_terminal_info_raw FROM devices WHERE imei = $1"
+            "SELECT imei, latest_engine_status_guess, latest_latitude, latest_longitude, latest_terminal_info_raw, latest_acc_high, latest_vibration_detected FROM devices WHERE imei = $1"
         )
         .bind("866221070478388")
         .fetch_one(database.pool())
@@ -615,6 +664,8 @@ mod tests {
 
         assert_eq!(device_row.get::<String, _>("imei"), "866221070478388");
         assert_eq!(device_row.get::<String, _>("latest_engine_status_guess"), "on");
+        assert!(device_row.get::<bool, _>("latest_acc_high"));
+        assert!(device_row.get::<bool, _>("latest_vibration_detected"));
         assert!((device_row.get::<f64, _>("latest_latitude") - (-6.204_066_6)).abs() < 0.001);
         assert!((device_row.get::<f64, _>("latest_longitude") - 106.785_514_4).abs() < 0.001);
         assert_eq!(device_row.get::<i32, _>("latest_terminal_info_raw"), 69);

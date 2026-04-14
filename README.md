@@ -120,6 +120,10 @@ For heartbeat packets:
 
 - raw `terminal_info`
 - `terminal_info_bits`
+- validated `gps_tracking_on`
+- validated `acc_high`
+- validated `vibration_detected`
+- neutral guess fields for remaining heartbeat bits
 - voltage level
 - GSM signal strength
 - alarm/language field
@@ -163,6 +167,7 @@ The bot stores its own operational state in PostgreSQL so it can continue safely
 Important note:
 
 - `engine_status_guess` is still heuristic and should not yet be treated as a fully validated ignition signal
+- heartbeat bits now mix validated names and neutral `bit_*_guess` placeholders until the remaining bits are confirmed on the real device
 
 More detail:
 

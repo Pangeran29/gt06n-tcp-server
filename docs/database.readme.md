@@ -91,7 +91,7 @@ What it stores:
 - server receive time
 - raw terminal info
 - terminal info bits
-- decoded boolean flags
+- decoded heartbeat flags, including validated fields and neutral guess fields for unconfirmed bits
 - engine status guess
 - voltage level
 - GSM signal strength
