@@ -8,6 +8,8 @@ async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dotenvy = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
 sqlx = { version = "0.8", features = ["chrono", "postgres", "runtime-tokio-rustls"] }
 thiserror = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

@@ -2,20 +2,21 @@
 
 ## Overview
 
-This backend is intended to run as a long-running Linux service on a VPS.
+This backend is intended to run as long-running Linux services on a VPS.
 
 The recommended setup is:
 
-- build the Rust binary on the VPS
+- build the Rust binaries on the VPS
 - configure runtime values in `.env`
-- run the backend with `systemd`
+- run the TCP server with `systemd`
+- optionally run the Telegram bot with a second `systemd` service
 - redeploy by pulling code, rebuilding, and restarting the service
 
-`systemd` is the process manager that keeps the backend alive.
+`systemd` is the process manager that keeps each service alive.
 
 It is responsible for:
 
-- starting the backend at boot
+- starting the service at boot
 - restarting it if it crashes
 - giving you a standard way to inspect logs and status
 
@@ -34,7 +35,7 @@ sudo journalctl -u gt06n.service -f
 
 ## systemd Service
 
-The backend is managed by the `gt06n.service` service unit.
+The TCP backend is managed by the `gt06n.service` service unit.
 
 Typical service file location:
 
@@ -42,15 +43,21 @@ Typical service file location:
 /etc/systemd/system/gt06n.service
 ```
 
+If you also deploy the Telegram bot as a service, it should have its own unit, for example:
+
+```bash
+/etc/systemd/system/gt06n-telegram-bot.service
+```
+
 ## Essential systemd Commands
 
-Start the backend:
+Start the TCP backend:
 
 ```bash
 sudo systemctl start gt06n.service
 ```
 
-Stop the backend:
+Stop the TCP backend:
 
 ```bash
 sudo systemctl stop gt06n.service
@@ -78,4 +85,12 @@ Watch backend logs:
 
 ```bash
 sudo journalctl -u gt06n.service -f
+```
+
+If you run the Telegram bot as a second service, the commands are the same pattern, for example:
+
+```bash
+sudo systemctl restart gt06n-telegram-bot.service
+sudo systemctl status gt06n-telegram-bot.service
+sudo journalctl -u gt06n-telegram-bot.service -f
 ```

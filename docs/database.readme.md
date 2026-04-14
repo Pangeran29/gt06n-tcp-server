@@ -9,6 +9,7 @@ The database design is built around three tables:
 - `devices`
 - `device_locations`
 - `device_heartbeats`
+- `telegram_bot_state`
 
 The design is intentionally simple:
 
@@ -138,3 +139,22 @@ Some fields are still not fully final, such as:
 - future handling of packet `0x26`
 
 Because of that, the schema stores both parsed and raw values so the backend can improve later without losing historical meaning.
+
+### `telegram_bot_state`
+
+Business meaning:
+
+- this is the small operational-state table for the Telegram bot
+- it stores cursors and configuration that let the bot continue safely after restart
+
+What it stores:
+
+- last processed Telegram update id
+- last notified heartbeat id
+- admin chat id
+
+Why it exists:
+
+- prevents duplicate notification processing after restart
+- keeps the bot decoupled from the TCP server
+- lets the bot resume from PostgreSQL-backed state instead of in-memory state

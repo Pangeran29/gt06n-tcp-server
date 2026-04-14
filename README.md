@@ -2,19 +2,16 @@
 
 ## Overview Project
 
-This project is a Rust TCP backend for `GT06` / `Concox` GPS trackers.
+This project is a Rust tracking backend for `GT06` / `Concox` GPS trackers.
 
-Its job is to:
+Today the repo contains two Rust services:
 
-- accept raw TCP connections from the GPS device
-- validate and decode tracker packets
-- send the ACK packets the device expects
-- log decoded device activity
-- persist decoded data into PostgreSQL
+- the TCP server that receives raw tracker packets, decodes them, and stores the data
+- the Telegram bot that reads stored heartbeat data from PostgreSQL and sends notifications to one admin chat
 
-This backend is already suitable as the ingestion layer for a tracking system. It is not yet a complete product with public APIs, dashboards, authentication, or business workflows.
+The backend is already suitable as the ingestion and first notification layer for a tracking system. It is not yet a complete product with public APIs, dashboards, authentication, or business workflows.
 
-The server currently supports these protocol packets:
+The TCP server currently supports these protocol packets:
 
 - login (`0x01`)
 - heartbeat (`0x13`)
@@ -34,15 +31,21 @@ RUST_LOG=info
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/gt06n_tcp_server
 DATABASE_MAX_CONNECTIONS=10
 DATABASE_WRITE_TIMEOUT_MS=5000
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ADMIN_CHAT_ID=
+TELEGRAM_POLL_TIMEOUT_SECS=30
+TELEGRAM_HEARTBEAT_POLL_INTERVAL_MS=3000
 ```
 
 Notes:
 
-- if `DATABASE_URL` is not set, the server still runs, but without PostgreSQL persistence
-- if `DATABASE_URL` is set, the server will connect to PostgreSQL and run migrations automatically at startup
-- the PostgreSQL database itself must already exist before the server starts
+- if `DATABASE_URL` is not set, the TCP server still runs, but without PostgreSQL persistence
+- if `DATABASE_URL` is set, the app connects to PostgreSQL and runs migrations automatically at startup
+- the PostgreSQL database itself must already exist before the service starts
+- if `TELEGRAM_BOT_TOKEN` is set, you can run the Telegram bot service
+- if `TELEGRAM_ADMIN_CHAT_ID` is empty, the bot can be bound from Telegram with `/bind_me`
 
-### 2. Run locally
+### 2. Run the TCP Server
 
 ```powershell
 cargo run
@@ -54,7 +57,21 @@ For release mode:
 cargo run --release
 ```
 
-### 3. Check that it is listening
+### 3. Run the Telegram Bot
+
+```powershell
+cargo run --bin telegram_bot
+```
+
+For release mode:
+
+```powershell
+cargo run --release --bin telegram_bot
+```
+
+The bot uses long polling and reads heartbeat data from PostgreSQL. It does not receive data directly from the TCP socket layer.
+
+### 4. Check that the TCP server is listening
 
 Windows PowerShell:
 
@@ -68,7 +85,7 @@ Linux / VPS:
 ss -ltn | grep 5000
 ```
 
-### 4. Run tests
+### 5. Run tests
 
 ```powershell
 cargo test
@@ -76,7 +93,7 @@ cargo test
 
 ## What This Has
 
-### TCP / Protocol
+### TCP Ingestion
 
 - async TCP server using `tokio`
 - GT06 `0x7878` frame parsing
@@ -85,7 +102,7 @@ cargo test
 - heartbeat ACK support
 - support for real Concox login packet variants with extra trailing bytes
 
-### Decoded Data
+### Decoded Tracking Data
 
 For location packets:
 
@@ -123,10 +140,35 @@ The schema stores both:
 
 This is intentional so future parser improvements do not make old data useless.
 
+### Telegram Integration
+
+The repo also includes a separate Telegram bot service that:
+
+- uses Telegram Bot API long polling
+- reads new heartbeat rows from PostgreSQL
+- sends one notification per new heartbeat row
+- supports an initial command surface:
+  - `/start`
+  - `/help`
+  - `/bind_me`
+  - `/last_heartbeat`
+  - `/latest_location`
+
+The bot stores its own operational state in PostgreSQL so it can continue safely after restart. That state currently includes:
+
+- last processed Telegram update id
+- last notified heartbeat id
+- bound admin chat id
+
+Important note:
+
+- `engine_status_guess` is still heuristic and should not yet be treated as a fully validated ignition signal
+
 More detail:
 
 - database design: [database.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/database.README.md)
 - deployment process: [deployment.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/deployment.README.md)
+- telegram bot: [telegram.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/telegram.README.md)
 
 ## What Need To Be Implemented
 
@@ -137,5 +179,9 @@ The main remaining work is:
 - support more Concox alarm and status packet variants
 - build a read API for latest device state and history
 - add dashboard / map UI
+- expand Telegram commands beyond heartbeat-first operations
+- add delivery rules such as status-change-only notifications and richer filtering
+- support production deployment for the Telegram bot with its own `systemd` service
+- evaluate Telegram Stars / payment flows later if the product direction needs them
 - add retention and archival strategy for long-running GPS history
 - improve production hardening, especially running the service under a dedicated Linux user instead of `/root`
