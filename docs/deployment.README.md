@@ -98,3 +98,5 @@ sudo systemctl restart gt06n-telegram-bot.service
 sudo systemctl status gt06n-telegram-bot.service
 sudo journalctl -u gt06n-telegram-bot.service -f
 ```
+
+

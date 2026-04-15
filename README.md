@@ -190,3 +190,15 @@ The main remaining work is:
 - evaluate Telegram Stars / payment flows later if the product direction needs them
 - add retention and archival strategy for long-running GPS history
 - improve production hardening, especially running the service under a dedicated Linux user instead of `/root`
+
+
+
+motor on, is this you?
+a. yes, its me -> okay, enjoy your ride
+b. not, me -> there's indication that the motor is being "dicuri" rn use below link to detect your motor
+
+later
+
+how's you riding, you traveled 40km today, your average speed is 40km, you are riding for 40 minutes, open this link to view detail perjalana.
+or
+youre ridign for 40km today, click link below to see your riding activity

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, NaiveDateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -61,6 +61,8 @@ pub struct TelegramBot {
     heartbeat_poll_interval_ms: u64,
     preconfigured_admin_chat_id: Option<i64>,
 }
+
+const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 
 impl TelegramBot {
     pub async fn from_config(config: &Config) -> Result<Self, BotError> {
@@ -142,8 +144,67 @@ impl TelegramBot {
         let heartbeats = fetch_new_heartbeats(self.database.pool(), last_notified).await?;
 
         for heartbeat in heartbeats {
-            let text = format_heartbeat_notification(&heartbeat);
-            self.send_message(admin_chat_id, &text).await?;
+            if let Some(status) = heartbeat.notification_status() {
+                let existing =
+                    fetch_notification_state(self.database.pool(), &heartbeat.imei, admin_chat_id)
+                        .await?;
+                let text = format_engine_status_notification(&heartbeat, status);
+
+                match existing {
+                    Some(existing) if existing.last_status == status => {
+                        if let Err(error) = self
+                            .edit_message_text(admin_chat_id, existing.last_message_id, &text)
+                            .await
+                        {
+                            warn!(
+                                error = %error,
+                                imei = %heartbeat.imei,
+                                message_id = existing.last_message_id,
+                                "failed to edit existing status message; sending a new one"
+                            );
+                            let message_id = self.send_message(admin_chat_id, &text).await?;
+                            upsert_notification_state(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                                status,
+                                message_id,
+                                heartbeat.id,
+                            )
+                            .await?;
+                        } else {
+                            upsert_notification_state(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                                status,
+                                existing.last_message_id,
+                                heartbeat.id,
+                            )
+                            .await?;
+                        }
+                    }
+                    _ => {
+                        let message_id = self.send_message(admin_chat_id, &text).await?;
+                        upsert_notification_state(
+                            self.database.pool(),
+                            &heartbeat.imei,
+                            admin_chat_id,
+                            status,
+                            message_id,
+                            heartbeat.id,
+                        )
+                        .await?;
+                    }
+                }
+            } else {
+                info!(
+                    imei = %heartbeat.imei,
+                    engine_status_guess = %heartbeat.engine_status_guess,
+                    "skipping heartbeat notification because status is not notifiable"
+                );
+            }
+
             set_state_i64(
                 self.database.pool(),
                 "last_notified_heartbeat_id",
@@ -240,7 +301,7 @@ impl TelegramBot {
         Ok(body.result)
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<(), reqwest::Error> {
+    async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, reqwest::Error> {
         let request = SendMessageRequest {
             chat_id,
             text: text.to_string(),
@@ -254,7 +315,31 @@ impl TelegramBot {
             .await?
             .error_for_status()?;
 
-        let _: TelegramResponse<TelegramMessage> = response.json().await?;
+        let body: TelegramResponse<TelegramMessage> = response.json().await?;
+        Ok(i64::from(body.result.message_id.unwrap_or_default()))
+    }
+
+    async fn edit_message_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+    ) -> Result<(), reqwest::Error> {
+        let request = EditMessageTextRequest {
+            chat_id,
+            message_id,
+            text: text.to_string(),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/editMessageText", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
         Ok(())
     }
 }
@@ -276,6 +361,7 @@ struct TelegramUpdate {
 struct TelegramMessage {
     chat: TelegramChat,
     text: Option<String>,
+    message_id: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +380,13 @@ struct GetUpdatesRequest {
 #[derive(Debug, Serialize)]
 struct SendMessageRequest {
     chat_id: i64,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EditMessageTextRequest {
+    chat_id: i64,
+    message_id: i64,
     text: String,
 }
 
@@ -324,22 +417,57 @@ pub struct StoredLocation {
     pub satellite_count: Option<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationState {
+    pub imei: String,
+    pub chat_id: i64,
+    pub last_status: String,
+    pub last_message_id: i64,
+    pub last_heartbeat_id: i64,
+}
+
+impl StoredHeartbeat {
+    pub fn notification_status(&self) -> Option<&str> {
+        match self.engine_status_guess.as_str() {
+            "on" => Some("on"),
+            "off" => Some("off"),
+            _ => None,
+        }
+    }
+}
+
 pub fn format_heartbeat_notification(heartbeat: &StoredHeartbeat) -> String {
     format!(
-        "Heartbeat update\nIMEI: {}\nServer time: {}\nEngine status: {} (heuristic)\nTerminal info: {} ({})\nVoltage level: {}\nGSM signal: {}",
+        "Heartbeat update\nIMEI: {}\nServer time: {}\nEngine status: {} (heuristic)\nTerminal info: {} ({})\nVoltage level: {}\nGSM signal: {}\nGPS tracking: {}\nACC high: {}\nVibration detected: {}",
         heartbeat.imei,
         heartbeat.server_received_at.format("%Y-%m-%d %H:%M:%S UTC"),
         heartbeat.engine_status_guess,
         heartbeat.terminal_info_raw,
         heartbeat.terminal_info_bits,
         heartbeat.voltage_level,
-        heartbeat.gsm_signal_strength
-    ) + &format!(
-        "\nGPS tracking: {}\nACC high: {}\nVibration detected: {}",
+        heartbeat.gsm_signal_strength,
         heartbeat.gps_tracking_on,
         option_bool(heartbeat.acc_high),
         heartbeat.vibration_detected
     )
+}
+
+pub fn format_engine_status_notification(heartbeat: &StoredHeartbeat, status: &str) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS)
+        .expect("valid WIB offset")
+        .from_utc_datetime(&heartbeat.server_received_at.naive_utc());
+
+    match status {
+        "on" => format!(
+            "Motor Dinyalakan\nKalau ini bukan kamu, segera cek lokasi motor.\n{}",
+            wib.format("%d %b %Y • %H:%M WIB")
+        ),
+        "off" => format!(
+            "Motor Dimatikan\nAktivitas terdeteksi pada motor kamu.\n{}",
+            wib.format("%d %b %Y • %H:%M WIB")
+        ),
+        _ => format_heartbeat_notification(heartbeat),
+    }
 }
 
 pub fn format_latest_location_message(location: &StoredLocation) -> String {
@@ -451,6 +579,64 @@ pub async fn fetch_new_heartbeats(
         .collect())
 }
 
+pub async fn fetch_notification_state(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Option<NotificationState>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT imei, chat_id, last_status, last_message_id, last_heartbeat_id
+        FROM telegram_device_notifications
+        WHERE imei = $1 AND chat_id = $2
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| NotificationState {
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        last_status: row.get("last_status"),
+        last_message_id: row.get("last_message_id"),
+        last_heartbeat_id: row.get("last_heartbeat_id"),
+    }))
+}
+
+pub async fn upsert_notification_state(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+    last_status: &str,
+    last_message_id: i64,
+    last_heartbeat_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO telegram_device_notifications (
+            imei, chat_id, last_status, last_message_id, last_heartbeat_id, updated_at
+        )
+        VALUES ($1, $2, $3, $4, $5, NOW())
+        ON CONFLICT (imei, chat_id) DO UPDATE
+        SET last_status = EXCLUDED.last_status,
+            last_message_id = EXCLUDED.last_message_id,
+            last_heartbeat_id = EXCLUDED.last_heartbeat_id,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .bind(last_status)
+    .bind(last_message_id)
+    .bind(last_heartbeat_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn fetch_latest_heartbeat(
     pool: &sqlx::PgPool,
 ) -> Result<Option<StoredHeartbeat>, sqlx::Error> {
@@ -558,6 +744,31 @@ mod tests {
         assert!(text.contains("heuristic"));
     }
 
+    #[test]
+    fn formats_engine_status_notification_message() {
+        let heartbeat = StoredHeartbeat {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            server_received_at: Utc.with_ymd_and_hms(2026, 4, 15, 9, 5, 0).unwrap(),
+            terminal_info_raw: 69,
+            terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
+            engine_status_guess: "on".to_string(),
+            voltage_level: 6,
+            gsm_signal_strength: 3,
+        };
+
+        let on_text = format_engine_status_notification(&heartbeat, "on");
+        assert!(on_text.contains("Motor Dinyalakan"));
+        assert!(on_text.contains("15 Apr 2026"));
+        assert!(on_text.contains("16:05 WIB"));
+
+        let off_text = format_engine_status_notification(&heartbeat, "off");
+        assert!(off_text.contains("Motor Dimatikan"));
+    }
+
     #[tokio::test]
     async fn stores_and_restores_bot_state() -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
@@ -569,7 +780,7 @@ mod tests {
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
         let database = Database::connect(&config).await?.expect("database configured");
-        sqlx::query("TRUNCATE telegram_bot_state RESTART IDENTITY")
+        sqlx::query("TRUNCATE telegram_bot_state, telegram_device_notifications RESTART IDENTITY")
             .execute(database.pool())
             .await?;
 
@@ -601,7 +812,7 @@ mod tests {
         ]);
         let database = Database::connect(&config).await?.expect("database configured");
         sqlx::query(
-            "TRUNCATE telegram_bot_state, device_heartbeats, device_locations, devices RESTART IDENTITY CASCADE",
+            "TRUNCATE telegram_bot_state, telegram_device_notifications, device_heartbeats, device_locations, devices RESTART IDENTITY CASCADE",
         )
         .execute(database.pool())
         .await?;
@@ -636,6 +847,42 @@ mod tests {
 
         let second_batch = fetch_new_heartbeats(database.pool(), first_batch[1].id).await?;
         assert!(second_batch.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stores_and_restores_notification_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config).await?.expect("database configured");
+        sqlx::query("TRUNCATE telegram_device_notifications RESTART IDENTITY")
+            .execute(database.pool())
+            .await?;
+
+        upsert_notification_state(
+            database.pool(),
+            "866221070478388",
+            12345,
+            "on",
+            777,
+            55,
+        )
+        .await?;
+
+        let state = fetch_notification_state(database.pool(), "866221070478388", 12345)
+            .await?
+            .expect("state should exist");
+        assert_eq!(state.last_status, "on");
+        assert_eq!(state.last_message_id, 777);
+        assert_eq!(state.last_heartbeat_id, 55);
 
         Ok(())
     }
