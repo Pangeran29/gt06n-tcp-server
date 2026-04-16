@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
-use reqwest::Client;
+use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use thiserror::Error;
@@ -35,6 +35,30 @@ pub enum BotCommand {
     Unknown(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionAction {
+    Yes,
+    No,
+}
+
+impl SessionAction {
+    fn parse(data: &str) -> Option<Self> {
+        let mut parts = data.split(':');
+        let prefix = parts.next()?;
+        let action = parts.next()?;
+
+        if prefix != "engine_session" || parts.next().is_some() {
+            return None;
+        }
+
+        Some(match action {
+            "yes" => Self::Yes,
+            "no" => Self::No,
+            _ => return None,
+        })
+    }
+}
+
 impl BotCommand {
     pub fn parse(text: &str) -> Option<Self> {
         let command = text.split_whitespace().next()?;
@@ -63,6 +87,7 @@ pub struct TelegramBot {
 }
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
+const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 
 impl TelegramBot {
     pub async fn from_config(config: &Config) -> Result<Self, BotError> {
@@ -114,6 +139,10 @@ impl TelegramBot {
                 self.handle_message(message).await?;
             }
 
+            if let Some(callback_query) = update.callback_query {
+                self.handle_callback_query(callback_query).await?;
+            }
+
             set_state_i64(
                 self.database.pool(),
                 "last_telegram_update_id",
@@ -152,8 +181,47 @@ impl TelegramBot {
 
                 match existing {
                     Some(existing) if existing.last_status == status => {
-                        if let Err(error) = self
-                            .edit_message_text(admin_chat_id, existing.last_message_id, &text)
+                        if status == "on" {
+                            if let Some(session) = fetch_active_pending_session(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                            )
+                            .await?
+                            {
+                                let text = format_engine_on_confirmation_message_with_duration(
+                                    &heartbeat,
+                                    Some(session.created_at),
+                                );
+                                let keyboard = engine_session_confirmation_keyboard();
+                                if let Err(error) = self
+                                    .edit_message_text(
+                                        admin_chat_id,
+                                        session.prompt_message_id,
+                                        &text,
+                                        Some(keyboard),
+                                    )
+                                    .await
+                                {
+                                    warn!(
+                                        error = %error,
+                                        imei = %heartbeat.imei,
+                                        message_id = session.prompt_message_id,
+                                        "failed to update pending confirmation message"
+                                    );
+                                }
+                            }
+                            upsert_notification_state(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                                status,
+                                existing.last_message_id,
+                                heartbeat.id,
+                            )
+                            .await?;
+                        } else if let Err(error) = self
+                            .edit_message_text(admin_chat_id, existing.last_message_id, &text, None)
                             .await
                         {
                             warn!(
@@ -185,7 +253,38 @@ impl TelegramBot {
                         }
                     }
                     _ => {
-                        let message_id = self.send_message(admin_chat_id, &text).await?;
+                        let message_id = if status == "on" {
+                            let message_id = self
+                                .send_engine_on_confirmation(admin_chat_id, &heartbeat)
+                                .await?;
+                            create_engine_session(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                                heartbeat.id,
+                                message_id,
+                            )
+                            .await?;
+                            message_id
+                        } else {
+                            if let Some(session) = fetch_active_confirmed_safe_session(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                admin_chat_id,
+                            )
+                            .await?
+                            {
+                                resolve_engine_session(
+                                    self.database.pool(),
+                                    session.id,
+                                    "finished",
+                                )
+                                .await?;
+                                self.send_message(admin_chat_id, format_session_finished_message())
+                                    .await?;
+                            }
+                            self.send_message(admin_chat_id, &text).await?
+                        };
                         upsert_notification_state(
                             self.database.pool(),
                             &heartbeat.imei,
@@ -280,6 +379,85 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn handle_callback_query(
+        &self,
+        callback_query: TelegramCallbackQuery,
+    ) -> Result<(), BotError> {
+        let Some(data) = callback_query.data.as_deref() else {
+            return Ok(());
+        };
+        let Some(action) = SessionAction::parse(data) else {
+            return Ok(());
+        };
+        let Some(message) = callback_query.message else {
+            return Ok(());
+        };
+        let chat_id = message.chat.id;
+        let prompt_message_id = i64::from(message.message_id.unwrap_or_default());
+
+        let Some(session) =
+            fetch_engine_session_by_prompt_message(self.database.pool(), chat_id, prompt_message_id)
+                .await?
+        else {
+            self.answer_callback_query(
+                &callback_query.id,
+                "Sesi tidak ditemukan atau sudah tidak aktif.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        };
+
+        if session.chat_id != chat_id || session.prompt_message_id != prompt_message_id {
+            self.answer_callback_query(
+                &callback_query.id,
+                "Sesi ini tidak cocok dengan pesan yang dipilih.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if session.session_status != "pending_confirmation" {
+            self.answer_callback_query(
+                &callback_query.id,
+                "Pilihan ini sudah diproses sebelumnya.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        self.clear_inline_keyboard(chat_id, prompt_message_id).await?;
+
+        match action {
+            SessionAction::Yes => {
+                if let Err(error) = self.send_engine_on_sticker(chat_id).await {
+                    warn!(error = %error, "failed to send engine-on sticker");
+                }
+                self.send_message(chat_id, format_ride_safe_message()).await?;
+                resolve_engine_session(self.database.pool(), session.id, "confirmed_safe").await?;
+                self.answer_callback_query(&callback_query.id, "Sip, sesi dikonfirmasi.", false)
+                    .await?;
+            }
+            SessionAction::No => {
+                let location =
+                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
+                let text = format_theft_warning_message(location.as_ref());
+                self.send_message(chat_id, &text).await?;
+                resolve_engine_session(self.database.pool(), session.id, "reported_theft").await?;
+                self.answer_callback_query(
+                    &callback_query.id,
+                    "Lokasi terakhir sudah dikirim.",
+                    false,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn get_updates(
         &self,
         offset: Option<i64>,
@@ -302,9 +480,51 @@ impl TelegramBot {
     }
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, reqwest::Error> {
+        self.send_message_internal(chat_id, text, None).await
+    }
+
+    async fn send_engine_on_confirmation(
+        &self,
+        chat_id: i64,
+        heartbeat: &StoredHeartbeat,
+    ) -> Result<i64, reqwest::Error> {
+        let text = format_engine_on_confirmation_message(heartbeat);
+        let keyboard = engine_session_confirmation_keyboard();
+
+        self.send_message_internal(chat_id, &text, Some(keyboard)).await
+    }
+
+    async fn send_engine_on_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
+        let sticker_part = multipart::Part::bytes(ENGINE_ON_STICKER_BYTES.to_vec())
+            .file_name("AnimatedSticker.tgs")
+            .mime_str("application/x-tgsticker")?;
+
+        let form = multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("sticker", sticker_part);
+
+        let response = self
+            .client
+            .post(format!("{}/sendSticker", self.base_url))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn send_message_internal(
+        &self,
+        chat_id: i64,
+        text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<i64, reqwest::Error> {
         let request = SendMessageRequest {
             chat_id,
             text: text.to_string(),
+            reply_markup,
         };
 
         let response = self
@@ -324,16 +544,65 @@ impl TelegramBot {
         chat_id: i64,
         message_id: i64,
         text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
     ) -> Result<(), reqwest::Error> {
         let request = EditMessageTextRequest {
             chat_id,
             message_id,
             text: text.to_string(),
+            reply_markup,
         };
 
         let response = self
             .client
             .post(format!("{}/editMessageText", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn clear_inline_keyboard(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<(), reqwest::Error> {
+        let request = EditMessageReplyMarkupRequest {
+            chat_id,
+            message_id,
+            reply_markup: None,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/editMessageReplyMarkup", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn answer_callback_query(
+        &self,
+        callback_query_id: &str,
+        text: &str,
+        show_alert: bool,
+    ) -> Result<(), reqwest::Error> {
+        let request = AnswerCallbackQueryRequest {
+            callback_query_id: callback_query_id.to_string(),
+            text: text.to_string(),
+            show_alert,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/answerCallbackQuery", self.base_url))
             .json(&request)
             .send()
             .await?
@@ -355,6 +624,7 @@ struct TelegramResponse<T> {
 struct TelegramUpdate {
     update_id: i32,
     message: Option<TelegramMessage>,
+    callback_query: Option<TelegramCallbackQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,6 +632,13 @@ struct TelegramMessage {
     chat: TelegramChat,
     text: Option<String>,
     message_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramCallbackQuery {
+    id: String,
+    data: Option<String>,
+    message: Option<TelegramMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,6 +658,8 @@ struct GetUpdatesRequest {
 struct SendMessageRequest {
     chat_id: i64,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -388,6 +667,49 @@ struct EditMessageTextRequest {
     chat_id: i64,
     message_id: i64,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+#[derive(Debug, Serialize)]
+struct EditMessageReplyMarkupRequest {
+    chat_id: i64,
+    message_id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<InlineKeyboardMarkup>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnswerCallbackQueryRequest {
+    callback_query_id: String,
+    text: String,
+    show_alert: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct InlineKeyboardMarkup {
+    inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct InlineKeyboardButton {
+    text: String,
+    callback_data: String,
+}
+
+fn engine_session_confirmation_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton {
+                text: "Yes, it's me".to_string(),
+                callback_data: "engine_session:yes".to_string(),
+            },
+            InlineKeyboardButton {
+                text: "No, not me".to_string(),
+                callback_data: "engine_session:no".to_string(),
+            },
+        ]],
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -424,6 +746,18 @@ pub struct NotificationState {
     pub last_status: String,
     pub last_message_id: i64,
     pub last_heartbeat_id: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineSession {
+    pub id: i64,
+    pub imei: String,
+    pub chat_id: i64,
+    pub trigger_heartbeat_id: i64,
+    pub prompt_message_id: i64,
+    pub ride_status_message_id: Option<i64>,
+    pub session_status: String,
+    pub created_at: DateTime<Utc>,
 }
 
 impl StoredHeartbeat {
@@ -467,6 +801,83 @@ pub fn format_engine_status_notification(heartbeat: &StoredHeartbeat, status: &s
             wib.format("%d %b %Y • %H:%M WIB")
         ),
         _ => format_heartbeat_notification(heartbeat),
+    }
+}
+
+pub fn format_engine_on_confirmation_message(heartbeat: &StoredHeartbeat) -> String {
+    format_engine_on_confirmation_message_with_duration(heartbeat, None)
+}
+
+pub fn format_engine_on_confirmation_message_with_duration(
+    heartbeat: &StoredHeartbeat,
+    started_at: Option<DateTime<Utc>>,
+) -> String {
+    let _ = heartbeat;
+    let _ = started_at;
+
+    format!(
+        "WARNING! Motor ON detected.\nConfirm is this you?",
+    )
+}
+
+pub fn format_ride_safe_message() -> &'static str {
+    "Copy. Ride safe, We are tracking you in case there's something wrong."
+}
+
+pub fn format_session_finished_message() -> &'static str {
+    "Ride session ended."
+}
+
+pub fn format_theft_warning_message(location: Option<&StoredLocation>) -> String {
+    let mut text =
+        "there's indication that the motor is being \"dicuri\" rn use below link to detect your motor"
+            .to_string();
+
+    if let Some(location) = location {
+        text.push_str("\n\n");
+        text.push_str(&format_latest_location_message(location));
+    } else {
+        text.push_str("\n\nLokasi terakhir belum tersedia.");
+    }
+
+    text
+}
+
+pub fn format_ride_session_status_message(
+    session: &EngineSession,
+    heartbeat: &StoredHeartbeat,
+) -> String {
+    let start = FixedOffset::east_opt(WIB_OFFSET_SECONDS)
+        .expect("valid WIB offset")
+        .from_utc_datetime(&session.created_at.naive_utc());
+    let duration = heartbeat
+        .server_received_at
+        .signed_duration_since(session.created_at)
+        .to_std()
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    format!(
+        "Current Session\nYou started riding at {}.\nIt has been {:02}:{:02}:{:02} on the road so far.\nGPS tracking is currently {} and your connection quality is {}.",
+        start.format("%d %b %Y • %H:%M WIB"),
+        hours,
+        minutes,
+        seconds,
+        if heartbeat.gps_tracking_on { "on" } else { "off" },
+        connection_status_label(heartbeat.gsm_signal_strength),
+    )
+}
+
+fn connection_status_label(gsm_signal_strength: i32) -> &'static str {
+    match gsm_signal_strength.clamp(1, 4) {
+        1 => "1 = bad connection",
+        2 => "2 = slow",
+        3 => "3 = ok",
+        4 => "4 = excelent",
+        _ => "unknown",
     }
 }
 
@@ -605,6 +1016,173 @@ pub async fn fetch_notification_state(
     }))
 }
 
+pub async fn create_engine_session(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+    trigger_heartbeat_id: i64,
+    prompt_message_id: i64,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO telegram_engine_sessions (
+            imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id,
+            session_status, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, $4, NULL, 'pending_confirmation', NOW(), NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .bind(trigger_heartbeat_id)
+    .bind(prompt_message_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.get("id"))
+}
+
+pub async fn fetch_engine_session_by_prompt_message(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    prompt_message_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        FROM telegram_engine_sessions
+        WHERE chat_id = $1 AND prompt_message_id = $2
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(chat_id)
+    .bind(prompt_message_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+    }))
+}
+
+pub async fn resolve_engine_session(
+    pool: &sqlx::PgPool,
+    session_id: i64,
+    session_status: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE telegram_engine_sessions
+        SET session_status = $2,
+            updated_at = NOW(),
+            resolved_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .bind(session_status)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn set_engine_session_ride_status_message_id(
+    pool: &sqlx::PgPool,
+    session_id: i64,
+    ride_status_message_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE telegram_engine_sessions
+        SET ride_status_message_id = $2,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(session_id)
+    .bind(ride_status_message_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn fetch_active_confirmed_safe_session(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND session_status = 'confirmed_safe'
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+    }))
+}
+
+pub async fn fetch_active_pending_session(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND session_status = 'pending_confirmation'
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+    }))
+}
+
 pub async fn upsert_notification_state(
     pool: &sqlx::PgPool,
     imei: &str,
@@ -668,6 +1246,40 @@ pub async fn fetch_latest_heartbeat(
     }))
 }
 
+pub async fn fetch_latest_heartbeat_for_imei(
+    pool: &sqlx::PgPool,
+    imei: &str,
+) -> Result<Option<StoredHeartbeat>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, server_received_at, terminal_info_raw, terminal_info_bits,
+               gps_tracking_on, acc_high, vibration_detected, engine_status_guess,
+               voltage_level, gsm_signal_strength
+        FROM device_heartbeats
+        WHERE imei = $1
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| StoredHeartbeat {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        server_received_at: row.get("server_received_at"),
+        terminal_info_raw: row.get("terminal_info_raw"),
+        terminal_info_bits: row.get("terminal_info_bits"),
+        gps_tracking_on: row.get("gps_tracking_on"),
+        acc_high: row.get("acc_high"),
+        vibration_detected: row.get("vibration_detected"),
+        engine_status_guess: row.get("engine_status_guess"),
+        voltage_level: row.get("voltage_level"),
+        gsm_signal_strength: row.get("gsm_signal_strength"),
+    }))
+}
+
 pub async fn fetch_latest_location(
     pool: &sqlx::PgPool,
 ) -> Result<Option<StoredLocation>, sqlx::Error> {
@@ -681,6 +1293,35 @@ pub async fn fetch_latest_location(
         LIMIT 1
         "#,
     )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| StoredLocation {
+        imei: row.get("imei"),
+        last_seen_at: row.get("last_seen_at"),
+        gps_timestamp: row.get("latest_gps_timestamp"),
+        latitude: row.get("latest_latitude"),
+        longitude: row.get("latest_longitude"),
+        speed_kph: row.get("latest_speed_kph"),
+        course: row.get("latest_course"),
+        satellite_count: row.get("latest_satellite_count"),
+    }))
+}
+
+pub async fn fetch_latest_location_for_imei(
+    pool: &sqlx::PgPool,
+    imei: &str,
+) -> Result<Option<StoredLocation>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT imei, last_seen_at, latest_gps_timestamp, latest_latitude, latest_longitude,
+               latest_speed_kph, latest_course, latest_satellite_count
+        FROM devices
+        WHERE imei = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
     .fetch_optional(pool)
     .await?;
 
@@ -720,6 +1361,13 @@ mod tests {
             Some(BotCommand::LatestLocation)
         );
         assert_eq!(BotCommand::parse("hello"), None);
+    }
+
+    #[test]
+    fn parses_session_actions() {
+        assert_eq!(SessionAction::parse("engine_session:yes"), Some(SessionAction::Yes));
+        assert_eq!(SessionAction::parse("engine_session:no"), Some(SessionAction::No));
+        assert_eq!(SessionAction::parse("engine_session:maybe"), None);
     }
 
     #[test]
@@ -883,6 +1531,39 @@ mod tests {
         assert_eq!(state.last_status, "on");
         assert_eq!(state.last_message_id, 777);
         assert_eq!(state.last_heartbeat_id, 55);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn creates_and_resolves_engine_session(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config).await?.expect("database configured");
+        sqlx::query("TRUNCATE telegram_engine_sessions RESTART IDENTITY")
+            .execute(database.pool())
+            .await?;
+
+        let session_id =
+            create_engine_session(database.pool(), "866221070478388", 12345, 88, 999).await?;
+        let session = fetch_engine_session_by_prompt_message(database.pool(), 12345, 999)
+            .await?
+            .expect("session should exist");
+        assert_eq!(session.id, session_id);
+        assert_eq!(session.session_status, "pending_confirmation");
+
+        resolve_engine_session(database.pool(), session_id, "confirmed_safe").await?;
+        let resolved = fetch_engine_session_by_prompt_message(database.pool(), 12345, 999)
+            .await?
+            .expect("resolved session should exist");
+        assert_eq!(resolved.session_status, "confirmed_safe");
 
         Ok(())
     }
