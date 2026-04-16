@@ -202,3 +202,4 @@ later
 how's you riding, you traveled 40km today, your average speed is 40km, you are riding for 40 minutes, open this link to view detail perjalana.
 or
 youre ridign for 40km today, click link below to see your riding activity
+# hearthbeats-client
