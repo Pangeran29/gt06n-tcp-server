@@ -192,13 +192,6 @@ The main remaining work is:
 - improve production hardening, especially running the service under a dedicated Linux user instead of `/root`
 
 
-
-motor on, is this you?
-a. yes, its me -> okay, enjoy your ride
-b. not, me -> there's indication that the motor is being "dicuri" rn use below link to detect your motor
-
-later
-
-how's you riding, you traveled 40km today, your average speed is 40km, you are riding for 40 minutes, open this link to view detail perjalana.
-or
-youre ridign for 40km today, click link below to see your riding activity
+- all menu access start from command /start
+- imporve flow when the session is not confirmed (not select between yes or no when engine on open a new session to). right now it only send detail of motor off, instead just send like default session end for "Yes" option. bot resolves session as finished and sends a ride summary
+- integrate onboard, /start -> check status first, /start -> give avaiable option

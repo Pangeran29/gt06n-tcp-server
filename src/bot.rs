@@ -349,6 +349,49 @@ impl TelegramBot {
                             )
                             .await?;
                             message_id
+                        } else if let Some(session) = fetch_active_pending_session(
+                            self.database.pool(),
+                            &heartbeat.imei,
+                            admin_chat_id,
+                        )
+                        .await?
+                        {
+                            if let Err(error) = self
+                                .clear_inline_keyboard(admin_chat_id, session.prompt_message_id)
+                                .await
+                            {
+                                warn!(
+                                    error = %error,
+                                    imei = %heartbeat.imei,
+                                    message_id = session.prompt_message_id,
+                                    "failed to clear pending confirmation keyboard before finishing session"
+                                );
+                            }
+
+                            resolve_engine_session(
+                                self.database.pool(),
+                                session.id,
+                                "finished",
+                            )
+                            .await?;
+                            self.send_message(admin_chat_id, format_session_finished_message())
+                                .await?;
+                            let ride_summary = fetch_ride_summary(
+                                self.database.pool(),
+                                &heartbeat.imei,
+                                session.created_at,
+                                heartbeat.server_received_at,
+                            )
+                            .await?;
+                            self.send_message(
+                                admin_chat_id,
+                                &format_ride_summary_message(
+                                    &session,
+                                    heartbeat.server_received_at,
+                                    ride_summary.as_ref(),
+                                ),
+                            )
+                            .await?
                         } else {
                             if let Some(session) = fetch_active_confirmed_safe_session(
                                 self.database.pool(),
@@ -512,8 +555,6 @@ impl TelegramBot {
         let Some(action) = SessionAction::parse(data) else {
             return Ok(());
         };
-        self.answer_callback_query(&callback_query.id, "", false)
-            .await?;
         let prompt_message_id = i64::from(message.message_id.unwrap_or_default());
 
         let Some(session) =
@@ -522,7 +563,7 @@ impl TelegramBot {
         else {
             self.answer_callback_query(
                 &callback_query.id,
-                "Sesi tidak ditemukan atau sudah tidak aktif.",
+                "Session not found or already inactive.",
                 false,
             )
             .await?;
@@ -532,7 +573,7 @@ impl TelegramBot {
         if session.chat_id != chat_id || session.prompt_message_id != prompt_message_id {
             self.answer_callback_query(
                 &callback_query.id,
-                "Sesi ini tidak cocok dengan pesan yang dipilih.",
+                "This session does not match the selected message.",
                 false,
             )
             .await?;
@@ -542,13 +583,15 @@ impl TelegramBot {
         if session.session_status != "pending_confirmation" {
             self.answer_callback_query(
                 &callback_query.id,
-                "Pilihan ini sudah diproses sebelumnya.",
+                "This session already ended.",
                 false,
             )
             .await?;
             return Ok(());
         }
 
+        self.answer_callback_query(&callback_query.id, "", false)
+            .await?;
         self.clear_inline_keyboard(chat_id, prompt_message_id).await?;
 
         match action {
@@ -1994,7 +2037,7 @@ mod tests {
     fn formats_theft_warning_message() {
         let text = format_theft_warning_message();
         assert!(text.contains("Pay attention"));
-        assert!(text.contains("stream the realtime hearthbeats and location"));
+        assert!(text.contains("Use button below to track your motor"));
     }
 
     #[test]

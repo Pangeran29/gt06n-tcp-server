@@ -40,6 +40,8 @@ Business meaning:
 What it stores:
 
 - IMEI
+- SIM card number / label
+- SIM card expiration date
 - first seen / last seen
 - last login / last heartbeat / last location time
 - latest known location summary
