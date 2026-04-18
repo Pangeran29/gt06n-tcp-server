@@ -29,8 +29,6 @@ pub enum BotError {
 pub enum BotCommand {
     Start,
     Help,
-    LastHeartbeat,
-    LatestLocation,
     Unknown(String),
 }
 
@@ -48,9 +46,9 @@ enum SessionAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TheftAlertAction {
-    StreamLocation { session_id: i64 },
-    CheckLatestStatus { session_id: i64 },
-    ContactSupport { session_id: i64 },
+    StreamLocation { session_id: Option<i64> },
+    CheckLatestStatus { session_id: Option<i64> },
+    ContactSupport { session_id: Option<i64> },
 }
 
 impl SessionAction {
@@ -76,7 +74,10 @@ impl TheftAlertAction {
         let mut parts = data.split(':');
         let prefix = parts.next()?;
         let action = parts.next()?;
-        let session_id = parts.next()?.parse().ok()?;
+        let session_id = match parts.next() {
+            Some(value) => Some(value.parse().ok()?),
+            None => None,
+        };
 
         if prefix != "theft_alert" || parts.next().is_some() {
             return None;
@@ -99,8 +100,6 @@ impl BotCommand {
         Some(match normalized {
             "/start" => Self::Start,
             "/help" => Self::Help,
-            "/last_heartbeat" => Self::LastHeartbeat,
-            "/latest_location" => Self::LatestLocation,
             other if other.starts_with('/') => Self::Unknown(other.to_string()),
             _ => return None,
         })
@@ -505,6 +504,12 @@ impl TelegramBot {
         if let Err(error) = self.send_bind_success_sticker(chat_id).await {
             warn!(error = %error, "failed to send bind-success sticker");
         }
+        self.send_message_internal(
+            chat_id,
+            &format_start_status_message(),
+            Some(theft_alert_keyboard(None)),
+        )
+        .await?;
 
         Ok(())
     }
@@ -521,9 +526,10 @@ impl TelegramBot {
             BotCommand::Start => {
                 match user {
                     Some(user) if user.bound_imei.is_some() => {
-                        self.send_message(
+                        self.send_message_internal(
                             chat_id,
-                            &format_start_status_message(&user),
+                            &format_start_status_message(),
+                            Some(theft_alert_keyboard(None)),
                         )
                         .await?;
                     }
@@ -545,40 +551,6 @@ impl TelegramBot {
             }
             BotCommand::Help => {
                 self.send_message(chat_id, HELP_TEXT).await?;
-            }
-            BotCommand::LastHeartbeat => {
-                let Some(bound_imei) = user.as_ref().and_then(|value| value.bound_imei.as_deref()) else {
-                    self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
-                        .await?;
-                    return Ok(());
-                };
-
-                let response = if let Some(heartbeat) =
-                    fetch_latest_heartbeat_for_imei(self.database.pool(), bound_imei).await?
-                {
-                    format_heartbeat_notification(&heartbeat)
-                } else {
-                    "No heartbeat data is stored for your device yet.".to_string()
-                };
-
-                self.send_message(chat_id, &response).await?;
-            }
-            BotCommand::LatestLocation => {
-                let Some(bound_imei) = user.as_ref().and_then(|value| value.bound_imei.as_deref()) else {
-                    self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
-                        .await?;
-                    return Ok(());
-                };
-
-                let response = if let Some(location) =
-                    fetch_latest_location_for_imei(self.database.pool(), bound_imei).await?
-                {
-                    format_latest_location_message(&location)
-                } else {
-                    "No location data is stored for your device yet.".to_string()
-                };
-
-                self.send_message(chat_id, &response).await?;
             }
             BotCommand::Unknown(command) => {
                 self.send_message(
@@ -667,7 +639,7 @@ impl TelegramBot {
                 self.send_message_internal(
                     chat_id,
                     format_theft_warning_message(),
-                    Some(theft_alert_keyboard(session.id)),
+                    Some(theft_alert_keyboard(Some(session.id))),
                 )
                 .await?;
                 resolve_engine_session(self.database.pool(), session.id, "reported_theft").await?;
@@ -683,35 +655,58 @@ impl TelegramBot {
         action: TheftAlertAction,
     ) -> Result<(), BotError> {
         let chat_id = message.chat.id;
-        let session_id = match action {
+        let session_id = match &action {
             TheftAlertAction::StreamLocation { session_id }
             | TheftAlertAction::CheckLatestStatus { session_id }
-            | TheftAlertAction::ContactSupport { session_id } => session_id,
+            | TheftAlertAction::ContactSupport { session_id } => *session_id,
         };
 
-        let Some(session) = fetch_engine_session_by_id(self.database.pool(), session_id).await?
-        else {
-            return Ok(());
+        let user = fetch_telegram_user_by_chat_id(self.database.pool(), chat_id).await?;
+        let bound_imei = user.as_ref().and_then(|value| value.bound_imei.as_deref());
+
+        let session = if let Some(session_id) = session_id {
+            let Some(session) = fetch_engine_session_by_id(self.database.pool(), session_id).await?
+            else {
+                return Ok(());
+            };
+
+            if session.chat_id != chat_id {
+                return Ok(());
+            }
+
+            Some(session)
+        } else {
+            None
         };
 
-        if session.chat_id != chat_id {
+        let session_imei = session.as_ref().map(|value| value.imei.clone());
+        let imei = if let Some(session_imei) = session_imei.as_deref() {
+            session_imei
+        } else if let Some(bound_imei) = bound_imei {
+            bound_imei
+        } else {
+            self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
+                .await?;
             return Ok(());
-        }
+        };
 
         match action {
             TheftAlertAction::StreamLocation { .. } => {
-                let location =
-                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
+                let location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
                 let text = format_stream_location_message(location.as_ref());
                 self.send_message(chat_id, &text).await?;
             }
             TheftAlertAction::CheckLatestStatus { .. } => {
-                let location =
-                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
-                let latest_heartbeat =
-                    fetch_latest_heartbeat_for_imei(self.database.pool(), &session.imei).await?;
+                let location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
+                let latest_heartbeat = fetch_latest_heartbeat_for_imei(self.database.pool(), imei).await?;
+                let fallback_session = session.unwrap_or_else(|| build_status_session(
+                    imei,
+                    chat_id,
+                    latest_heartbeat.as_ref(),
+                    location.as_ref(),
+                ));
                 let text = format_latest_motor_status_initial_message(
-                    &session,
+                    &fallback_session,
                     latest_heartbeat.as_ref(),
                     location.as_ref(),
                     Utc::now(),
@@ -912,7 +907,7 @@ impl TelegramBot {
     }
 }
 
-pub const HELP_TEXT: &str = "/start - bind this Telegram account to your device or show binding status\n/help - show available commands\n/last_heartbeat - show the most recent stored heartbeat for your bound device\n/latest_location - show the latest stored device location for your bound device";
+pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, tracking real time motor position, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message";
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -1017,24 +1012,31 @@ fn engine_session_confirmation_keyboard() -> InlineKeyboardMarkup {
     }
 }
 
-fn theft_alert_keyboard(session_id: i64) -> InlineKeyboardMarkup {
+fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![
             vec![
                 InlineKeyboardButton {
                     text: "stream location".to_string(),
-                    callback_data: format!("theft_alert:stream_location:{session_id}"),
+                    callback_data: theft_alert_callback_data("stream_location", session_id),
                 },
                 InlineKeyboardButton {
                     text: "check latest status".to_string(),
-                    callback_data: format!("theft_alert:check_latest_status:{session_id}"),
+                    callback_data: theft_alert_callback_data("check_latest_status", session_id),
                 },
             ],
             vec![InlineKeyboardButton {
                 text: "contact support".to_string(),
-                callback_data: format!("theft_alert:contact_support:{session_id}"),
+                callback_data: theft_alert_callback_data("contact_support", session_id),
             }],
         ],
+    }
+}
+
+fn theft_alert_callback_data(action: &str, session_id: Option<i64>) -> String {
+    match session_id {
+        Some(session_id) => format!("theft_alert:{action}:{session_id}"),
+        None => format!("theft_alert:{action}"),
     }
 }
 
@@ -1413,12 +1415,33 @@ pub fn format_latest_location_message(location: &StoredLocation) -> String {
     )
 }
 
-fn format_start_status_message(user: &TelegramUserRecord) -> String {
-    let bound_imei = user.bound_imei.as_deref().unwrap_or("not bound");
-    format!(
-        "Your Telegram account is already bound.\nIMEI: {}",
-        bound_imei
-    )
+fn format_start_status_message() -> String {
+    "🛵 welcome to @tryheartbeatsbot 🛣 \n\nclick /help for more information."
+        .to_string()
+}
+
+fn build_status_session(
+    imei: &str,
+    chat_id: i64,
+    heartbeat: Option<&StoredHeartbeat>,
+    location: Option<&StoredLocation>,
+) -> EngineSession {
+    let created_at = heartbeat
+        .map(|value| value.server_received_at)
+        .or_else(|| location.and_then(|value| value.last_seen_at))
+        .unwrap_or_else(Utc::now);
+
+    EngineSession {
+        id: 0,
+        imei: imei.to_string(),
+        chat_id,
+        trigger_heartbeat_id: heartbeat.map(|value| value.id).unwrap_or(0),
+        prompt_message_id: 0,
+        ride_status_message_id: None,
+        session_status: "bound".to_string(),
+        created_at,
+        resolved_at: None,
+    }
 }
 
 fn option_f64(value: Option<f64>) -> String {
@@ -1499,6 +1522,35 @@ async fn fetch_telegram_user_by_user_id(
 
     Ok(row.and_then(|row| {
         let registration_status = parse_registration_status(row.get::<String, _>("registration_status").as_str())?;
+        Some(TelegramUserRecord {
+            telegram_user_id: row.get("telegram_user_id"),
+            chat_id: row.get("chat_id"),
+            bound_imei: row.get("bound_imei"),
+            registration_status,
+        })
+    }))
+}
+
+async fn fetch_telegram_user_by_chat_id(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+) -> Result<Option<TelegramUserRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT telegram_user_id, chat_id, bound_imei, registration_status
+        FROM telegram_users
+        WHERE chat_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|row| {
+        let registration_status = parse_registration_status(
+            row.get::<String, _>("registration_status").as_str(),
+        )?;
         Some(TelegramUserRecord {
             telegram_user_id: row.get("telegram_user_id"),
             chat_id: row.get("chat_id"),
@@ -2215,10 +2267,7 @@ mod tests {
     fn parses_commands() {
         assert_eq!(BotCommand::parse("/start"), Some(BotCommand::Start));
         assert_eq!(BotCommand::parse("/help"), Some(BotCommand::Help));
-        assert_eq!(
-            BotCommand::parse("/latest_location@my_bot"),
-            Some(BotCommand::LatestLocation)
-        );
+        assert_eq!(BotCommand::parse("/latest_location@my_bot"), Some(BotCommand::Unknown("/latest_location".to_string())));
         assert_eq!(BotCommand::parse("hello"), None);
     }
 
@@ -2240,15 +2289,19 @@ mod tests {
     fn parses_theft_alert_actions() {
         assert_eq!(
             TheftAlertAction::parse("theft_alert:stream_location:12"),
-            Some(TheftAlertAction::StreamLocation { session_id: 12 })
+            Some(TheftAlertAction::StreamLocation { session_id: Some(12) })
         );
         assert_eq!(
             TheftAlertAction::parse("theft_alert:check_latest_status:9"),
-            Some(TheftAlertAction::CheckLatestStatus { session_id: 9 })
+            Some(TheftAlertAction::CheckLatestStatus { session_id: Some(9) })
         );
         assert_eq!(
             TheftAlertAction::parse("theft_alert:contact_support:5"),
-            Some(TheftAlertAction::ContactSupport { session_id: 5 })
+            Some(TheftAlertAction::ContactSupport { session_id: Some(5) })
+        );
+        assert_eq!(
+            TheftAlertAction::parse("theft_alert:stream_location"),
+            Some(TheftAlertAction::StreamLocation { session_id: None })
         );
         assert_eq!(TheftAlertAction::parse("theft_alert:record_sound:1"), None);
     }
