@@ -29,10 +29,15 @@ pub enum BotError {
 pub enum BotCommand {
     Start,
     Help,
-    BindMe,
     LastHeartbeat,
     LatestLocation,
     Unknown(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramRegistrationStatus {
+    AwaitingImei,
+    Bound,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +99,6 @@ impl BotCommand {
         Some(match normalized {
             "/start" => Self::Start,
             "/help" => Self::Help,
-            "/bind_me" => Self::BindMe,
             "/last_heartbeat" => Self::LastHeartbeat,
             "/latest_location" => Self::LatestLocation,
             other if other.starts_with('/') => Self::Unknown(other.to_string()),
@@ -110,11 +114,11 @@ pub struct TelegramBot {
     base_url: String,
     poll_timeout_secs: u64,
     heartbeat_poll_interval_ms: u64,
-    preconfigured_admin_chat_id: Option<i64>,
 }
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
+const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
 
 impl TelegramBot {
     pub async fn from_config(config: &Config) -> Result<Self, BotError> {
@@ -130,16 +134,11 @@ impl TelegramBot {
             base_url: format!("https://api.telegram.org/bot{token}"),
             poll_timeout_secs: config.telegram_poll_timeout_secs,
             heartbeat_poll_interval_ms: config.telegram_heartbeat_poll_interval_ms,
-            preconfigured_admin_chat_id: config.telegram_admin_chat_id,
         })
     }
 
     pub async fn run(&self) -> Result<(), BotError> {
         info!("telegram bot started");
-
-        if let Some(chat_id) = self.preconfigured_admin_chat_id {
-            ensure_admin_chat_id(self.database.pool(), chat_id).await?;
-        }
 
         loop {
             if let Err(error) = self.process_updates().await {
@@ -182,17 +181,6 @@ impl TelegramBot {
     }
 
     async fn process_heartbeat_notifications(&self) -> Result<(), BotError> {
-        let admin_chat_id = if let Some(chat_id) = self.preconfigured_admin_chat_id {
-            Some(chat_id)
-        } else {
-            get_state_i64(self.database.pool(), "admin_chat_id").await?
-        };
-
-        let Some(admin_chat_id) = admin_chat_id else {
-            warn!("telegram admin chat is not configured; heartbeat notifications are paused");
-            return Ok(());
-        };
-
         let last_notified = get_state_i64(self.database.pool(), "last_notified_heartbeat_id")
             .await?
             .unwrap_or(0);
@@ -200,254 +188,24 @@ impl TelegramBot {
         let heartbeats = fetch_new_heartbeats(self.database.pool(), last_notified).await?;
 
         for heartbeat in heartbeats {
+            let notification_chat_ids =
+                fetch_notification_chat_ids_for_imei(self.database.pool(), &heartbeat.imei)
+                    .await?;
+
+            if notification_chat_ids.is_empty() {
+                set_state_i64(
+                    self.database.pool(),
+                    "last_notified_heartbeat_id",
+                    heartbeat.id,
+                )
+                .await?;
+                continue;
+            }
+
             if let Some(status) = heartbeat.notification_status() {
-                let existing =
-                    fetch_notification_state(self.database.pool(), &heartbeat.imei, admin_chat_id)
+                for chat_id in notification_chat_ids {
+                    self.process_heartbeat_notification_for_chat(&heartbeat, status, chat_id)
                         .await?;
-                let text = format_engine_status_notification(&heartbeat, status);
-
-                match existing {
-                    Some(existing) if existing.last_status == status => {
-                        if status == "on" {
-                            if let Some(session) = fetch_active_pending_session(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                            )
-                            .await?
-                            {
-                                let text = format_engine_on_confirmation_message_with_duration(
-                                    &heartbeat,
-                                    Some(session.created_at),
-                                );
-                                let keyboard = engine_session_confirmation_keyboard();
-                                if let Err(error) = self
-                                    .edit_message_text(
-                                        admin_chat_id,
-                                        session.prompt_message_id,
-                                        &text,
-                                        Some(keyboard),
-                                    )
-                                    .await
-                                {
-                                    warn!(
-                                        error = %error,
-                                        imei = %heartbeat.imei,
-                                        message_id = session.prompt_message_id,
-                                        "failed to update pending confirmation message"
-                                    );
-                                }
-                            }
-                            upsert_notification_state(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                                status,
-                                existing.last_message_id,
-                                heartbeat.id,
-                            )
-                            .await?;
-                        } else {
-                            let theft_off_session = fetch_latest_theft_off_session(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                            )
-                            .await?;
-                            let off_text = if let Some(session) = theft_off_session.filter(|session| {
-                                session.ride_status_message_id == Some(existing.last_message_id)
-                            }) {
-                                let off_started_at =
-                                    session.resolved_at.unwrap_or(heartbeat.server_received_at);
-                                format_theft_engine_off_follow_up_message(off_started_at, Utc::now())
-                            } else {
-                                continue;
-                            };
-
-                            if let Err(error) = self
-                                .edit_message_text(
-                                    admin_chat_id,
-                                    existing.last_message_id,
-                                    &off_text,
-                                    None,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    error = %error,
-                                    imei = %heartbeat.imei,
-                                    message_id = existing.last_message_id,
-                                    "failed to edit existing status message; sending a new one"
-                                );
-                                let message_id = self
-                                    .send_message_internal(
-                                        admin_chat_id,
-                                        &off_text,
-                                        None,
-                                    )
-                                    .await?;
-                                upsert_notification_state(
-                                    self.database.pool(),
-                                    &heartbeat.imei,
-                                    admin_chat_id,
-                                    status,
-                                    message_id,
-                                    heartbeat.id,
-                                )
-                                .await?;
-                            } else {
-                                upsert_notification_state(
-                                    self.database.pool(),
-                                    &heartbeat.imei,
-                                    admin_chat_id,
-                                    status,
-                                    existing.last_message_id,
-                                    heartbeat.id,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    _ => {
-                        let message_id = if status == "on" {
-                            let message_id = self
-                                .send_engine_on_confirmation(admin_chat_id, &heartbeat)
-                                .await?;
-                            create_engine_session(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                                heartbeat.id,
-                                message_id,
-                            )
-                            .await?;
-                            message_id
-                        } else if let Some(session) = fetch_active_reported_theft_session(
-                            self.database.pool(),
-                            &heartbeat.imei,
-                            admin_chat_id,
-                        )
-                        .await?
-                        {
-                            let message_id = self
-                                .send_message_internal(
-                                    admin_chat_id,
-                                    format_theft_engine_off_message(),
-                                    None,
-                                )
-                                .await?;
-                            set_engine_session_ride_status_message_id(
-                                self.database.pool(),
-                                session.id,
-                                message_id,
-                            )
-                            .await?;
-                            resolve_engine_session(
-                                self.database.pool(),
-                                session.id,
-                                "theft_engine_off",
-                            )
-                            .await?;
-                            message_id
-                        } else if let Some(session) = fetch_active_pending_session(
-                            self.database.pool(),
-                            &heartbeat.imei,
-                            admin_chat_id,
-                        )
-                        .await?
-                        {
-                            if let Err(error) = self
-                                .clear_inline_keyboard(admin_chat_id, session.prompt_message_id)
-                                .await
-                            {
-                                warn!(
-                                    error = %error,
-                                    imei = %heartbeat.imei,
-                                    message_id = session.prompt_message_id,
-                                    "failed to clear pending confirmation keyboard before finishing session"
-                                );
-                            }
-
-                            resolve_engine_session(
-                                self.database.pool(),
-                                session.id,
-                                "finished",
-                            )
-                            .await?;
-                            self.send_message(admin_chat_id, format_session_finished_message())
-                                .await?;
-                            let ride_summary = fetch_ride_summary(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                session.created_at,
-                                heartbeat.server_received_at,
-                            )
-                            .await?;
-                            self.send_message(
-                                admin_chat_id,
-                                &format_ride_summary_message(
-                                    &session,
-                                    heartbeat.server_received_at,
-                                    ride_summary.as_ref(),
-                                ),
-                            )
-                            .await?
-                        } else {
-                            if let Some(session) = fetch_active_confirmed_safe_session(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                            )
-                            .await?
-                            {
-                                resolve_engine_session(
-                                    self.database.pool(),
-                                    session.id,
-                                    "finished",
-                                )
-                                .await?;
-                                self.send_message(admin_chat_id, format_session_finished_message())
-                                    .await?;
-                                let ride_summary = fetch_ride_summary(
-                                    self.database.pool(),
-                                    &heartbeat.imei,
-                                    session.created_at,
-                                    heartbeat.server_received_at,
-                                )
-                                .await?;
-                                let summary_message_id = self
-                                    .send_message(
-                                        admin_chat_id,
-                                        &format_ride_summary_message(
-                                            &session,
-                                            heartbeat.server_received_at,
-                                            ride_summary.as_ref(),
-                                        ),
-                                    )
-                                    .await?;
-                                upsert_notification_state(
-                                    self.database.pool(),
-                                    &heartbeat.imei,
-                                    admin_chat_id,
-                                    status,
-                                    summary_message_id,
-                                    heartbeat.id,
-                                )
-                                .await?;
-                                continue;
-                            }
-                            self.send_message(admin_chat_id, &text).await?
-                        };
-                        upsert_notification_state(
-                            self.database.pool(),
-                            &heartbeat.imei,
-                            admin_chat_id,
-                            status,
-                            message_id,
-                            heartbeat.id,
-                        )
-                        .await?;
-                    }
                 }
             } else {
                 info!(
@@ -468,54 +226,356 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn process_heartbeat_notification_for_chat(
+        &self,
+        heartbeat: &StoredHeartbeat,
+        status: &str,
+        chat_id: i64,
+    ) -> Result<(), BotError> {
+        let existing = fetch_notification_state(self.database.pool(), &heartbeat.imei, chat_id).await?;
+        let text = format_engine_status_notification(heartbeat, status);
+
+        match existing {
+            Some(existing) if existing.last_status == status => {
+                if status == "on" {
+                    if let Some(session) = fetch_active_pending_session(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        chat_id,
+                    )
+                    .await?
+                    {
+                        let text = format_engine_on_confirmation_message_with_duration(
+                            heartbeat,
+                            Some(session.created_at),
+                        );
+                        let keyboard = engine_session_confirmation_keyboard();
+                        if let Err(error) = self
+                            .edit_message_text(
+                                chat_id,
+                                session.prompt_message_id,
+                                &text,
+                                Some(keyboard),
+                            )
+                            .await
+                        {
+                            warn!(
+                                error = %error,
+                                imei = %heartbeat.imei,
+                                message_id = session.prompt_message_id,
+                                "failed to update pending confirmation message"
+                            );
+                        }
+                    }
+                    upsert_notification_state(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        chat_id,
+                        status,
+                        existing.last_message_id,
+                        heartbeat.id,
+                    )
+                    .await?;
+                } else if let Some(session) =
+                    fetch_latest_theft_off_session(self.database.pool(), &heartbeat.imei, chat_id)
+                        .await?
+                        .filter(|session| session.ride_status_message_id == Some(existing.last_message_id))
+                {
+                    let off_started_at = session.resolved_at.unwrap_or(heartbeat.server_received_at);
+                    let off_text =
+                        format_theft_engine_off_follow_up_message(off_started_at, Utc::now());
+
+                    if let Err(error) = self
+                        .edit_message_text(chat_id, existing.last_message_id, &off_text, None)
+                        .await
+                    {
+                        warn!(
+                            error = %error,
+                            imei = %heartbeat.imei,
+                            message_id = existing.last_message_id,
+                            "failed to edit existing status message; sending a new one"
+                        );
+                        let message_id =
+                            self.send_message_internal(chat_id, &off_text, None).await?;
+                        upsert_notification_state(
+                            self.database.pool(),
+                            &heartbeat.imei,
+                            chat_id,
+                            status,
+                            message_id,
+                            heartbeat.id,
+                        )
+                        .await?;
+                    } else {
+                        upsert_notification_state(
+                            self.database.pool(),
+                            &heartbeat.imei,
+                            chat_id,
+                            status,
+                            existing.last_message_id,
+                            heartbeat.id,
+                        )
+                        .await?;
+                    }
+                } else {
+                    upsert_notification_state(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        chat_id,
+                        status,
+                        existing.last_message_id,
+                        heartbeat.id,
+                    )
+                    .await?;
+                }
+            }
+            _ => {
+                let message_id = if status == "on" {
+                    let message_id = self.send_engine_on_confirmation(chat_id, heartbeat).await?;
+                    create_engine_session(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        chat_id,
+                        heartbeat.id,
+                        message_id,
+                    )
+                    .await?;
+                    message_id
+                } else if let Some(session) =
+                    fetch_active_reported_theft_session(self.database.pool(), &heartbeat.imei, chat_id)
+                        .await?
+                {
+                    let message_id = self
+                        .send_message_internal(chat_id, format_theft_engine_off_message(), None)
+                        .await?;
+                    set_engine_session_ride_status_message_id(
+                        self.database.pool(),
+                        session.id,
+                        message_id,
+                    )
+                    .await?;
+                    resolve_engine_session(self.database.pool(), session.id, "theft_engine_off")
+                        .await?;
+                    message_id
+                } else if let Some(session) =
+                    fetch_active_pending_session(self.database.pool(), &heartbeat.imei, chat_id)
+                        .await?
+                {
+                    if let Err(error) =
+                        self.clear_inline_keyboard(chat_id, session.prompt_message_id).await
+                    {
+                        warn!(
+                            error = %error,
+                            imei = %heartbeat.imei,
+                            message_id = session.prompt_message_id,
+                            "failed to clear pending confirmation keyboard before finishing session"
+                        );
+                    }
+
+                    resolve_engine_session(self.database.pool(), session.id, "finished").await?;
+                    self.send_message(chat_id, format_session_finished_message())
+                        .await?;
+                    let ride_summary = fetch_ride_summary(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        session.created_at,
+                        heartbeat.server_received_at,
+                    )
+                    .await?;
+                    self.send_message(
+                        chat_id,
+                        &format_ride_summary_message(
+                            &session,
+                            heartbeat.server_received_at,
+                            ride_summary.as_ref(),
+                        ),
+                    )
+                    .await?
+                } else if let Some(session) =
+                    fetch_active_confirmed_safe_session(self.database.pool(), &heartbeat.imei, chat_id)
+                        .await?
+                {
+                    resolve_engine_session(self.database.pool(), session.id, "finished").await?;
+                    self.send_message(chat_id, format_session_finished_message())
+                        .await?;
+                    let ride_summary = fetch_ride_summary(
+                        self.database.pool(),
+                        &heartbeat.imei,
+                        session.created_at,
+                        heartbeat.server_received_at,
+                    )
+                    .await?;
+                    self.send_message(
+                        chat_id,
+                        &format_ride_summary_message(
+                            &session,
+                            heartbeat.server_received_at,
+                            ride_summary.as_ref(),
+                        ),
+                    )
+                    .await?
+                } else {
+                    self.send_message(chat_id, &text).await?
+                };
+
+                upsert_notification_state(
+                    self.database.pool(),
+                    &heartbeat.imei,
+                    chat_id,
+                    status,
+                    message_id,
+                    heartbeat.id,
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_message(&self, message: TelegramMessage) -> Result<(), BotError> {
+        let Some(from) = message.from.as_ref() else {
+            return Ok(());
+        };
         let Some(text) = message.text.as_deref() else {
             return Ok(());
         };
 
-        let Some(command) = BotCommand::parse(text) else {
+        let chat_id = message.chat.id;
+        let telegram_user_id = from.id;
+
+        if let Some(command) = BotCommand::parse(text) {
+            return self
+                .handle_command(chat_id, telegram_user_id, command)
+                .await;
+        }
+
+        let Some(user) = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?
+        else {
             return Ok(());
         };
 
-        let chat_id = message.chat.id;
+        if user.registration_status != TelegramRegistrationStatus::AwaitingImei {
+            return Ok(());
+        }
+
+        let imei = text.trim();
+        if !is_valid_imei(imei) {
+            self.send_message(
+                chat_id,
+                "IMEI must be exactly 15 numeric digits. Please send a valid IMEI.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if user.bound_imei.is_some() {
+            self.send_message(
+                chat_id,
+                "Your Telegram account is already bound to a device.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if !device_exists(self.database.pool(), imei).await? {
+            self.send_message(
+                chat_id,
+                "That IMEI is not registered in the system yet. Please check the IMEI and try again.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if is_device_bound_to_another_user(self.database.pool(), imei, telegram_user_id).await? {
+            self.send_message(
+                chat_id,
+                "That device is already bound to another Telegram user.",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        bind_telegram_user_to_imei(self.database.pool(), telegram_user_id, chat_id, imei).await?;
+        self.send_message(
+            chat_id,
+            &format!("Success. This Telegram account is now bound to IMEI {imei}."),
+        )
+        .await?;
+        if let Err(error) = self.send_bind_success_sticker(chat_id).await {
+            warn!(error = %error, "failed to send bind-success sticker");
+        }
+
+        Ok(())
+    }
+
+    async fn handle_command(
+        &self,
+        chat_id: i64,
+        telegram_user_id: i64,
+        command: BotCommand,
+    ) -> Result<(), BotError> {
+        let user = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?;
 
         match command {
             BotCommand::Start => {
-                self.send_message(
-                    chat_id,
-                    "GT06 bot is online. Use /help to see available commands.",
-                )
-                .await?;
+                match user {
+                    Some(user) if user.bound_imei.is_some() => {
+                        self.send_message(
+                            chat_id,
+                            &format_start_status_message(&user),
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        upsert_telegram_user_registration_state(
+                            self.database.pool(),
+                            telegram_user_id,
+                            chat_id,
+                            TelegramRegistrationStatus::AwaitingImei,
+                        )
+                        .await?;
+                        self.send_message(
+                            chat_id,
+                            "Welcome. Please send your device IMEI to bind this Telegram account.",
+                        )
+                        .await?;
+                    }
+                }
             }
             BotCommand::Help => {
                 self.send_message(chat_id, HELP_TEXT).await?;
             }
-            BotCommand::BindMe => {
-                ensure_admin_chat_id(self.database.pool(), chat_id).await?;
-                self.send_message(
-                    chat_id,
-                    "This chat is now bound as the heartbeat notification target.",
-                )
-                .await?;
-            }
             BotCommand::LastHeartbeat => {
+                let Some(bound_imei) = user.as_ref().and_then(|value| value.bound_imei.as_deref()) else {
+                    self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
+                        .await?;
+                    return Ok(());
+                };
+
                 let response = if let Some(heartbeat) =
-                    fetch_latest_heartbeat(self.database.pool()).await?
+                    fetch_latest_heartbeat_for_imei(self.database.pool(), bound_imei).await?
                 {
                     format_heartbeat_notification(&heartbeat)
                 } else {
-                    "No heartbeat data is stored yet.".to_string()
+                    "No heartbeat data is stored for your device yet.".to_string()
                 };
 
                 self.send_message(chat_id, &response).await?;
             }
             BotCommand::LatestLocation => {
+                let Some(bound_imei) = user.as_ref().and_then(|value| value.bound_imei.as_deref()) else {
+                    self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
+                        .await?;
+                    return Ok(());
+                };
+
                 let response = if let Some(location) =
-                    fetch_latest_location(self.database.pool()).await?
+                    fetch_latest_location_for_imei(self.database.pool(), bound_imei).await?
                 {
                     format_latest_location_message(&location)
                 } else {
-                    "No location data is stored yet.".to_string()
+                    "No location data is stored for your device yet.".to_string()
                 };
 
                 self.send_message(chat_id, &response).await?;
@@ -724,6 +784,27 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn send_bind_success_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
+        let sticker_part = multipart::Part::bytes(BIND_SUCCESS_STICKER_BYTES.to_vec())
+            .file_name("AnimatedSticker - hi.tgs")
+            .mime_str("application/x-tgsticker")?;
+
+        let form = multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("sticker", sticker_part);
+
+        let response = self
+            .client
+            .post(format!("{}/sendSticker", self.base_url))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
     async fn send_message_internal(
         &self,
         chat_id: i64,
@@ -831,7 +912,7 @@ impl TelegramBot {
     }
 }
 
-pub const HELP_TEXT: &str = "/start - confirm the bot is online\n/help - show available commands\n/bind_me - make this chat the heartbeat notification target\n/last_heartbeat - show the most recent stored heartbeat\n/latest_location - show the latest stored device location";
+pub const HELP_TEXT: &str = "/start - bind this Telegram account to your device or show binding status\n/help - show available commands\n/last_heartbeat - show the most recent stored heartbeat for your bound device\n/latest_location - show the latest stored device location for your bound device";
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -848,6 +929,7 @@ struct TelegramUpdate {
 #[derive(Debug, Deserialize)]
 struct TelegramMessage {
     chat: TelegramChat,
+    from: Option<TelegramUser>,
     text: Option<String>,
     message_id: Option<i32>,
 }
@@ -861,6 +943,11 @@ struct TelegramCallbackQuery {
 
 #[derive(Debug, Deserialize)]
 struct TelegramChat {
+    id: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramUser {
     id: i64,
 }
 
@@ -1004,6 +1091,14 @@ pub struct EngineSession {
     pub session_status: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TelegramUserRecord {
+    telegram_user_id: i64,
+    chat_id: i64,
+    bound_imei: Option<String>,
+    registration_status: TelegramRegistrationStatus,
 }
 
 impl StoredHeartbeat {
@@ -1318,6 +1413,14 @@ pub fn format_latest_location_message(location: &StoredLocation) -> String {
     )
 }
 
+fn format_start_status_message(user: &TelegramUserRecord) -> String {
+    let bound_imei = user.bound_imei.as_deref().unwrap_or("not bound");
+    format!(
+        "Your Telegram account is already bound.\nIMEI: {}",
+        bound_imei
+    )
+}
+
 fn option_f64(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.6}"))
@@ -1357,6 +1460,164 @@ fn haversine_distance_km(
 
 pub async fn ensure_admin_chat_id(pool: &sqlx::PgPool, chat_id: i64) -> Result<(), sqlx::Error> {
     set_state_i64(pool, "admin_chat_id", chat_id).await
+}
+
+fn parse_registration_status(value: &str) -> Option<TelegramRegistrationStatus> {
+    match value {
+        "awaiting_imei" => Some(TelegramRegistrationStatus::AwaitingImei),
+        "bound" => Some(TelegramRegistrationStatus::Bound),
+        _ => None,
+    }
+}
+
+fn registration_status_value(status: &TelegramRegistrationStatus) -> &'static str {
+    match status {
+        TelegramRegistrationStatus::AwaitingImei => "awaiting_imei",
+        TelegramRegistrationStatus::Bound => "bound",
+    }
+}
+
+fn is_valid_imei(value: &str) -> bool {
+    value.len() == 15 && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+async fn fetch_telegram_user_by_user_id(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+) -> Result<Option<TelegramUserRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT telegram_user_id, chat_id, bound_imei, registration_status
+        FROM telegram_users
+        WHERE telegram_user_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.and_then(|row| {
+        let registration_status = parse_registration_status(row.get::<String, _>("registration_status").as_str())?;
+        Some(TelegramUserRecord {
+            telegram_user_id: row.get("telegram_user_id"),
+            chat_id: row.get("chat_id"),
+            bound_imei: row.get("bound_imei"),
+            registration_status,
+        })
+    }))
+}
+
+async fn upsert_telegram_user_registration_state(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+    chat_id: i64,
+    registration_status: TelegramRegistrationStatus,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO telegram_users (
+            telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+        )
+        VALUES ($1, $2, NULL, $3, NOW(), NOW())
+        ON CONFLICT (telegram_user_id) DO UPDATE
+        SET chat_id = EXCLUDED.chat_id,
+            registration_status = CASE
+                WHEN telegram_users.bound_imei IS NULL THEN EXCLUDED.registration_status
+                ELSE telegram_users.registration_status
+            END,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(chat_id)
+    .bind(registration_status_value(&registration_status))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn bind_telegram_user_to_imei(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+    chat_id: i64,
+    imei: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE telegram_users
+        SET chat_id = $2,
+            bound_imei = $3,
+            registration_status = 'bound',
+            updated_at = NOW()
+        WHERE telegram_user_id = $1
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(chat_id)
+    .bind(imei)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+async fn device_exists(pool: &sqlx::PgPool, imei: &str) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT 1
+        FROM devices
+        WHERE imei = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
+async fn is_device_bound_to_another_user(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    telegram_user_id: i64,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT 1
+        FROM telegram_users
+        WHERE bound_imei = $1
+          AND telegram_user_id <> $2
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
+async fn fetch_notification_chat_ids_for_imei(
+    pool: &sqlx::PgPool,
+    imei: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT chat_id
+        FROM telegram_users
+        WHERE bound_imei = $1
+          AND registration_status = 'bound'
+        "#,
+    )
+    .bind(imei)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|row| row.get("chat_id")).collect())
 }
 
 pub async fn get_state_i64(pool: &sqlx::PgPool, key: &str) -> Result<Option<i64>, sqlx::Error> {
@@ -1954,12 +2215,18 @@ mod tests {
     fn parses_commands() {
         assert_eq!(BotCommand::parse("/start"), Some(BotCommand::Start));
         assert_eq!(BotCommand::parse("/help"), Some(BotCommand::Help));
-        assert_eq!(BotCommand::parse("/bind_me"), Some(BotCommand::BindMe));
         assert_eq!(
             BotCommand::parse("/latest_location@my_bot"),
             Some(BotCommand::LatestLocation)
         );
         assert_eq!(BotCommand::parse("hello"), None);
+    }
+
+    #[test]
+    fn validates_imei_format() {
+        assert!(is_valid_imei("866221070478388"));
+        assert!(!is_valid_imei("86622107047838"));
+        assert!(!is_valid_imei("86622107047838A"));
     }
 
     #[test]
