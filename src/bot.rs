@@ -507,7 +507,7 @@ impl TelegramBot {
         self.send_message_internal(
             chat_id,
             &format_start_status_message(),
-            Some(theft_alert_keyboard(None)),
+            Some(start_menu_keyboard()),
         )
         .await?;
 
@@ -529,7 +529,7 @@ impl TelegramBot {
                         self.send_message_internal(
                             chat_id,
                             &format_start_status_message(),
-                            Some(theft_alert_keyboard(None)),
+                            Some(start_menu_keyboard()),
                         )
                         .await?;
                     }
@@ -1021,7 +1021,7 @@ fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
                     callback_data: theft_alert_callback_data("stream_location", session_id),
                 },
                 InlineKeyboardButton {
-                    text: "check latest status".to_string(),
+                    text: "health check".to_string(),
                     callback_data: theft_alert_callback_data("check_latest_status", session_id),
                 },
             ],
@@ -1030,6 +1030,21 @@ fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
                 callback_data: theft_alert_callback_data("contact_support", session_id),
             }],
         ],
+    }
+}
+
+fn start_menu_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![vec![
+            InlineKeyboardButton {
+                text: "stream location".to_string(),
+                callback_data: theft_alert_callback_data("stream_location", None),
+            },
+            InlineKeyboardButton {
+                text: "health check".to_string(),
+                callback_data: theft_alert_callback_data("check_latest_status", None),
+            },
+        ]],
     }
 }
 
@@ -1227,66 +1242,7 @@ pub fn format_latest_motor_status_message(
     heartbeat: Option<&StoredHeartbeat>,
     location: Option<&StoredLocation>,
 ) -> String {
-    let latitude = location
-        .and_then(|value| value.latitude)
-        .map(|value| format!("{value:.6}"))
-        .unwrap_or_else(|| "unknown".to_string());
-    let longitude = location
-        .and_then(|value| value.longitude)
-        .map(|value| format!("{value:.6}"))
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let ride_duration = match session.session_status.as_str() {
-        "reported_theft" => Utc::now().signed_duration_since(session.created_at),
-        _ => heartbeat
-            .map(|value| value.server_received_at.signed_duration_since(session.created_at))
-            .unwrap_or_else(|| Utc::now().signed_duration_since(session.created_at)),
-    };
-    let ride_duration = ride_duration.to_std().unwrap_or_default();
-    let total_seconds = ride_duration.as_secs();
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-    let engine_status = heartbeat
-        .map(|value| value.engine_status_guess.as_str())
-        .unwrap_or("unknown");
-    let gps_tracking_status = heartbeat
-        .map(|value| if value.gps_tracking_on { "on" } else { "off" })
-        .unwrap_or("unknown");
-    let connection_status = heartbeat
-        .map(|value| connection_status_label(value.gsm_signal_strength))
-        .unwrap_or("unknown");
-    let voltage_level = heartbeat
-        .map(|value| value.voltage_level.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let latest_heartbeat = heartbeat
-        .map(|value| {
-            FixedOffset::east_opt(WIB_OFFSET_SECONDS)
-                .expect("valid WIB offset")
-                .from_utc_datetime(&value.server_received_at.naive_utc())
-                .format("%d %b %Y %H:%M:%S WIB")
-                .to_string()
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-    let satellite_count = location
-        .and_then(|value| value.satellite_count)
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    format!(
-        "Latest motor status\nLatitude: {}\nLongitude: {}\nRiding time: {:02}:{:02}:{:02}\nEngine status: {}\nGPS tracking: {}\nConnection status: {}\nVoltage level: {}\nLatest heartbeat: {}\nSatellites: {}",
-        latitude,
-        longitude,
-        hours,
-        minutes,
-        seconds,
-        engine_status,
-        gps_tracking_status,
-        connection_status,
-        voltage_level,
-        latest_heartbeat,
-        satellite_count
-    )
+    format_latest_motor_status_message_at(session, heartbeat, location, Utc::now())
 }
 
 pub fn format_latest_motor_status_initial_message(
@@ -1295,19 +1251,7 @@ pub fn format_latest_motor_status_initial_message(
     location: Option<&StoredLocation>,
     requested_at: DateTime<Utc>,
 ) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let requested_wib = wib.from_utc_datetime(&requested_at.naive_utc());
-    let base = format_latest_motor_status_message(session, heartbeat, location);
-
-    if let Some(rest) = base.strip_prefix("Latest motor status\n") {
-        format!(
-            "Latest motor status ({})\n{}",
-            requested_wib.format("%d %b %Y %H:%M:%S WIB"),
-            rest
-        )
-    } else {
-        base
-    }
+    format_latest_motor_status_message_at(session, heartbeat, location, requested_at)
 }
 
 pub fn format_contact_support_message() -> &'static str {
@@ -1354,6 +1298,63 @@ fn latest_location_link(location: Option<&StoredLocation>) -> Option<String> {
     ))
 }
 
+fn format_latest_motor_status_message_at(
+    session: &EngineSession,
+    heartbeat: Option<&StoredHeartbeat>,
+    location: Option<&StoredLocation>,
+    reference_time: DateTime<Utc>,
+) -> String {
+    let _ = session;
+    let map_link = latest_location_link(location)
+        .unwrap_or_else(|| "Location is not available yet.".to_string());
+    let engine_status = heartbeat
+        .map(|value| match value.engine_status_guess.as_str() {
+            "on" => "ON",
+            "off" => "OFF",
+            _ => "UNKNOWN",
+        })
+        .unwrap_or("UNKNOWN");
+    let movement_status = match location.and_then(|value| value.speed_kph) {
+        Some(speed) if speed > 0 => format!("Moving ({speed} km/h)"),
+        Some(_) => "Stationary".to_string(),
+        None => "Stationary".to_string(),
+    };
+    let signal_status = heartbeat
+        .map(|value| connection_status_label(value.gsm_signal_strength))
+        .unwrap_or("Unknown");
+    let gps_tracking_status = heartbeat
+        .map(|value| if value.gps_tracking_on { "Active" } else { "Inactive" })
+        .unwrap_or("Unknown");
+    let battery_level = heartbeat
+        .map(|value| gps_battery_label(value.voltage_level).to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let last_update = heartbeat
+        .map(|value| value.server_received_at)
+        .into_iter()
+        .chain(location.and_then(|value| value.last_seen_at))
+        .max()
+        .map(|value| format_relative_time(reference_time, value))
+        .unwrap_or_else(|| "unknown".to_string());
+    let battery_warning = heartbeat
+        .filter(|value| value.voltage_level == 0)
+        .map(|_| {
+            "\n\nWarning: GPS device battery is empty. New updates may only arrive after the motor turns on again."
+        })
+        .unwrap_or("");
+
+    format!(
+        "📍 Your latest motor location {} ({} {})\n\nEngine: {}\nGPS Signal: {}\nGPS Tracking: {}\nGPS Battery/Power: {}{}",
+        map_link,
+        movement_status,
+        last_update,
+        engine_status,
+        signal_status,
+        gps_tracking_status,
+        battery_level,
+        battery_warning,
+    )
+}
+
 pub fn format_ride_session_status_message(
     session: &EngineSession,
     heartbeat: &StoredHeartbeat,
@@ -1384,11 +1385,42 @@ pub fn format_ride_session_status_message(
 
 fn connection_status_label(gsm_signal_strength: i32) -> &'static str {
     match gsm_signal_strength.clamp(1, 4) {
-        1 => "1 = bad connection",
-        2 => "2 = slow",
-        3 => "3 = ok",
-        4 => "4 = excelent",
-        _ => "unknown",
+        1 => "Poor",
+        2 => "Fair",
+        3 => "OK",
+        4 => "Excellent",
+        _ => "Unknown",
+    }
+}
+
+fn gps_battery_label(voltage_level: i32) -> &'static str {
+    match voltage_level {
+        0 => "Empty",
+        1 => "Very Low",
+        2 => "Low",
+        3 => "Medium",
+        4 => "Full",
+        _ => "Unknown",
+    }
+}
+
+fn format_relative_time(reference_time: DateTime<Utc>, event_time: DateTime<Utc>) -> String {
+    let duration = reference_time
+        .signed_duration_since(event_time)
+        .to_std()
+        .unwrap_or_default();
+    let seconds = duration.as_secs();
+
+    match seconds {
+        0..=59 => format!("{seconds} seconds ago"),
+        60..=3599 => {
+            let minutes = seconds / 60;
+            format!("{minutes} minutes ago")
+        }
+        _ => {
+            let hours = seconds / 3600;
+            format!("{hours} hours ago")
+        }
     }
 }
 
@@ -2466,24 +2498,26 @@ mod tests {
         };
         let location = StoredLocation {
             imei: "866221070478388".to_string(),
-            last_seen_at: None,
+            last_seen_at: Some(Utc.with_ymd_and_hms(2026, 4, 17, 10, 4, 49).unwrap()),
             gps_timestamp: None,
             latitude: Some(-6.204066),
             longitude: Some(106.785514),
-            speed_kph: None,
+            speed_kph: Some(0),
             course: None,
             satellite_count: None,
         };
 
-        let text = format_latest_motor_status_message(&session, Some(&heartbeat), Some(&location));
-        assert!(text.contains("Latitude: -6.204066"));
-        assert!(text.contains("Longitude: 106.785514"));
-        assert!(text.contains("Riding time: 00:05:07"));
-        assert!(text.contains("Engine status: off"));
-        assert!(text.contains("GPS tracking: on"));
-        assert!(text.contains("Connection status: 3 = ok"));
-        assert!(text.contains("Voltage level: 6"));
-        assert!(text.contains("Satellites: unknown"));
+        let text = format_latest_motor_status_initial_message(
+            &session,
+            Some(&heartbeat),
+            Some(&location),
+            Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 1).unwrap(),
+        );
+        assert!(text.contains("📍 Your latest motor location https://maps.google.com/?q=-6.204066,106.785514 (Stationary 12 seconds ago)"));
+        assert!(text.contains("Engine: OFF"));
+        assert!(text.contains("GPS Signal: OK"));
+        assert!(text.contains("GPS Tracking: Active"));
+        assert!(text.contains("GPS Battery/Power: Unknown"));
     }
 
     #[test]
@@ -2503,7 +2537,44 @@ mod tests {
 
         let text =
             format_latest_motor_status_initial_message(&session, None, None, requested_at);
-        assert!(text.contains("Latest motor status (17 Apr 2026 17:01:02 WIB)"));
+        assert!(text.contains("📍 Your latest motor location Location is not available yet. (Stationary unknown)"));
+    }
+
+    #[test]
+    fn formats_health_check_battery_warning() {
+        let session = EngineSession {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            chat_id: 12345,
+            trigger_heartbeat_id: 7,
+            prompt_message_id: 99,
+            ride_status_message_id: None,
+            session_status: "bound".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap(),
+            resolved_at: None,
+        };
+        let heartbeat = StoredHeartbeat {
+            id: 8,
+            imei: "866221070478388".to_string(),
+            server_received_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap(),
+            terminal_info_raw: 69,
+            terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
+            engine_status_guess: "off".to_string(),
+            voltage_level: 0,
+            gsm_signal_strength: 3,
+        };
+
+        let text = format_latest_motor_status_initial_message(
+            &session,
+            Some(&heartbeat),
+            None,
+            Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
+        );
+        assert!(text.contains("GPS Battery/Power: Empty"));
+        assert!(text.contains("Warning: GPS device battery is empty."));
     }
 
     #[tokio::test]
