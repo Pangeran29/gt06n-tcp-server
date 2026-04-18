@@ -41,6 +41,13 @@ enum SessionAction {
     No,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TheftAlertAction {
+    StreamLocation { session_id: i64 },
+    CheckLatestStatus { session_id: i64 },
+    ContactSupport { session_id: i64 },
+}
+
 impl SessionAction {
     fn parse(data: &str) -> Option<Self> {
         let mut parts = data.split(':');
@@ -54,6 +61,26 @@ impl SessionAction {
         Some(match action {
             "yes" => Self::Yes,
             "no" => Self::No,
+            _ => return None,
+        })
+    }
+}
+
+impl TheftAlertAction {
+    fn parse(data: &str) -> Option<Self> {
+        let mut parts = data.split(':');
+        let prefix = parts.next()?;
+        let action = parts.next()?;
+        let session_id = parts.next()?.parse().ok()?;
+
+        if prefix != "theft_alert" || parts.next().is_some() {
+            return None;
+        }
+
+        Some(match action {
+            "stream_location" => Self::StreamLocation { session_id },
+            "check_latest_status" => Self::CheckLatestStatus { session_id },
+            "contact_support" => Self::ContactSupport { session_id },
             _ => return None,
         })
     }
@@ -220,36 +247,65 @@ impl TelegramBot {
                                 heartbeat.id,
                             )
                             .await?;
-                        } else if let Err(error) = self
-                            .edit_message_text(admin_chat_id, existing.last_message_id, &text, None)
-                            .await
-                        {
-                            warn!(
-                                error = %error,
-                                imei = %heartbeat.imei,
-                                message_id = existing.last_message_id,
-                                "failed to edit existing status message; sending a new one"
-                            );
-                            let message_id = self.send_message(admin_chat_id, &text).await?;
-                            upsert_notification_state(
-                                self.database.pool(),
-                                &heartbeat.imei,
-                                admin_chat_id,
-                                status,
-                                message_id,
-                                heartbeat.id,
-                            )
-                            .await?;
                         } else {
-                            upsert_notification_state(
+                            let theft_off_session = fetch_latest_theft_off_session(
                                 self.database.pool(),
                                 &heartbeat.imei,
                                 admin_chat_id,
-                                status,
-                                existing.last_message_id,
-                                heartbeat.id,
                             )
                             .await?;
+                            let off_text = if let Some(session) = theft_off_session.filter(|session| {
+                                session.ride_status_message_id == Some(existing.last_message_id)
+                            }) {
+                                let off_started_at =
+                                    session.resolved_at.unwrap_or(heartbeat.server_received_at);
+                                format_theft_engine_off_follow_up_message(off_started_at, Utc::now())
+                            } else {
+                                continue;
+                            };
+
+                            if let Err(error) = self
+                                .edit_message_text(
+                                    admin_chat_id,
+                                    existing.last_message_id,
+                                    &off_text,
+                                    None,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    error = %error,
+                                    imei = %heartbeat.imei,
+                                    message_id = existing.last_message_id,
+                                    "failed to edit existing status message; sending a new one"
+                                );
+                                let message_id = self
+                                    .send_message_internal(
+                                        admin_chat_id,
+                                        &off_text,
+                                        None,
+                                    )
+                                    .await?;
+                                upsert_notification_state(
+                                    self.database.pool(),
+                                    &heartbeat.imei,
+                                    admin_chat_id,
+                                    status,
+                                    message_id,
+                                    heartbeat.id,
+                                )
+                                .await?;
+                            } else {
+                                upsert_notification_state(
+                                    self.database.pool(),
+                                    &heartbeat.imei,
+                                    admin_chat_id,
+                                    status,
+                                    existing.last_message_id,
+                                    heartbeat.id,
+                                )
+                                .await?;
+                            }
                         }
                     }
                     _ => {
@@ -263,6 +319,33 @@ impl TelegramBot {
                                 admin_chat_id,
                                 heartbeat.id,
                                 message_id,
+                            )
+                            .await?;
+                            message_id
+                        } else if let Some(session) = fetch_active_reported_theft_session(
+                            self.database.pool(),
+                            &heartbeat.imei,
+                            admin_chat_id,
+                        )
+                        .await?
+                        {
+                            let message_id = self
+                                .send_message_internal(
+                                    admin_chat_id,
+                                    format_theft_engine_off_message(),
+                                    None,
+                                )
+                                .await?;
+                            set_engine_session_ride_status_message_id(
+                                self.database.pool(),
+                                session.id,
+                                message_id,
+                            )
+                            .await?;
+                            resolve_engine_session(
+                                self.database.pool(),
+                                session.id,
+                                "theft_engine_off",
                             )
                             .await?;
                             message_id
@@ -282,6 +365,33 @@ impl TelegramBot {
                                 .await?;
                                 self.send_message(admin_chat_id, format_session_finished_message())
                                     .await?;
+                                let ride_summary = fetch_ride_summary(
+                                    self.database.pool(),
+                                    &heartbeat.imei,
+                                    session.created_at,
+                                    heartbeat.server_received_at,
+                                )
+                                .await?;
+                                let summary_message_id = self
+                                    .send_message(
+                                        admin_chat_id,
+                                        &format_ride_summary_message(
+                                            &session,
+                                            heartbeat.server_received_at,
+                                            ride_summary.as_ref(),
+                                        ),
+                                    )
+                                    .await?;
+                                upsert_notification_state(
+                                    self.database.pool(),
+                                    &heartbeat.imei,
+                                    admin_chat_id,
+                                    status,
+                                    summary_message_id,
+                                    heartbeat.id,
+                                )
+                                .await?;
+                                continue;
                             }
                             self.send_message(admin_chat_id, &text).await?
                         };
@@ -386,13 +496,24 @@ impl TelegramBot {
         let Some(data) = callback_query.data.as_deref() else {
             return Ok(());
         };
-        let Some(action) = SessionAction::parse(data) else {
-            return Ok(());
-        };
         let Some(message) = callback_query.message else {
             return Ok(());
         };
         let chat_id = message.chat.id;
+
+        if let Some(action) = TheftAlertAction::parse(data) {
+            self.answer_callback_query(&callback_query.id, "", false)
+                .await?;
+            return self
+                .handle_theft_alert_action(message, action)
+                .await;
+        }
+
+        let Some(action) = SessionAction::parse(data) else {
+            return Ok(());
+        };
+        self.answer_callback_query(&callback_query.id, "", false)
+            .await?;
         let prompt_message_id = i64::from(message.message_id.unwrap_or_default());
 
         let Some(session) =
@@ -432,26 +553,71 @@ impl TelegramBot {
 
         match action {
             SessionAction::Yes => {
+                self.send_message(chat_id, format_ride_safe_message()).await?;
                 if let Err(error) = self.send_engine_on_sticker(chat_id).await {
                     warn!(error = %error, "failed to send engine-on sticker");
                 }
-                self.send_message(chat_id, format_ride_safe_message()).await?;
                 resolve_engine_session(self.database.pool(), session.id, "confirmed_safe").await?;
-                self.answer_callback_query(&callback_query.id, "Sip, sesi dikonfirmasi.", false)
-                    .await?;
             }
             SessionAction::No => {
-                let location =
-                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
-                let text = format_theft_warning_message(location.as_ref());
-                self.send_message(chat_id, &text).await?;
-                resolve_engine_session(self.database.pool(), session.id, "reported_theft").await?;
-                self.answer_callback_query(
-                    &callback_query.id,
-                    "Lokasi terakhir sudah dikirim.",
-                    false,
+                self.send_message(chat_id, "🧨").await?;
+                self.send_message_internal(
+                    chat_id,
+                    format_theft_warning_message(),
+                    Some(theft_alert_keyboard(session.id)),
                 )
                 .await?;
+                resolve_engine_session(self.database.pool(), session.id, "reported_theft").await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_theft_alert_action(
+        &self,
+        message: TelegramMessage,
+        action: TheftAlertAction,
+    ) -> Result<(), BotError> {
+        let chat_id = message.chat.id;
+        let session_id = match action {
+            TheftAlertAction::StreamLocation { session_id }
+            | TheftAlertAction::CheckLatestStatus { session_id }
+            | TheftAlertAction::ContactSupport { session_id } => session_id,
+        };
+
+        let Some(session) = fetch_engine_session_by_id(self.database.pool(), session_id).await?
+        else {
+            return Ok(());
+        };
+
+        if session.chat_id != chat_id {
+            return Ok(());
+        }
+
+        match action {
+            TheftAlertAction::StreamLocation { .. } => {
+                let location =
+                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
+                let text = format_stream_location_message(location.as_ref());
+                self.send_message(chat_id, &text).await?;
+            }
+            TheftAlertAction::CheckLatestStatus { .. } => {
+                let location =
+                    fetch_latest_location_for_imei(self.database.pool(), &session.imei).await?;
+                let latest_heartbeat =
+                    fetch_latest_heartbeat_for_imei(self.database.pool(), &session.imei).await?;
+                let text = format_latest_motor_status_initial_message(
+                    &session,
+                    latest_heartbeat.as_ref(),
+                    location.as_ref(),
+                    Utc::now(),
+                );
+                self.send_message(chat_id, &text).await?;
+            }
+            TheftAlertAction::ContactSupport { .. } => {
+                self.send_message(chat_id, format_contact_support_message())
+                    .await?;
             }
         }
 
@@ -570,10 +736,19 @@ impl TelegramBot {
         chat_id: i64,
         message_id: i64,
     ) -> Result<(), reqwest::Error> {
+        self.edit_message_reply_markup(chat_id, message_id, None).await
+    }
+
+    async fn edit_message_reply_markup(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<(), reqwest::Error> {
         let request = EditMessageReplyMarkupRequest {
             chat_id,
             message_id,
-            reply_markup: None,
+            reply_markup,
         };
 
         let response = self
@@ -712,6 +887,27 @@ fn engine_session_confirmation_keyboard() -> InlineKeyboardMarkup {
     }
 }
 
+fn theft_alert_keyboard(session_id: i64) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: "stream location".to_string(),
+                    callback_data: format!("theft_alert:stream_location:{session_id}"),
+                },
+                InlineKeyboardButton {
+                    text: "check latest status".to_string(),
+                    callback_data: format!("theft_alert:check_latest_status:{session_id}"),
+                },
+            ],
+            vec![InlineKeyboardButton {
+                text: "contact support".to_string(),
+                callback_data: format!("theft_alert:contact_support:{session_id}"),
+            }],
+        ],
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredHeartbeat {
     pub id: i64,
@@ -739,6 +935,12 @@ pub struct StoredLocation {
     pub satellite_count: Option<i32>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RideSummary {
+    pub total_distance_km: f64,
+    pub average_speed_kph: f64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotificationState {
     pub imei: String,
@@ -758,6 +960,7 @@ pub struct EngineSession {
     pub ride_status_message_id: Option<i64>,
     pub session_status: String,
     pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 impl StoredHeartbeat {
@@ -821,26 +1024,194 @@ pub fn format_engine_on_confirmation_message_with_duration(
 }
 
 pub fn format_ride_safe_message() -> &'static str {
-    "Copy. Ride safe, We are tracking you in case there's something wrong."
+    "Ride safe, We are tracking you in case there's something wrong."
 }
 
 pub fn format_session_finished_message() -> &'static str {
     "Ride session ended."
 }
 
-pub fn format_theft_warning_message(location: Option<&StoredLocation>) -> String {
-    let mut text =
-        "there's indication that the motor is being \"dicuri\" rn use below link to detect your motor"
-            .to_string();
+pub fn format_theft_warning_message() -> &'static str {
+    "Pay attention\nThere's indication that your motor is being theft. Use button below to track your motor."
+}
 
+pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
     if let Some(location) = location {
-        text.push_str("\n\n");
-        text.push_str(&format_latest_location_message(location));
+        format_latest_location_message(location)
     } else {
-        text.push_str("\n\nLokasi terakhir belum tersedia.");
+        "Latest location\nLokasi terakhir belum tersedia.".to_string()
     }
+}
 
-    text
+pub fn format_theft_engine_off_message() -> &'static str {
+    "Motor terdeteksi mati (berhenti).\nYou can still tracking your motor via GPS device battery mode."
+}
+
+pub fn format_theft_engine_off_follow_up_message(
+    off_started_at: DateTime<Utc>,
+    current_time: DateTime<Utc>,
+) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let off_started_wib = wib.from_utc_datetime(&off_started_at.naive_utc());
+    let duration = current_time
+        .signed_duration_since(off_started_at)
+        .to_std()
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    format!(
+        "{}\nOff from: {} -> now\nDuration: {:02}:{:02}:{:02}",
+        format_theft_engine_off_message(),
+        off_started_wib.format("%d %b %Y %H:%M:%S WIB"),
+        hours,
+        minutes,
+        seconds,
+    )
+}
+
+pub fn format_stream_location_message(location: Option<&StoredLocation>) -> String {
+    let link = latest_location_link(location)
+        .unwrap_or_else(|| "Latest location link is not available yet.".to_string());
+
+    format!(
+        "To track your motor realtime, use link below.\n{}\n*This is shareable link, share this link to your friend to help tracking your motor.",
+        link
+    )
+}
+
+pub fn format_latest_motor_status_message(
+    session: &EngineSession,
+    heartbeat: Option<&StoredHeartbeat>,
+    location: Option<&StoredLocation>,
+) -> String {
+    let latitude = location
+        .and_then(|value| value.latitude)
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let longitude = location
+        .and_then(|value| value.longitude)
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let ride_duration = match session.session_status.as_str() {
+        "reported_theft" => Utc::now().signed_duration_since(session.created_at),
+        _ => heartbeat
+            .map(|value| value.server_received_at.signed_duration_since(session.created_at))
+            .unwrap_or_else(|| Utc::now().signed_duration_since(session.created_at)),
+    };
+    let ride_duration = ride_duration.to_std().unwrap_or_default();
+    let total_seconds = ride_duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let engine_status = heartbeat
+        .map(|value| value.engine_status_guess.as_str())
+        .unwrap_or("unknown");
+    let gps_tracking_status = heartbeat
+        .map(|value| if value.gps_tracking_on { "on" } else { "off" })
+        .unwrap_or("unknown");
+    let connection_status = heartbeat
+        .map(|value| connection_status_label(value.gsm_signal_strength))
+        .unwrap_or("unknown");
+    let voltage_level = heartbeat
+        .map(|value| value.voltage_level.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let latest_heartbeat = heartbeat
+        .map(|value| {
+            FixedOffset::east_opt(WIB_OFFSET_SECONDS)
+                .expect("valid WIB offset")
+                .from_utc_datetime(&value.server_received_at.naive_utc())
+                .format("%d %b %Y %H:%M:%S WIB")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let satellite_count = location
+        .and_then(|value| value.satellite_count)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "Latest motor status\nLatitude: {}\nLongitude: {}\nRiding time: {:02}:{:02}:{:02}\nEngine status: {}\nGPS tracking: {}\nConnection status: {}\nVoltage level: {}\nLatest heartbeat: {}\nSatellites: {}",
+        latitude,
+        longitude,
+        hours,
+        minutes,
+        seconds,
+        engine_status,
+        gps_tracking_status,
+        connection_status,
+        voltage_level,
+        latest_heartbeat,
+        satellite_count
+    )
+}
+
+pub fn format_latest_motor_status_initial_message(
+    session: &EngineSession,
+    heartbeat: Option<&StoredHeartbeat>,
+    location: Option<&StoredLocation>,
+    requested_at: DateTime<Utc>,
+) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let requested_wib = wib.from_utc_datetime(&requested_at.naive_utc());
+    let base = format_latest_motor_status_message(session, heartbeat, location);
+
+    if let Some(rest) = base.strip_prefix("Latest motor status\n") {
+        format!(
+            "Latest motor status ({})\n{}",
+            requested_wib.format("%d %b %Y %H:%M:%S WIB"),
+            rest
+        )
+    } else {
+        base
+    }
+}
+
+pub fn format_contact_support_message() -> &'static str {
+    "1. Hubungi Call Center 110\n'Halo Polisi, saya ingin melaporkan pencurian motor yang baru saja terjadi. Posisi pelaku sedang terpantau di GPS saya. Mohon bantuan untuk pengejaran.'\n\n2. Datangi SPKT Polsek/Polres\nLangsung ke bagian SPKT (Sentra Pelayanan Kepolisian Terpadu). Tunjukkan aplikasi GPS yang sedang live kepada petugas. Polisi akan langsung berkoordinasi dengan tim Buser/Resmob untuk bergerak ke titik tersebut.\n\n3. Bawa Bukti Kepemilikan\nSiapkan STNK/BPKB (asli atau foto) dan KTP. Polisi butuh ini untuk memastikan itu benar motor Anda sebelum mereka melakukan penindakan atau penangkapan.\n\n 4. Minta Pendampingan Unit Lapangan\nSetelah melapor, minta izin untuk mendampingi petugas (di mobil patroli) atau memberikan akses akun GPS Anda kepada petugas agar mereka bisa mengejar target secara akurat.\n\n⚠️ PENTING: Jangan mendatangi lokasi GPS sendirian. Biarkan polisi yang melakukan tindakan penggerebekan demi keselamatan Anda."
+}
+
+pub fn format_ride_summary_message(
+    session: &EngineSession,
+    off_time: DateTime<Utc>,
+    summary: Option<&RideSummary>,
+) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
+    let off_wib = wib.from_utc_datetime(&off_time.naive_utc());
+    let duration = off_time
+        .signed_duration_since(session.created_at)
+        .to_std()
+        .unwrap_or_default();
+    let total_seconds = duration.as_secs();
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
+    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
+
+    format!(
+        "Ride summary\nStarted: {}\nOff: {}\nDriving time: {:02}:{:02}:{:02}\nDistance: {:.2} km\nAverage speed: {:.2} km/h",
+        started_wib.format("%d %b %Y %H:%M:%S WIB"),
+        off_wib.format("%d %b %Y %H:%M:%S WIB"),
+        hours,
+        minutes,
+        seconds,
+        total_distance_km,
+        average_speed_kph,
+    )
+}
+
+fn latest_location_link(location: Option<&StoredLocation>) -> Option<String> {
+    let location = location?;
+    let latitude = location.latitude?;
+    let longitude = location.longitude?;
+    Some(format!(
+        "https://maps.google.com/?q={latitude:.6},{longitude:.6}"
+    ))
 }
 
 pub fn format_ride_session_status_message(
@@ -920,6 +1291,25 @@ fn option_bool(value: Option<bool>) -> String {
     value
         .map(|v| v.to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn haversine_distance_km(
+    start_latitude: f64,
+    start_longitude: f64,
+    end_latitude: f64,
+    end_longitude: f64,
+) -> f64 {
+    let earth_radius_km = 6371.0;
+    let start_latitude = start_latitude.to_radians();
+    let end_latitude = end_latitude.to_radians();
+    let delta_latitude = (end_latitude - start_latitude).abs();
+    let delta_longitude = (end_longitude - start_longitude).to_radians().abs();
+
+    let a = (delta_latitude / 2.0).sin().powi(2)
+        + start_latitude.cos() * end_latitude.cos() * (delta_longitude / 2.0).sin().powi(2);
+    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+
+    earth_radius_km * c
 }
 
 pub async fn ensure_admin_chat_id(pool: &sqlx::PgPool, chat_id: i64) -> Result<(), sqlx::Error> {
@@ -1050,7 +1440,7 @@ pub async fn fetch_engine_session_by_prompt_message(
 ) -> Result<Option<EngineSession>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
         FROM telegram_engine_sessions
         WHERE chat_id = $1 AND prompt_message_id = $2
         ORDER BY id DESC
@@ -1071,6 +1461,36 @@ pub async fn fetch_engine_session_by_prompt_message(
         ride_status_message_id: row.get("ride_status_message_id"),
         session_status: row.get("session_status"),
         created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
+    }))
+}
+
+pub async fn fetch_engine_session_by_id(
+    pool: &sqlx::PgPool,
+    session_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
     }))
 }
 
@@ -1124,7 +1544,7 @@ pub async fn fetch_active_confirmed_safe_session(
 ) -> Result<Option<EngineSession>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
         FROM telegram_engine_sessions
         WHERE imei = $1
           AND chat_id = $2
@@ -1147,6 +1567,75 @@ pub async fn fetch_active_confirmed_safe_session(
         ride_status_message_id: row.get("ride_status_message_id"),
         session_status: row.get("session_status"),
         created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
+    }))
+}
+
+pub async fn fetch_active_reported_theft_session(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND session_status = 'reported_theft'
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
+    }))
+}
+
+pub async fn fetch_latest_theft_off_session(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Option<EngineSession>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND session_status = 'theft_engine_off'
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| EngineSession {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        chat_id: row.get("chat_id"),
+        trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+        prompt_message_id: row.get("prompt_message_id"),
+        ride_status_message_id: row.get("ride_status_message_id"),
+        session_status: row.get("session_status"),
+        created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
     }))
 }
 
@@ -1157,7 +1646,7 @@ pub async fn fetch_active_pending_session(
 ) -> Result<Option<EngineSession>, sqlx::Error> {
     let row = sqlx::query(
         r#"
-        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
         FROM telegram_engine_sessions
         WHERE imei = $1
           AND chat_id = $2
@@ -1180,6 +1669,7 @@ pub async fn fetch_active_pending_session(
         ride_status_message_id: row.get("ride_status_message_id"),
         session_status: row.get("session_status"),
         created_at: row.get("created_at"),
+        resolved_at: row.get("resolved_at"),
     }))
 }
 
@@ -1337,6 +1827,72 @@ pub async fn fetch_latest_location_for_imei(
     }))
 }
 
+pub async fn fetch_ride_summary(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Result<Option<RideSummary>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT latitude, longitude
+        FROM device_locations
+        WHERE imei = $1
+          AND server_received_at >= $2
+          AND server_received_at <= $3
+        ORDER BY server_received_at ASC
+        "#,
+    )
+    .bind(imei)
+    .bind(started_at)
+    .bind(ended_at)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.len() < 2 {
+        return Ok(Some(RideSummary {
+            total_distance_km: 0.0,
+            average_speed_kph: 0.0,
+        }));
+    }
+
+    let mut total_distance_km = 0.0;
+    let mut previous: Option<(f64, f64)> = None;
+
+    for row in rows {
+        let latitude: f64 = row.get("latitude");
+        let longitude: f64 = row.get("longitude");
+
+        if let Some((previous_latitude, previous_longitude)) = previous {
+            total_distance_km += haversine_distance_km(
+                previous_latitude,
+                previous_longitude,
+                latitude,
+                longitude,
+            );
+        }
+
+        previous = Some((latitude, longitude));
+    }
+
+    let duration_hours = ended_at
+        .signed_duration_since(started_at)
+        .to_std()
+        .unwrap_or_default()
+        .as_secs_f64()
+        / 3600.0;
+    let average_speed_kph = if duration_hours > 0.0 {
+        total_distance_km / duration_hours
+    } else {
+        0.0
+    };
+
+    Ok(Some(RideSummary {
+        total_distance_km,
+        average_speed_kph,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
@@ -1368,6 +1924,23 @@ mod tests {
         assert_eq!(SessionAction::parse("engine_session:yes"), Some(SessionAction::Yes));
         assert_eq!(SessionAction::parse("engine_session:no"), Some(SessionAction::No));
         assert_eq!(SessionAction::parse("engine_session:maybe"), None);
+    }
+
+    #[test]
+    fn parses_theft_alert_actions() {
+        assert_eq!(
+            TheftAlertAction::parse("theft_alert:stream_location:12"),
+            Some(TheftAlertAction::StreamLocation { session_id: 12 })
+        );
+        assert_eq!(
+            TheftAlertAction::parse("theft_alert:check_latest_status:9"),
+            Some(TheftAlertAction::CheckLatestStatus { session_id: 9 })
+        );
+        assert_eq!(
+            TheftAlertAction::parse("theft_alert:contact_support:5"),
+            Some(TheftAlertAction::ContactSupport { session_id: 5 })
+        );
+        assert_eq!(TheftAlertAction::parse("theft_alert:record_sound:1"), None);
     }
 
     #[test]
@@ -1415,6 +1988,159 @@ mod tests {
 
         let off_text = format_engine_status_notification(&heartbeat, "off");
         assert!(off_text.contains("Motor Dimatikan"));
+    }
+
+    #[test]
+    fn formats_theft_warning_message() {
+        let text = format_theft_warning_message();
+        assert!(text.contains("Pay attention"));
+        assert!(text.contains("stream the realtime hearthbeats and location"));
+    }
+
+    #[test]
+    fn formats_theft_location_message_without_location() {
+        let text = format_theft_location_message(None);
+        assert!(text.contains("Latest location"));
+        assert!(text.contains("Lokasi terakhir belum tersedia"));
+    }
+
+    #[test]
+    fn formats_theft_engine_off_message() {
+        let text = format_theft_engine_off_message();
+        assert!(text.contains("Motor terdeteksi mati (berhenti)"));
+        assert!(text.contains("battery mode"));
+    }
+
+    #[test]
+    fn formats_theft_engine_off_follow_up_message() {
+        let started = Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap();
+        let newest = Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 7).unwrap();
+
+        let text = format_theft_engine_off_follow_up_message(started, newest);
+        assert!(text.contains("Motor terdeteksi mati (berhenti)"));
+        assert!(text.contains("-> now"));
+        assert!(text.contains("Duration: 00:05:07"));
+    }
+
+    #[test]
+    fn formats_ride_summary_message() {
+        let session = EngineSession {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            chat_id: 12345,
+            trigger_heartbeat_id: 7,
+            prompt_message_id: 99,
+            ride_status_message_id: None,
+            session_status: "finished".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap(),
+            resolved_at: Some(Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap()),
+        };
+        let summary = RideSummary {
+            total_distance_km: 3.25,
+            average_speed_kph: 39.0,
+        };
+
+        let text = format_ride_summary_message(
+            &session,
+            Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap(),
+            Some(&summary),
+        );
+        assert!(text.contains("Ride summary"));
+        assert!(text.contains("Driving time: 00:05:00"));
+        assert!(text.contains("Distance: 3.25 km"));
+        assert!(text.contains("Average speed: 39.00 km/h"));
+    }
+
+    #[test]
+    fn computes_haversine_distance() {
+        let distance = haversine_distance_km(-6.204066, 106.785514, -6.204500, 106.786000);
+        assert!(distance > 0.05);
+    }
+
+    #[test]
+    fn formats_stream_location_message() {
+        let location = StoredLocation {
+            imei: "866221070478388".to_string(),
+            last_seen_at: None,
+            gps_timestamp: None,
+            latitude: Some(-6.204066),
+            longitude: Some(106.785514),
+            speed_kph: None,
+            course: None,
+            satellite_count: None,
+        };
+
+        let text = format_stream_location_message(Some(&location));
+        assert!(text.contains("To track your motor realtime"));
+        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
+    }
+
+    #[test]
+    fn formats_latest_motor_status_message() {
+        let session = EngineSession {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            chat_id: 12345,
+            trigger_heartbeat_id: 7,
+            prompt_message_id: 99,
+            ride_status_message_id: None,
+            session_status: "theft_engine_off".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap(),
+            resolved_at: None,
+        };
+        let heartbeat = StoredHeartbeat {
+            id: 8,
+            imei: "866221070478388".to_string(),
+            server_received_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 7).unwrap(),
+            terminal_info_raw: 69,
+            terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
+            engine_status_guess: "off".to_string(),
+            voltage_level: 6,
+            gsm_signal_strength: 3,
+        };
+        let location = StoredLocation {
+            imei: "866221070478388".to_string(),
+            last_seen_at: None,
+            gps_timestamp: None,
+            latitude: Some(-6.204066),
+            longitude: Some(106.785514),
+            speed_kph: None,
+            course: None,
+            satellite_count: None,
+        };
+
+        let text = format_latest_motor_status_message(&session, Some(&heartbeat), Some(&location));
+        assert!(text.contains("Latitude: -6.204066"));
+        assert!(text.contains("Longitude: 106.785514"));
+        assert!(text.contains("Riding time: 00:05:07"));
+        assert!(text.contains("Engine status: off"));
+        assert!(text.contains("GPS tracking: on"));
+        assert!(text.contains("Connection status: 3 = ok"));
+        assert!(text.contains("Voltage level: 6"));
+        assert!(text.contains("Satellites: unknown"));
+    }
+
+    #[test]
+    fn formats_initial_latest_motor_status_message() {
+        let session = EngineSession {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            chat_id: 12345,
+            trigger_heartbeat_id: 7,
+            prompt_message_id: 99,
+            ride_status_message_id: None,
+            session_status: "reported_theft".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap(),
+            resolved_at: None,
+        };
+        let requested_at = Utc.with_ymd_and_hms(2026, 4, 17, 10, 1, 2).unwrap();
+
+        let text =
+            format_latest_motor_status_initial_message(&session, None, None, requested_at);
+        assert!(text.contains("Latest motor status (17 Apr 2026 17:01:02 WIB)"));
     }
 
     #[tokio::test]
