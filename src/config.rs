@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub bind_addr: SocketAddr,
+    pub http_api_bind_addr: SocketAddr,
     pub log_filter: String,
     pub read_buffer_capacity: usize,
     pub database_url: Option<String>,
@@ -20,6 +21,9 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             bind_addr: "0.0.0.0:5000".parse().expect("default bind address must be valid"),
+            http_api_bind_addr: "0.0.0.0:8080"
+                .parse()
+                .expect("default http api bind address must be valid"),
             log_filter: "info".to_string(),
             read_buffer_capacity: 4096,
             database_url: None,
@@ -55,6 +59,12 @@ impl Config {
         if let Some(bind_addr) = vars.get("GT06_BIND_ADDR") {
             if let Ok(parsed) = bind_addr.parse() {
                 config.bind_addr = parsed;
+            }
+        }
+
+        if let Some(bind_addr) = vars.get("HTTP_API_BIND_ADDR") {
+            if let Ok(parsed) = bind_addr.parse() {
+                config.http_api_bind_addr = parsed;
             }
         }
 
@@ -130,6 +140,7 @@ mod tests {
     fn reads_expected_environment_overrides() {
         let config = Config::from_pairs([
             ("GT06_BIND_ADDR", "127.0.0.1:6000"),
+            ("HTTP_API_BIND_ADDR", "127.0.0.1:8080"),
             ("RUST_LOG", "debug"),
             ("GT06_READ_BUFFER_CAPACITY", "8192"),
             ("DATABASE_URL", "postgres://postgres:postgres@localhost/gt06"),
@@ -142,6 +153,7 @@ mod tests {
         ]);
 
         assert_eq!(config.bind_addr, "127.0.0.1:6000".parse().unwrap());
+        assert_eq!(config.http_api_bind_addr, "127.0.0.1:8080".parse().unwrap());
         assert_eq!(config.log_filter, "debug");
         assert_eq!(config.read_buffer_capacity, 8192);
         assert_eq!(

@@ -8,6 +8,7 @@ Today the repo contains two Rust services:
 
 - the TCP server that receives raw tracker packets, decodes them, and stores the data
 - the Telegram bot that reads stored heartbeat data from PostgreSQL and sends notifications to one admin chat
+- the HTTP API that serves device location data from PostgreSQL for map and stream features
 
 The backend is already suitable as the ingestion and first notification layer for a tracking system. It is not yet a complete product with public APIs, dashboards, authentication, or business workflows.
 
@@ -31,6 +32,7 @@ RUST_LOG=info
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/gt06n_tcp_server
 DATABASE_MAX_CONNECTIONS=10
 DATABASE_WRITE_TIMEOUT_MS=5000
+HTTP_API_BIND_ADDR=0.0.0.0:8080
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_ADMIN_CHAT_ID=
 TELEGRAM_POLL_TIMEOUT_SECS=30
@@ -71,7 +73,23 @@ cargo run --release --bin telegram_bot
 
 The bot uses long polling and reads heartbeat data from PostgreSQL. It does not receive data directly from the TCP socket layer.
 
-### 4. Check that the TCP server is listening
+### 4. Run the HTTP API
+
+```powershell
+cargo run --bin http_api
+```
+
+For release mode:
+
+```powershell
+cargo run --release --bin http_api
+```
+
+The API exposes:
+
+- `GET /api/devices/:imei/locations?start_at=2026-04-19T10:00:00Z`
+
+### 5. Check that the TCP server is listening
 
 Windows PowerShell:
 
@@ -85,7 +103,7 @@ Linux / VPS:
 ss -ltn | grep 5000
 ```
 
-### 5. Run tests
+### 6. Run tests
 
 ```powershell
 cargo test

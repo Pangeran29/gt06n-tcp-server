@@ -9,12 +9,14 @@ The recommended setup is:
 - build the Rust binaries on the VPS
 - configure runtime values in `.env`
 - run the TCP server with `systemd`
-- optionally run the Telegram bot with a second `systemd` service
+- run the Telegram bot with a second `systemd` service
+- run the HTTP API with a third `systemd` service
 - redeploy by pulling code, rebuilding, and restarting the service
 
 `systemd` is the process manager that keeps each service alive.
 tcp sysmtemd config: `/etc/systemd/system/gt06n.service`
 telegram bot systemd config: `/etc/systemd/system/gt06n-telegram-bot.service`
+http api systemd config: `/etc/systemd/system/gt06n-http-api.service`
 It is responsible for:
 
 - starting the service at boot
@@ -31,10 +33,13 @@ git pull
 cargo build --release
 sudo systemctl restart gt06n.service
 sudo systemctl restart gt06n-telegram-bot.service
+sudo systemctl restart gt06n-http-api.service
 sudo systemctl status gt06n.service
 sudo systemctl status gt06n-telegram-bot.service
+sudo systemctl status gt06n-http-api.service
 sudo journalctl -u gt06n.service -f
 sudo journalctl -u gt06n-telegram-bot.service -f
+sudo journalctl -u gt06n-http-api.service -f
 ```
 
 ## systemd Service
@@ -51,6 +56,71 @@ If you also deploy the Telegram bot as a service, it should have its own unit, f
 
 ```bash
 /etc/systemd/system/gt06n-telegram-bot.service
+```
+
+The HTTP API should also have its own unit:
+
+```bash
+/etc/systemd/system/gt06n-http-api.service
+```
+
+## Example systemd Units
+
+TCP server:
+
+```ini
+[Unit]
+Description=GT06N TCP Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gt06n-tcp-server
+ExecStart=/root/gt06n-tcp-server/target/release/gt06n-tcp-server
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/gt06n-tcp-server/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Telegram bot:
+
+```ini
+[Unit]
+Description=GT06N Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gt06n-tcp-server
+ExecStart=/root/gt06n-tcp-server/target/release/telegram_bot
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/gt06n-tcp-server/.env
+
+[Install]
+WantedBy=multi-user.target
+```
+
+HTTP API:
+
+```ini
+[Unit]
+Description=GT06N HTTP API
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/gt06n-tcp-server
+ExecStart=/root/gt06n-tcp-server/target/release/http_api
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/gt06n-tcp-server/.env
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 ## Essential systemd Commands
@@ -99,4 +169,11 @@ sudo systemctl status gt06n-telegram-bot.service
 sudo journalctl -u gt06n-telegram-bot.service -f
 ```
 
+If you run the HTTP API as a third service, use:
+
+```bash
+sudo systemctl restart gt06n-http-api.service
+sudo systemctl status gt06n-http-api.service
+sudo journalctl -u gt06n-http-api.service -f
+```
 
