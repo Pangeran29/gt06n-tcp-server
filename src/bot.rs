@@ -116,6 +116,7 @@ pub struct TelegramBot {
 }
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
+const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 300;
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
 
@@ -232,50 +233,18 @@ impl TelegramBot {
         chat_id: i64,
     ) -> Result<(), BotError> {
         let existing = fetch_notification_state(self.database.pool(), &heartbeat.imei, chat_id).await?;
+
+        if status == "on" {
+            return self
+                .process_engine_on_notification_for_chat(heartbeat, chat_id, existing)
+                .await;
+        }
+
         let text = format_engine_status_notification(heartbeat, status);
 
         match existing {
             Some(existing) if existing.last_status == status => {
-                if status == "on" {
-                    if let Some(session) = fetch_active_pending_session(
-                        self.database.pool(),
-                        &heartbeat.imei,
-                        chat_id,
-                    )
-                    .await?
-                    {
-                        let text = format_engine_on_confirmation_message_with_duration(
-                            heartbeat,
-                            Some(session.created_at),
-                        );
-                        let keyboard = engine_session_confirmation_keyboard();
-                        if let Err(error) = self
-                            .edit_message_text(
-                                chat_id,
-                                session.prompt_message_id,
-                                &text,
-                                Some(keyboard),
-                            )
-                            .await
-                        {
-                            warn!(
-                                error = %error,
-                                imei = %heartbeat.imei,
-                                message_id = session.prompt_message_id,
-                                "failed to update pending confirmation message"
-                            );
-                        }
-                    }
-                    upsert_notification_state(
-                        self.database.pool(),
-                        &heartbeat.imei,
-                        chat_id,
-                        status,
-                        existing.last_message_id,
-                        heartbeat.id,
-                    )
-                    .await?;
-                } else if let Some(session) =
+                if let Some(session) =
                     fetch_latest_theft_off_session(self.database.pool(), &heartbeat.imei, chat_id)
                         .await?
                         .filter(|session| session.ride_status_message_id == Some(existing.last_message_id))
@@ -329,18 +298,7 @@ impl TelegramBot {
                 }
             }
             _ => {
-                let message_id = if status == "on" {
-                    let message_id = self.send_engine_on_confirmation(chat_id, heartbeat).await?;
-                    create_engine_session(
-                        self.database.pool(),
-                        &heartbeat.imei,
-                        chat_id,
-                        heartbeat.id,
-                        message_id,
-                    )
-                    .await?;
-                    message_id
-                } else if let Some(session) =
+                let message_id = if let Some(session) =
                     fetch_active_reported_theft_session(self.database.pool(), &heartbeat.imei, chat_id)
                         .await?
                 {
@@ -428,6 +386,86 @@ impl TelegramBot {
                 .await?;
             }
         }
+
+        Ok(())
+    }
+
+    async fn process_engine_on_notification_for_chat(
+        &self,
+        heartbeat: &StoredHeartbeat,
+        chat_id: i64,
+        existing: Option<NotificationState>,
+    ) -> Result<(), BotError> {
+        let pending_sessions =
+            fetch_active_pending_sessions(self.database.pool(), &heartbeat.imei, chat_id).await?;
+        let latest_pending = pending_sessions.first();
+
+        if !should_send_new_engine_on_alert(
+            heartbeat.server_received_at,
+            latest_pending.map(|session| session.created_at),
+        ) {
+            let message_id = latest_pending
+                .map(|session| session.prompt_message_id)
+                .or(existing.as_ref().map(|state| state.last_message_id))
+                .unwrap_or_default();
+
+            info!(
+                imei = %heartbeat.imei,
+                chat_id,
+                heartbeat_id = heartbeat.id,
+                message_id,
+                "skipping new engine-on warning due to cooldown"
+            );
+
+            upsert_notification_state(
+                self.database.pool(),
+                &heartbeat.imei,
+                chat_id,
+                "on",
+                message_id,
+                heartbeat.id,
+            )
+            .await?;
+
+            return Ok(());
+        }
+
+        for session in &pending_sessions {
+            if let Err(error) = self
+                .clear_inline_keyboard(chat_id, session.prompt_message_id)
+                .await
+            {
+                warn!(
+                    error = %error,
+                    imei = %heartbeat.imei,
+                    chat_id,
+                    session_id = session.id,
+                    message_id = session.prompt_message_id,
+                    "failed to clear superseded pending confirmation keyboard"
+                );
+            }
+
+            resolve_engine_session(self.database.pool(), session.id, "superseded").await?;
+        }
+
+        let message_id = self.send_engine_on_confirmation(chat_id, heartbeat).await?;
+        create_engine_session(
+            self.database.pool(),
+            &heartbeat.imei,
+            chat_id,
+            heartbeat.id,
+            message_id,
+        )
+        .await?;
+        upsert_notification_state(
+            self.database.pool(),
+            &heartbeat.imei,
+            chat_id,
+            "on",
+            message_id,
+            heartbeat.id,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1476,6 +1514,20 @@ fn build_status_session(
     }
 }
 
+fn should_send_new_engine_on_alert(
+    heartbeat_time: DateTime<Utc>,
+    latest_pending_created_at: Option<DateTime<Utc>>,
+) -> bool {
+    let Some(latest_pending_created_at) = latest_pending_created_at else {
+        return true;
+    };
+
+    heartbeat_time
+        .signed_duration_since(latest_pending_created_at)
+        .num_seconds()
+        >= ENGINE_ON_ALERT_COOLDOWN_SECS
+}
+
 fn option_f64(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.6}"))
@@ -2061,6 +2113,42 @@ pub async fn fetch_active_pending_session(
     }))
 }
 
+pub async fn fetch_active_pending_sessions(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+) -> Result<Vec<EngineSession>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND session_status = 'pending_confirmation'
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EngineSession {
+            id: row.get("id"),
+            imei: row.get("imei"),
+            chat_id: row.get("chat_id"),
+            trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+            prompt_message_id: row.get("prompt_message_id"),
+            ride_status_message_id: row.get("ride_status_message_id"),
+            session_status: row.get("session_status"),
+            created_at: row.get("created_at"),
+            resolved_at: row.get("resolved_at"),
+        })
+        .collect())
+}
+
 pub async fn upsert_notification_state(
     pool: &sqlx::PgPool,
     imei: &str,
@@ -2471,6 +2559,34 @@ mod tests {
     }
 
     #[test]
+    fn sends_new_engine_on_alert_when_no_pending_session() {
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+        assert!(should_send_new_engine_on_alert(heartbeat_time, None));
+    }
+
+    #[test]
+    fn throttles_engine_on_alert_within_cooldown_window() {
+        let pending_created_at = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 4, 59).unwrap();
+
+        assert!(!should_send_new_engine_on_alert(
+            heartbeat_time,
+            Some(pending_created_at)
+        ));
+    }
+
+    #[test]
+    fn sends_new_engine_on_alert_after_cooldown_window() {
+        let pending_created_at = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 5, 1).unwrap();
+
+        assert!(should_send_new_engine_on_alert(
+            heartbeat_time,
+            Some(pending_created_at)
+        ));
+    }
+
+    #[test]
     fn formats_latest_motor_status_message() {
         let session = EngineSession {
             id: 1,
@@ -2511,7 +2627,7 @@ mod tests {
             &session,
             Some(&heartbeat),
             Some(&location),
-            Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 1).unwrap(),
+            Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 19).unwrap(),
         );
         assert!(text.contains("📍 Your latest motor location https://maps.google.com/?q=-6.204066,106.785514 (Stationary 12 seconds ago)"));
         assert!(text.contains("Engine: OFF"));

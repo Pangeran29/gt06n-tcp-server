@@ -136,7 +136,7 @@ async fn get_device_locations(
     .fetch_all(&state.pool)
     .await?;
 
-    let points = rows
+    let points: Vec<LocationPoint> = rows
         .into_iter()
         .map(|row| LocationPoint {
             server_received_at: row
