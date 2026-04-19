@@ -127,7 +127,7 @@ async fn get_device_locations(
         SELECT server_received_at, gps_timestamp, latitude, longitude, speed_kph, course, satellite_count
         FROM device_locations
         WHERE imei = $1
-                    AND server_received_at > $2
+                    AND server_received_at >= $2
         ORDER BY server_received_at ASC
         "#,
     )
