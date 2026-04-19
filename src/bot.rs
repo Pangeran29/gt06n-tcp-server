@@ -117,6 +117,7 @@ pub struct TelegramBot {
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 300;
+const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
 
@@ -730,8 +731,14 @@ impl TelegramBot {
 
         match action {
             TheftAlertAction::StreamLocation { .. } => {
-                let location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
-                let text = format_stream_location_message(location.as_ref());
+                let latest_location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
+                let start_at = session
+                    .as_ref()
+                    .map(|value| value.created_at)
+                    .or_else(|| latest_location.and_then(|value| value.last_seen_at));
+                let live_tracking_link =
+                    start_at.and_then(|value| build_live_tracking_link(imei, value));
+                let text = format_stream_location_message(live_tracking_link.as_deref());
                 self.send_message(chat_id, &text).await?;
             }
             TheftAlertAction::CheckLatestStatus { .. } => {
@@ -1265,14 +1272,22 @@ pub fn format_theft_engine_off_follow_up_message(
     )
 }
 
-pub fn format_stream_location_message(location: Option<&StoredLocation>) -> String {
-    let link = latest_location_link(location)
-        .unwrap_or_else(|| "Latest location link is not available yet.".to_string());
+pub fn format_stream_location_message(live_tracking_link: Option<&str>) -> String {
+    let link = live_tracking_link
+        .unwrap_or("Live tracking link is not available yet.")
+        .to_string();
 
     format!(
         "To track your motor realtime, use link below.\n{}\n*This is shareable link, share this link to your friend to help tracking your motor.",
         link
     )
+}
+
+fn build_live_tracking_link(imei: &str, start_at: DateTime<Utc>) -> Option<String> {
+    let mut url = reqwest::Url::parse(&format!("{LIVE_TRACKING_BASE_URL}/{imei}")).ok()?;
+    let start_at = start_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    url.query_pairs_mut().append_pair("start_at", &start_at);
+    Some(url.into())
 }
 
 pub fn format_latest_motor_status_message(
@@ -2542,20 +2557,22 @@ mod tests {
 
     #[test]
     fn formats_stream_location_message() {
-        let location = StoredLocation {
-            imei: "866221070478388".to_string(),
-            last_seen_at: None,
-            gps_timestamp: None,
-            latitude: Some(-6.204066),
-            longitude: Some(106.785514),
-            speed_kph: None,
-            course: None,
-            satellite_count: None,
-        };
-
-        let text = format_stream_location_message(Some(&location));
+        let text = format_stream_location_message(Some(
+            "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z",
+        ));
         assert!(text.contains("To track your motor realtime"));
-        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
+        assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"));
+    }
+
+    #[test]
+    fn builds_live_tracking_link_with_encoded_start_at() {
+        let start_at = Utc.with_ymd_and_hms(2026, 4, 18, 10, 0, 0).unwrap();
+        let link = build_live_tracking_link("866221070478388", start_at).expect("link");
+
+        assert_eq!(
+            link,
+            "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"
+        );
     }
 
     #[test]
