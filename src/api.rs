@@ -71,6 +71,7 @@ struct LocationsQuery {
 struct LocationHistoryResponse {
     imei: String,
     start_at: String,
+    latest_server_received_at: Option<String>,
     points: Vec<LocationPoint>,
 }
 
@@ -126,7 +127,7 @@ async fn get_device_locations(
         SELECT server_received_at, gps_timestamp, latitude, longitude, speed_kph, course, satellite_count
         FROM device_locations
         WHERE imei = $1
-          AND server_received_at >= $2
+                    AND server_received_at > $2
         ORDER BY server_received_at ASC
         "#,
     )
@@ -153,9 +154,14 @@ async fn get_device_locations(
         })
         .collect();
 
+    let latest_server_received_at = points
+        .last()
+        .map(|point: &LocationPoint| point.server_received_at.clone());
+
     Ok(Json(LocationHistoryResponse {
         imei,
         start_at: start_at.to_rfc3339(),
+        latest_server_received_at,
         points,
     }))
 }
