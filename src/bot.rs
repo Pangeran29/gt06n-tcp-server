@@ -116,7 +116,7 @@ pub struct TelegramBot {
 }
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
-const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 300;
+const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
@@ -2595,7 +2595,7 @@ mod tests {
     #[test]
     fn sends_new_engine_on_alert_after_cooldown_window() {
         let pending_created_at = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
-        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 5, 1).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 15, 1).unwrap();
 
         assert!(should_send_new_engine_on_alert(
             heartbeat_time,
