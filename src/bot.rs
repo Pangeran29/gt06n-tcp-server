@@ -400,10 +400,21 @@ impl TelegramBot {
         let pending_sessions =
             fetch_active_pending_sessions(self.database.pool(), &heartbeat.imei, chat_id).await?;
         let latest_pending = pending_sessions.first();
+        let last_on_heartbeat_at = match existing
+            .as_ref()
+            .filter(|state| state.last_status == "on")
+            .map(|state| state.last_heartbeat_id)
+        {
+            Some(last_heartbeat_id) => {
+                fetch_heartbeat_server_received_at_by_id(self.database.pool(), last_heartbeat_id)
+                    .await?
+            }
+            None => None,
+        };
 
-        if !should_send_new_engine_on_alert(
+        if !should_start_new_engine_on_session(
             heartbeat.server_received_at,
-            latest_pending.map(|session| session.created_at),
+            last_on_heartbeat_at,
         ) {
             let message_id = latest_pending
                 .map(|session| session.prompt_message_id)
@@ -415,7 +426,7 @@ impl TelegramBot {
                 chat_id,
                 heartbeat_id = heartbeat.id,
                 message_id,
-                "skipping new engine-on warning due to cooldown"
+                "continuing existing engine-on session because heartbeat gap is below threshold"
             );
 
             upsert_notification_state(
@@ -442,11 +453,28 @@ impl TelegramBot {
                     chat_id,
                     session_id = session.id,
                     message_id = session.prompt_message_id,
-                    "failed to clear superseded pending confirmation keyboard"
+                    "failed to clear pending confirmation keyboard; skipping new warning to avoid duplicate inline buttons"
                 );
+
+                let message_id = latest_pending
+                    .map(|pending| pending.prompt_message_id)
+                    .or(existing.as_ref().map(|state| state.last_message_id))
+                    .unwrap_or_default();
+
+                upsert_notification_state(
+                    self.database.pool(),
+                    &heartbeat.imei,
+                    chat_id,
+                    "on",
+                    message_id,
+                    heartbeat.id,
+                )
+                .await?;
+
+                return Ok(());
             }
 
-            resolve_engine_session(self.database.pool(), session.id, "superseded").await?;
+            resolve_engine_session(self.database.pool(), session.id, "finished").await?;
         }
 
         let message_id = self.send_engine_on_confirmation(chat_id, heartbeat).await?;
@@ -1529,16 +1557,16 @@ fn build_status_session(
     }
 }
 
-fn should_send_new_engine_on_alert(
+fn should_start_new_engine_on_session(
     heartbeat_time: DateTime<Utc>,
-    latest_pending_created_at: Option<DateTime<Utc>>,
+    previous_on_heartbeat_time: Option<DateTime<Utc>>,
 ) -> bool {
-    let Some(latest_pending_created_at) = latest_pending_created_at else {
+    let Some(previous_on_heartbeat_time) = previous_on_heartbeat_time else {
         return true;
     };
 
     heartbeat_time
-        .signed_duration_since(latest_pending_created_at)
+        .signed_duration_since(previous_on_heartbeat_time)
         .num_seconds()
         >= ENGINE_ON_ALERT_COOLDOWN_SECS
 }
@@ -1833,6 +1861,25 @@ pub async fn fetch_new_heartbeats(
             gsm_signal_strength: row.get("gsm_signal_strength"),
         })
         .collect())
+}
+
+pub async fn fetch_heartbeat_server_received_at_by_id(
+    pool: &sqlx::PgPool,
+    heartbeat_id: i64,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT server_received_at
+        FROM device_heartbeats
+        WHERE id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(heartbeat_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| row.get("server_received_at")))
 }
 
 pub async fn fetch_notification_state(
@@ -2576,30 +2623,41 @@ mod tests {
     }
 
     #[test]
-    fn sends_new_engine_on_alert_when_no_pending_session() {
+    fn starts_new_engine_on_session_when_no_previous_on_heartbeat() {
         let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
-        assert!(should_send_new_engine_on_alert(heartbeat_time, None));
+        assert!(should_start_new_engine_on_session(heartbeat_time, None));
     }
 
     #[test]
-    fn throttles_engine_on_alert_within_cooldown_window() {
-        let pending_created_at = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+    fn keeps_existing_engine_on_session_within_gap_window() {
+        let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
         let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 4, 59).unwrap();
 
-        assert!(!should_send_new_engine_on_alert(
+        assert!(!should_start_new_engine_on_session(
             heartbeat_time,
-            Some(pending_created_at)
+            Some(previous_on_heartbeat)
         ));
     }
 
     #[test]
-    fn sends_new_engine_on_alert_after_cooldown_window() {
-        let pending_created_at = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+    fn starts_new_engine_on_session_at_exact_gap_threshold() {
+        let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 15, 0).unwrap();
+
+        assert!(should_start_new_engine_on_session(
+            heartbeat_time,
+            Some(previous_on_heartbeat)
+        ));
+    }
+
+    #[test]
+    fn starts_new_engine_on_session_after_gap_threshold() {
+        let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
         let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 15, 1).unwrap();
 
-        assert!(should_send_new_engine_on_alert(
+        assert!(should_start_new_engine_on_session(
             heartbeat_time,
-            Some(pending_created_at)
+            Some(previous_on_heartbeat)
         ));
     }
 
