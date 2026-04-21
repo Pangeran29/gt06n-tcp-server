@@ -1604,26 +1604,6 @@ fn gps_battery_label(voltage_level: i32) -> &'static str {
     }
 }
 
-fn format_relative_time(reference_time: DateTime<Utc>, event_time: DateTime<Utc>) -> String {
-    let duration = reference_time
-        .signed_duration_since(event_time)
-        .to_std()
-        .unwrap_or_default();
-    let seconds = duration.as_secs();
-
-    match seconds {
-        0..=59 => format!("{seconds} seconds ago"),
-        60..=3599 => {
-            let minutes = seconds / 60;
-            format!("{minutes} minutes ago")
-        }
-        _ => {
-            let hours = seconds / 3600;
-            format!("{hours} hours ago")
-        }
-    }
-}
-
 pub fn format_latest_location_message(location: &StoredLocation) -> String {
     let gps_timestamp = location
         .gps_timestamp
