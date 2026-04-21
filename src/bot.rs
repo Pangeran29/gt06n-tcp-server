@@ -809,12 +809,23 @@ impl TelegramBot {
             TheftAlertAction::CheckLatestStatus { .. } => {
                 let location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
                 let latest_heartbeat = fetch_latest_heartbeat_for_imei(self.database.pool(), imei).await?;
-                let fallback_session = session.unwrap_or_else(|| build_status_session(
-                    imei,
-                    chat_id,
-                    latest_heartbeat.as_ref(),
-                    location.as_ref(),
-                ));
+                let fallback_session = match session {
+                    Some(session) => session,
+                    None => fetch_latest_engine_session_for_imei_chat(
+                        self.database.pool(),
+                        imei,
+                        chat_id,
+                    )
+                    .await?
+                    .unwrap_or_else(|| {
+                        build_status_session(
+                            imei,
+                            chat_id,
+                            latest_heartbeat.as_ref(),
+                            location.as_ref(),
+                        )
+                    }),
+                };
                 let text = format_latest_motor_status_initial_message(
                     &fallback_session,
                     latest_heartbeat.as_ref(),
@@ -1284,7 +1295,7 @@ pub fn format_engine_on_confirmation_message_with_duration(
     let _ = started_at;
 
     format!(
-        "WARNING! Motor ON detected.\nConfirm is this you?",
+        "🚨 Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?",
     )
 }
 
@@ -1343,7 +1354,7 @@ pub fn format_stream_location_message(live_tracking_link: Option<&str>) -> Strin
         .to_string();
 
     format!(
-        "To track your motor realtime, use link below.\n{}\n*This is shareable link, share this link to your friend to help tracking your motor.",
+        "📍 Live Tracking Activated\nTrack your motor in real-time using this link:\n{}\n\n🔗 This link is shareable — send it to someone you trust if you need help tracking.",
         link
     )
 }
@@ -1458,7 +1469,7 @@ fn format_latest_motor_status_message_at(
     location: Option<&StoredLocation>,
     reference_time: DateTime<Utc>,
 ) -> String {
-    let _ = session;
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
     let map_link = latest_location_link(location)
         .unwrap_or_else(|| "Location is not available yet.".to_string());
     let engine_status = heartbeat
@@ -1487,7 +1498,7 @@ fn format_latest_motor_status_message_at(
         .into_iter()
         .chain(location.and_then(|value| value.last_seen_at))
         .max()
-        .map(|value| format_relative_time(reference_time, value))
+        .map(|value| format_relative_time_compact(reference_time, value))
         .unwrap_or_else(|| "unknown".to_string());
     let battery_warning = heartbeat
         .filter(|value| value.voltage_level == 0)
@@ -1495,18 +1506,53 @@ fn format_latest_motor_status_message_at(
             "\n\nWarning: GPS device battery is empty. New updates may only arrive after the motor turns on again."
         })
         .unwrap_or("");
+    let session_started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
+    let session_status = session.session_status.as_str();
+    let session_ended = session
+        .resolved_at
+        .map(|value| {
+            let value = wib.from_utc_datetime(&value.naive_utc());
+            value.format("%H:%M:%S WIB").to_string()
+        })
+        .unwrap_or_else(|| "ONGOING".to_string());
+    let report_time_wib = wib.from_utc_datetime(&reference_time.naive_utc());
 
     format!(
-        "📍 Your latest motor location {} ({} {})\n\nEngine: {}\nGPS Signal: {}\nGPS Tracking: {}\nGPS Battery/Power: {}{}",
+        "🛠️ Motor Diagnostics Report\n📅 {} — {} WIB\n\n📍 Last Known Location\n{}\n\nStatus: {}\nLast Update: {}\n\n⚙️ Engine Status\n\nEngine: {}\n\n📡 GPS & Tracking\n\nGPS Signal: {}\nTracking Mode: {}\nPower Level: {}\n\n🧾 Session Info\n\nSession State: {}\nStarted: {}\nEnded: {}{}",
+        report_time_wib.format("%d %b %Y"),
+        report_time_wib.format("%H:%M"),
         map_link,
-        movement_status,
+        movement_status.to_uppercase(),
         last_update,
         engine_status,
-        signal_status,
-        gps_tracking_status,
-        battery_level,
+        signal_status.to_uppercase(),
+        gps_tracking_status.to_uppercase(),
+        battery_level.to_uppercase(),
+        session_status.to_uppercase(),
+        session_started_wib.format("%H:%M:%S WIB"),
+        session_ended,
         battery_warning,
     )
+}
+
+fn format_relative_time_compact(reference_time: DateTime<Utc>, event_time: DateTime<Utc>) -> String {
+    let duration = reference_time
+        .signed_duration_since(event_time)
+        .to_std()
+        .unwrap_or_default();
+    let seconds = duration.as_secs();
+
+    match seconds {
+        0..=59 => format!("{seconds}s ago"),
+        60..=3599 => {
+            let minutes = seconds / 60;
+            format!("{minutes}m ago")
+        }
+        _ => {
+            let hours = seconds / 3600;
+            format!("{hours}h ago")
+        }
+    }
 }
 
 pub fn format_ride_session_status_message(
@@ -2728,8 +2774,10 @@ mod tests {
         let text = format_stream_location_message(Some(
             "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z",
         ));
-        assert!(text.contains("To track your motor realtime"));
+        assert!(text.contains("📍 Live Tracking Activated"));
+        assert!(text.contains("Track your motor in real-time using this link:"));
         assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"));
+        assert!(text.contains("🔗 This link is shareable"));
     }
 
     #[test]
@@ -2890,11 +2938,16 @@ mod tests {
             Some(&location),
             Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 19).unwrap(),
         );
-        assert!(text.contains("📍 Your latest motor location https://maps.google.com/?q=-6.204066,106.785514 (Stationary 12 seconds ago)"));
+        assert!(text.contains("🛠️ Motor Diagnostics Report"));
+        assert!(text.contains("📍 Last Known Location"));
+        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
+        assert!(text.contains("Status: STATIONARY"));
+        assert!(text.contains("Last Update: 12s ago"));
         assert!(text.contains("Engine: OFF"));
         assert!(text.contains("GPS Signal: OK"));
-        assert!(text.contains("GPS Tracking: Active"));
-        assert!(text.contains("GPS Battery/Power: Unknown"));
+        assert!(text.contains("Tracking Mode: ACTIVE"));
+        assert!(text.contains("Power Level: UNKNOWN"));
+        assert!(text.contains("Session State: THEFT_ENGINE_OFF"));
     }
 
     #[test]
@@ -2914,7 +2967,12 @@ mod tests {
 
         let text =
             format_latest_motor_status_initial_message(&session, None, None, requested_at);
-        assert!(text.contains("📍 Your latest motor location Location is not available yet. (Stationary unknown)"));
+        assert!(text.contains("🛠️ Motor Diagnostics Report"));
+        assert!(text.contains("📍 Last Known Location"));
+        assert!(text.contains("Location is not available yet."));
+        assert!(text.contains("Status: STATIONARY"));
+        assert!(text.contains("Last Update: unknown"));
+        assert!(text.contains("Session State: REPORTED_THEFT"));
     }
 
     #[test]
@@ -2950,7 +3008,7 @@ mod tests {
             None,
             Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
         );
-        assert!(text.contains("GPS Battery/Power: Empty"));
+        assert!(text.contains("Power Level: EMPTY"));
         assert!(text.contains("Warning: GPS device battery is empty."));
     }
 
