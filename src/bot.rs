@@ -340,12 +340,16 @@ impl TelegramBot {
                         heartbeat.server_received_at,
                     )
                     .await?;
+                    let latest_location =
+                        fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei)
+                            .await?;
                     self.send_message(
                         chat_id,
                         &format_ride_summary_message(
                             &session,
                             heartbeat.server_received_at,
                             ride_summary.as_ref(),
+                            latest_location.as_ref(),
                         ),
                     )
                     .await?
@@ -363,12 +367,16 @@ impl TelegramBot {
                         heartbeat.server_received_at,
                     )
                     .await?;
+                    let latest_location =
+                        fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei)
+                            .await?;
                     self.send_message(
                         chat_id,
                         &format_ride_summary_message(
                             &session,
                             heartbeat.server_received_at,
                             ride_summary.as_ref(),
+                            latest_location.as_ref(),
                         ),
                     )
                     .await?
@@ -484,12 +492,15 @@ impl TelegramBot {
                 heartbeat.server_received_at,
             )
             .await?;
+            let latest_location =
+                fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei).await?;
             self.send_message(
                 chat_id,
                 &format_ride_summary_message(
                     session,
                     heartbeat.server_received_at,
                     ride_summary.as_ref(),
+                    latest_location.as_ref(),
                 ),
             )
             .await?;
@@ -1379,6 +1390,7 @@ pub fn format_ride_summary_message(
     session: &EngineSession,
     off_time: DateTime<Utc>,
     summary: Option<&RideSummary>,
+    latest_location: Option<&StoredLocation>,
 ) -> String {
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
     let started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
@@ -1393,17 +1405,42 @@ pub fn format_ride_summary_message(
     let seconds = total_seconds % 60;
     let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
     let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
+    let history_link = build_history_tracking_link(&session.imei, session.created_at, off_time)
+        .unwrap_or_else(|| "History link is not available yet.".to_string());
+    let latest_map_link = latest_location_link(latest_location)
+        .unwrap_or_else(|| "Latest map link is not available yet.".to_string());
+    let duration_compact = if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    };
 
     format!(
-        "Ride summary\nStarted: {}\nOff: {}\nDriving time: {:02}:{:02}:{:02}\nDistance: {:.2} km\nAverage speed: {:.2} km/h",
-        started_wib.format("%d %b %Y %H:%M:%S WIB"),
-        off_wib.format("%d %b %Y %H:%M:%S WIB"),
-        hours,
-        minutes,
-        seconds,
+        "🏍️ Ride Summary ({})\n⏱️ {} → {} WIB ({})\n📍 {:.2} km\n⚡ Avg Speed: {:.2} km/h\n\n🗺️ History: [View Route]\n{}\n\n📌 Last Location: [Open in Google Maps]\n{}",
+        started_wib.format("%d %b %Y"),
+        started_wib.format("%H:%M"),
+        off_wib.format("%H:%M"),
+        duration_compact,
         total_distance_km,
         average_speed_kph,
+        history_link,
+        latest_map_link,
     )
+}
+
+fn build_history_tracking_link(
+    imei: &str,
+    start_at: DateTime<Utc>,
+    end_at: DateTime<Utc>,
+) -> Option<String> {
+    let mut url = reqwest::Url::parse(&format!("{LIVE_TRACKING_BASE_URL}/{imei}")).ok()?;
+    let start_at = start_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let end_at = end_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    url.query_pairs_mut().append_pair("start_at", &start_at);
+    url.query_pairs_mut().append_pair("end_at", &end_at);
+    Some(url.into())
 }
 
 fn latest_location_link(location: Option<&StoredLocation>) -> Option<String> {
@@ -2653,16 +2690,31 @@ mod tests {
             total_distance_km: 3.25,
             average_speed_kph: 39.0,
         };
+        let latest_location = StoredLocation {
+            imei: "866221070478388".to_string(),
+            last_seen_at: Some(Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap()),
+            gps_timestamp: None,
+            latitude: Some(-6.204066),
+            longitude: Some(106.785514),
+            speed_kph: Some(0),
+            course: None,
+            satellite_count: None,
+        };
 
         let text = format_ride_summary_message(
             &session,
             Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap(),
             Some(&summary),
+            Some(&latest_location),
         );
-        assert!(text.contains("Ride summary"));
-        assert!(text.contains("Driving time: 00:05:00"));
-        assert!(text.contains("Distance: 3.25 km"));
-        assert!(text.contains("Average speed: 39.00 km/h"));
+        assert!(text.contains("🏍️ Ride Summary (17 Apr 2026)"));
+        assert!(text.contains("⏱️ 17:00 → 17:05 WIB (5m 0s)"));
+        assert!(text.contains("📍 3.25 km"));
+        assert!(text.contains("⚡ Avg Speed: 39.00 km/h"));
+        assert!(text.contains("🗺️ History: [View Route]"));
+        assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z"));
+        assert!(text.contains("📌 Last Location: [Open in Google Maps]"));
+        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
     }
 
     #[test]
@@ -2688,6 +2740,19 @@ mod tests {
         assert_eq!(
             link,
             "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"
+        );
+    }
+
+    #[test]
+    fn builds_history_tracking_link_with_encoded_start_and_end_at() {
+        let start_at = Utc.with_ymd_and_hms(2026, 4, 18, 10, 0, 0).unwrap();
+        let end_at = Utc.with_ymd_and_hms(2026, 4, 18, 11, 0, 0).unwrap();
+        let link =
+            build_history_tracking_link("866221070478388", start_at, end_at).expect("link");
+
+        assert_eq!(
+            link,
+            "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z&end_at=2026-04-18T11%3A00%3A00Z"
         );
     }
 

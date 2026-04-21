@@ -24,6 +24,8 @@ pub enum ApiError {
     Bind(#[from] std::io::Error),
     #[error("invalid start_at query parameter")]
     InvalidStartAt,
+    #[error("invalid end_at query parameter")]
+    InvalidEndAt,
     #[error("database query failed: {0}")]
     Query(#[from] sqlx::Error),
 }
@@ -31,7 +33,7 @@ pub enum ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match self {
-            Self::InvalidStartAt => StatusCode::BAD_REQUEST,
+            Self::InvalidStartAt | Self::InvalidEndAt => StatusCode::BAD_REQUEST,
             Self::MissingDatabase => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Database(_) | Self::Query(_) | Self::Bind(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
@@ -65,6 +67,7 @@ struct ApiErrorBody {
 #[derive(Debug, Deserialize)]
 struct LocationsQuery {
     start_at: String,
+    end_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -121,18 +124,29 @@ async fn get_device_locations(
     let start_at = DateTime::parse_from_rfc3339(&query.start_at)
         .map_err(|_| ApiError::InvalidStartAt)?
         .with_timezone(&Utc);
+    let end_at = query
+        .end_at
+        .as_deref()
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value)
+                .map_err(|_| ApiError::InvalidEndAt)
+                .map(|value| value.with_timezone(&Utc))
+        })
+        .transpose()?;
 
     let rows = sqlx::query(
         r#"
         SELECT server_received_at, gps_timestamp, latitude, longitude, speed_kph, course, satellite_count
         FROM device_locations
         WHERE imei = $1
-                    AND server_received_at >= $2
+          AND server_received_at >= $2
+          AND ($3::timestamptz IS NULL OR server_received_at <= $3)
         ORDER BY server_received_at ASC
         "#,
     )
     .bind(&imei)
     .bind(start_at)
+    .bind(end_at)
     .fetch_all(&state.pool)
     .await?;
 
