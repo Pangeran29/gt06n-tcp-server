@@ -45,6 +45,12 @@ enum SessionAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum PaymentAction {
+    Subscribe,
+    Buy(StarsPackageCode),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TheftAlertAction {
     StreamLocation { session_id: Option<i64> },
     CheckLatestStatus { session_id: Option<i64> },
@@ -66,6 +72,31 @@ impl SessionAction {
             "no" => Self::No,
             _ => return None,
         })
+    }
+}
+
+impl PaymentAction {
+    fn parse(data: &str) -> Option<Self> {
+        let mut parts = data.split(':');
+        let prefix = parts.next()?;
+        let action = parts.next()?;
+
+        if prefix != "payment" {
+            return None;
+        }
+
+        match action {
+            "subscribe" if parts.next().is_none() => Some(Self::Subscribe),
+            "buy" => {
+                let package = parts.next()?;
+                if parts.next().is_some() {
+                    return None;
+                }
+
+                Some(Self::Buy(StarsPackageCode::parse(package)?))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -118,6 +149,9 @@ pub struct TelegramBot {
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
+const TELEGRAM_STARS_PLAN_CODE: &str = "monthly_stars";
+const TELEGRAM_STARS_CURRENCY: &str = "XTR";
+const TELEGRAM_STARS_PAYMENT_KIND: &str = "one_time_stars";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
 const THEFT_WARNING_STICKER_BYTES: &[u8] =
@@ -166,6 +200,10 @@ impl TelegramBot {
         let updates = self.get_updates(offset).await?;
 
         for update in updates {
+            if let Some(pre_checkout_query) = update.pre_checkout_query {
+                self.handle_pre_checkout_query(pre_checkout_query).await?;
+            }
+
             if let Some(message) = update.message {
                 self.handle_message(message).await?;
             }
@@ -467,12 +505,18 @@ impl TelegramBot {
         let Some(from) = message.from.as_ref() else {
             return Ok(());
         };
+        let chat_id = message.chat.id;
+        let telegram_user_id = from.id;
+
+        if let Some(successful_payment) = message.successful_payment {
+            return self
+                .handle_successful_payment(chat_id, telegram_user_id, successful_payment)
+                .await;
+        }
+
         let Some(text) = message.text.as_deref() else {
             return Ok(());
         };
-
-        let chat_id = message.chat.id;
-        let telegram_user_id = from.id;
 
         if let Some(command) = BotCommand::parse(text) {
             return self
@@ -536,12 +580,7 @@ impl TelegramBot {
         if let Err(error) = self.send_bind_success_sticker(chat_id).await {
             warn!(error = %error, "failed to send bind-success sticker");
         }
-        self.send_message_internal(
-            chat_id,
-            &format_start_status_message(),
-            Some(start_menu_keyboard()),
-        )
-        .await?;
+        self.send_subscription_required_menu(chat_id).await?;
 
         Ok(())
     }
@@ -557,12 +596,22 @@ impl TelegramBot {
         match command {
             BotCommand::Start => match user {
                 Some(user) if user.bound_imei.is_some() => {
-                    self.send_message_internal(
-                        chat_id,
-                        &format_start_status_message(),
-                        Some(start_menu_keyboard()),
+                    let is_active = has_active_subscription(
+                        self.database.pool(),
+                        user.telegram_user_id,
+                        Utc::now(),
                     )
                     .await?;
+                    if is_active {
+                        self.send_message_internal(
+                            chat_id,
+                            &format_start_status_message(),
+                            Some(subscribed_start_menu_keyboard()),
+                        )
+                        .await?;
+                    } else {
+                        self.send_subscription_required_menu(chat_id).await?;
+                    }
                 }
                 _ => {
                     upsert_telegram_user_registration_state(
@@ -594,6 +643,167 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn handle_payment_action(
+        &self,
+        callback_query: TelegramCallbackQuery,
+        action: PaymentAction,
+    ) -> Result<(), BotError> {
+        let Some(message) = callback_query.message else {
+            self.answer_callback_query(
+                &callback_query.id,
+                "Please open the bot chat and try again.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let chat_id = message.chat.id;
+        let telegram_user_id = callback_query.from.id;
+
+        match action {
+            PaymentAction::Subscribe => {
+                if !self
+                    .ensure_bound_for_payment(&callback_query.id, telegram_user_id)
+                    .await?
+                {
+                    return Ok(());
+                }
+
+                self.answer_callback_query(&callback_query.id, "", false)
+                    .await?;
+                self.send_message_internal(
+                    chat_id,
+                    "Choose your Heartbeats access package:",
+                    Some(stars_package_keyboard()),
+                )
+                .await?;
+            }
+            PaymentAction::Buy(package_code) => {
+                if !self
+                    .ensure_bound_for_payment(&callback_query.id, telegram_user_id)
+                    .await?
+                {
+                    return Ok(());
+                }
+
+                let payment_menu_message_id = i64::from(message.message_id.unwrap_or_default());
+                let package = package_code.package();
+                let invoice_payload =
+                    build_stars_invoice_payload(telegram_user_id, package, Utc::now());
+                create_pending_stars_payment(
+                    self.database.pool(),
+                    telegram_user_id,
+                    chat_id,
+                    &invoice_payload,
+                    package.stars_amount,
+                    package.period_days,
+                )
+                .await?;
+
+                self.answer_callback_query(&callback_query.id, "", false)
+                    .await?;
+                if let Err(error) = self
+                    .clear_inline_keyboard(chat_id, payment_menu_message_id)
+                    .await
+                {
+                    warn!(
+                        error = %error,
+                        chat_id,
+                        message_id = payment_menu_message_id,
+                        "failed to clear subscription payment keyboard"
+                    );
+                }
+                self.send_stars_subscription_invoice(chat_id, package, &invoice_payload)
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_subscription_required_menu(&self, chat_id: i64) -> Result<(), BotError> {
+        self.send_message_internal(
+            chat_id,
+            &format_subscription_menu_message(),
+            Some(stars_package_keyboard()),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    async fn ensure_bound_for_payment(
+        &self,
+        callback_query_id: &str,
+        telegram_user_id: i64,
+    ) -> Result<bool, BotError> {
+        let user = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?;
+        let is_bound = user
+            .as_ref()
+            .map(|user| {
+                user.bound_imei.is_some()
+                    && user.registration_status == TelegramRegistrationStatus::Bound
+            })
+            .unwrap_or(false);
+
+        if !is_bound {
+            self.answer_callback_query(
+                callback_query_id,
+                "Please bind your device with /start first.",
+                false,
+            )
+            .await?;
+        }
+
+        Ok(is_bound)
+    }
+
+    async fn handle_pre_checkout_query(
+        &self,
+        pre_checkout_query: TelegramPreCheckoutQuery,
+    ) -> Result<(), BotError> {
+        let validation =
+            validate_pre_checkout_query(self.database.pool(), &pre_checkout_query).await?;
+
+        match validation {
+            Ok(()) => {
+                self.answer_pre_checkout_query(&pre_checkout_query.id, true, None)
+                    .await?;
+            }
+            Err(message) => {
+                self.answer_pre_checkout_query(&pre_checkout_query.id, false, Some(&message))
+                    .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_successful_payment(
+        &self,
+        chat_id: i64,
+        telegram_user_id: i64,
+        successful_payment: TelegramSuccessfulPayment,
+    ) -> Result<(), BotError> {
+        let subscription = mark_stars_payment_paid_and_extend_subscription(
+            self.database.pool(),
+            telegram_user_id,
+            chat_id,
+            &successful_payment,
+            Utc::now(),
+        )
+        .await?;
+
+        self.send_message(
+            chat_id,
+            &format_payment_success_message(subscription.current_period_end_at),
+        )
+        .await?;
+
+        Ok(())
+    }
+
     async fn handle_callback_query(
         &self,
         callback_query: TelegramCallbackQuery,
@@ -601,6 +811,10 @@ impl TelegramBot {
         let Some(data) = callback_query.data.as_deref() else {
             return Ok(());
         };
+        if let Some(action) = PaymentAction::parse(data) {
+            return self.handle_payment_action(callback_query, action).await;
+        }
+
         let Some(message) = callback_query.message else {
             return Ok(());
         };
@@ -825,6 +1039,37 @@ impl TelegramBot {
             .await
     }
 
+    async fn send_stars_subscription_invoice(
+        &self,
+        chat_id: i64,
+        package: StarsPackage,
+        payload: &str,
+    ) -> Result<i64, reqwest::Error> {
+        let request = SendInvoiceRequest {
+            chat_id,
+            title: package.invoice_title.to_string(),
+            description: package.invoice_description.to_string(),
+            payload: payload.to_string(),
+            provider_token: String::new(),
+            currency: TELEGRAM_STARS_CURRENCY.to_string(),
+            prices: vec![LabeledPrice {
+                label: package.price_label.to_string(),
+                amount: package.stars_amount,
+            }],
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/sendInvoice", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let body: TelegramResponse<TelegramMessage> = response.json().await?;
+        Ok(i64::from(body.result.message_id.unwrap_or_default()))
+    }
+
     async fn send_engine_on_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(ENGINE_ON_STICKER_BYTES.to_vec())
             .file_name("AnimatedSticker.tgs")
@@ -968,9 +1213,33 @@ impl TelegramBot {
         let _ = response.bytes().await?;
         Ok(())
     }
+
+    async fn answer_pre_checkout_query(
+        &self,
+        pre_checkout_query_id: &str,
+        ok: bool,
+        error_message: Option<&str>,
+    ) -> Result<(), reqwest::Error> {
+        let request = AnswerPreCheckoutQueryRequest {
+            pre_checkout_query_id: pre_checkout_query_id.to_string(),
+            ok,
+            error_message: error_message.map(ToString::to_string),
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/answerPreCheckoutQuery", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
 }
 
-pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, tracking real time motor position, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message";
+pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message";
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -982,6 +1251,7 @@ struct TelegramUpdate {
     update_id: i32,
     message: Option<TelegramMessage>,
     callback_query: Option<TelegramCallbackQuery>,
+    pre_checkout_query: Option<TelegramPreCheckoutQuery>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -990,13 +1260,36 @@ struct TelegramMessage {
     from: Option<TelegramUser>,
     text: Option<String>,
     message_id: Option<i32>,
+    successful_payment: Option<TelegramSuccessfulPayment>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TelegramCallbackQuery {
     id: String,
+    from: TelegramUser,
     data: Option<String>,
     message: Option<TelegramMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramPreCheckoutQuery {
+    id: String,
+    from: TelegramUser,
+    currency: String,
+    total_amount: i64,
+    invoice_payload: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct TelegramSuccessfulPayment {
+    currency: String,
+    total_amount: i64,
+    invoice_payload: String,
+    telegram_payment_charge_id: String,
+    provider_payment_charge_id: String,
+    subscription_expiration_date: Option<i64>,
+    is_recurring: Option<bool>,
+    is_first_recurring: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1026,6 +1319,23 @@ struct SendMessageRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct SendInvoiceRequest {
+    chat_id: i64,
+    title: String,
+    description: String,
+    payload: String,
+    provider_token: String,
+    currency: String,
+    prices: Vec<LabeledPrice>,
+}
+
+#[derive(Debug, Serialize)]
+struct LabeledPrice {
+    label: String,
+    amount: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct EditMessageReplyMarkupRequest {
     chat_id: i64,
     message_id: i64,
@@ -1038,6 +1348,14 @@ struct AnswerCallbackQueryRequest {
     callback_query_id: String,
     text: String,
     show_alert: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct AnswerPreCheckoutQueryRequest {
+    pre_checkout_query_id: String,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1087,7 +1405,7 @@ fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
     }
 }
 
-fn start_menu_keyboard() -> InlineKeyboardMarkup {
+fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![
             InlineKeyboardButton {
@@ -1099,6 +1417,20 @@ fn start_menu_keyboard() -> InlineKeyboardMarkup {
                 callback_data: theft_alert_callback_data("check_latest_status", None),
             },
         ]],
+    }
+}
+
+fn stars_package_keyboard() -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: STARS_PACKAGES
+            .iter()
+            .map(|package| {
+                vec![InlineKeyboardButton {
+                    text: package.label.to_string(),
+                    callback_data: format!("payment:buy:{}", package.callback_code),
+                }]
+            })
+            .collect(),
     }
 }
 
@@ -1162,6 +1494,74 @@ pub struct EngineSession {
     pub session_status: String,
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramSubscriptionRecord {
+    pub id: i64,
+    pub telegram_user_id: i64,
+    pub chat_id: i64,
+    pub plan_code: String,
+    pub status: String,
+    pub current_period_start_at: Option<DateTime<Utc>>,
+    pub current_period_end_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StarsPackageCode {
+    Monthly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StarsPackage {
+    code: StarsPackageCode,
+    callback_code: &'static str,
+    label: &'static str,
+    invoice_title: &'static str,
+    invoice_description: &'static str,
+    price_label: &'static str,
+    stars_amount: i64,
+    period_days: i32,
+}
+
+impl StarsPackageCode {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "monthly" => Self::Monthly,
+            _ => return None,
+        })
+    }
+
+    fn package(self) -> StarsPackage {
+        STARS_PACKAGES
+            .iter()
+            .copied()
+            .find(|package| package.code == self)
+            .expect("stars package should exist")
+    }
+}
+
+const STARS_PACKAGES: [StarsPackage; 1] = [StarsPackage {
+    code: StarsPackageCode::Monthly,
+    callback_code: "monthly",
+    label: "🔒 Subscribe",
+    invoice_title: "Heartbeats Monthly Access",
+    invoice_description: "30 days of motorcycle GPS tracking access.",
+    price_label: "30 days access",
+    stars_amount: 150,
+    period_days: 30,
+}];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingStarsPayment {
+    id: i64,
+    telegram_user_id: i64,
+    chat_id: i64,
+    payment_status: String,
+    currency: String,
+    stars_amount: i64,
+    period_days: i32,
+    subscription_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1583,6 +1983,10 @@ fn format_start_status_message() -> String {
     "🛵 welcome to @tryheartbeatsbot 🛣 \n\nclick /help for more information.".to_string()
 }
 
+fn format_subscription_menu_message() -> String {
+    "Unlock full Heartbeats access and protect your motorcycle with smart GPS tracking.".to_string()
+}
+
 fn build_status_session(
     imei: &str,
     chat_id: i64,
@@ -1605,6 +2009,64 @@ fn build_status_session(
         created_at,
         resolved_at: None,
     }
+}
+
+fn build_stars_invoice_payload(
+    telegram_user_id: i64,
+    package: StarsPackage,
+    created_at: DateTime<Utc>,
+) -> String {
+    format!(
+        "stars:{telegram_user_id}:{}:{}",
+        package.callback_code,
+        created_at.timestamp_millis()
+    )
+}
+
+fn validate_pre_checkout_payment(
+    payment: Option<&PendingStarsPayment>,
+    buyer_telegram_user_id: i64,
+    currency: &str,
+    total_amount: i64,
+) -> Result<(), String> {
+    let Some(payment) = payment else {
+        return Err("Payment request was not found. Please create a new invoice.".to_string());
+    };
+
+    if payment.telegram_user_id != buyer_telegram_user_id {
+        return Err("This invoice belongs to another Telegram account.".to_string());
+    }
+
+    if payment.payment_status != "pending" {
+        return Err(
+            "This invoice has already been processed. Please create a new invoice.".to_string(),
+        );
+    }
+
+    if currency != TELEGRAM_STARS_CURRENCY || payment.currency != TELEGRAM_STARS_CURRENCY {
+        return Err("This invoice uses an unsupported currency.".to_string());
+    }
+
+    if total_amount != payment.stars_amount {
+        return Err(
+            "This invoice amount is no longer valid. Please create a new invoice.".to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+pub fn format_payment_success_message(current_period_end_at: Option<DateTime<Utc>>) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let active_until = current_period_end_at
+        .map(|value| {
+            wib.from_utc_datetime(&value.naive_utc())
+                .format("%d %b %Y %H:%M WIB")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!("Payment successful. Your Heartbeats access is active until {active_until}.")
 }
 
 fn should_start_new_engine_on_session(
@@ -1847,6 +2309,267 @@ async fn fetch_notification_chat_ids_for_imei(
     .await?;
 
     Ok(rows.into_iter().map(|row| row.get("chat_id")).collect())
+}
+
+async fn has_active_subscription(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+    reference_time: DateTime<Utc>,
+) -> Result<bool, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT 1
+        FROM telegram_subscriptions
+        WHERE telegram_user_id = $1
+          AND plan_code = $2
+          AND status = 'active'
+          AND current_period_end_at > $3
+        LIMIT 1
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(TELEGRAM_STARS_PLAN_CODE)
+    .bind(reference_time)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.is_some())
+}
+
+async fn create_pending_stars_payment(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+    chat_id: i64,
+    invoice_payload: &str,
+    stars_amount: i64,
+    period_days: i32,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        INSERT INTO telegram_payment_events (
+            telegram_user_id, chat_id, subscription_id, payment_kind, payment_status,
+            plan_code, currency, stars_amount, period_days, invoice_payload,
+            created_at, updated_at
+        )
+        VALUES ($1, $2, NULL, $3, 'pending', $4, $5, $6, $7, $8, NOW(), NOW())
+        RETURNING id
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(chat_id)
+    .bind(TELEGRAM_STARS_PAYMENT_KIND)
+    .bind(TELEGRAM_STARS_PLAN_CODE)
+    .bind(TELEGRAM_STARS_CURRENCY)
+    .bind(stars_amount)
+    .bind(period_days)
+    .bind(invoice_payload)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row.get("id"))
+}
+
+async fn fetch_stars_payment_by_payload(
+    pool: &sqlx::PgPool,
+    invoice_payload: &str,
+) -> Result<Option<PendingStarsPayment>, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, telegram_user_id, chat_id, payment_status, currency,
+               stars_amount, period_days, subscription_id
+        FROM telegram_payment_events
+        WHERE invoice_payload = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(invoice_payload)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|row| PendingStarsPayment {
+        id: row.get("id"),
+        telegram_user_id: row.get("telegram_user_id"),
+        chat_id: row.get("chat_id"),
+        payment_status: row.get("payment_status"),
+        currency: row.get("currency"),
+        stars_amount: row.get("stars_amount"),
+        period_days: row.get("period_days"),
+        subscription_id: row.get("subscription_id"),
+    }))
+}
+
+async fn validate_pre_checkout_query(
+    pool: &sqlx::PgPool,
+    pre_checkout_query: &TelegramPreCheckoutQuery,
+) -> Result<Result<(), String>, sqlx::Error> {
+    let payment = fetch_stars_payment_by_payload(pool, &pre_checkout_query.invoice_payload).await?;
+
+    Ok(validate_pre_checkout_payment(
+        payment.as_ref(),
+        pre_checkout_query.from.id,
+        &pre_checkout_query.currency,
+        pre_checkout_query.total_amount,
+    ))
+}
+
+pub async fn mark_stars_payment_paid_and_extend_subscription(
+    pool: &sqlx::PgPool,
+    telegram_user_id: i64,
+    chat_id: i64,
+    successful_payment: &TelegramSuccessfulPayment,
+    paid_at: DateTime<Utc>,
+) -> Result<TelegramSubscriptionRecord, sqlx::Error> {
+    let raw_successful_payment =
+        serde_json::to_string(successful_payment).map_err(|_| sqlx::Error::RowNotFound)?;
+    let mut tx = pool.begin().await?;
+
+    let payment_row = sqlx::query(
+        r#"
+        SELECT id, payment_status, subscription_id, currency, stars_amount, period_days
+        FROM telegram_payment_events
+        WHERE invoice_payload = $1
+          AND telegram_user_id = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(&successful_payment.invoice_payload)
+    .bind(telegram_user_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let payment_id: i64 = payment_row.get("id");
+    let payment_status: String = payment_row.get("payment_status");
+    let existing_subscription_id: Option<i64> = payment_row.get("subscription_id");
+    let currency: String = payment_row.get("currency");
+    let stars_amount: i64 = payment_row.get("stars_amount");
+    let period_days: i32 = payment_row.get("period_days");
+
+    if payment_status == "paid" {
+        let subscription_id = existing_subscription_id.ok_or(sqlx::Error::RowNotFound)?;
+        let subscription =
+            fetch_subscription_by_id_in_transaction(&mut tx, subscription_id).await?;
+        tx.commit().await?;
+        return Ok(subscription);
+    }
+
+    if payment_status != "pending" {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    if currency != TELEGRAM_STARS_CURRENCY
+        || successful_payment.currency != TELEGRAM_STARS_CURRENCY
+        || successful_payment.total_amount != stars_amount
+    {
+        return Err(sqlx::Error::RowNotFound);
+    }
+
+    let existing_subscription = sqlx::query(
+        r#"
+        SELECT id, current_period_end_at
+        FROM telegram_subscriptions
+        WHERE telegram_user_id = $1
+          AND plan_code = $2
+        FOR UPDATE
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(TELEGRAM_STARS_PLAN_CODE)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let base_time = existing_subscription
+        .as_ref()
+        .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("current_period_end_at"))
+        .filter(|value| *value > paid_at)
+        .unwrap_or(paid_at);
+    let period_end = base_time + chrono::Duration::days(i64::from(period_days));
+
+    let subscription_row = sqlx::query(
+        r#"
+        INSERT INTO telegram_subscriptions (
+            telegram_user_id, chat_id, plan_code, status,
+            current_period_start_at, current_period_end_at, created_at, updated_at
+        )
+        VALUES ($1, $2, $3, 'active', $4, $5, NOW(), NOW())
+        ON CONFLICT (telegram_user_id, plan_code) DO UPDATE
+        SET chat_id = EXCLUDED.chat_id,
+            status = EXCLUDED.status,
+            current_period_start_at = EXCLUDED.current_period_start_at,
+            current_period_end_at = EXCLUDED.current_period_end_at,
+            updated_at = EXCLUDED.updated_at
+        RETURNING id, telegram_user_id, chat_id, plan_code, status,
+                  current_period_start_at, current_period_end_at
+        "#,
+    )
+    .bind(telegram_user_id)
+    .bind(chat_id)
+    .bind(TELEGRAM_STARS_PLAN_CODE)
+    .bind(base_time)
+    .bind(period_end)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let subscription = TelegramSubscriptionRecord {
+        id: subscription_row.get("id"),
+        telegram_user_id: subscription_row.get("telegram_user_id"),
+        chat_id: subscription_row.get("chat_id"),
+        plan_code: subscription_row.get("plan_code"),
+        status: subscription_row.get("status"),
+        current_period_start_at: subscription_row.get("current_period_start_at"),
+        current_period_end_at: subscription_row.get("current_period_end_at"),
+    };
+
+    sqlx::query(
+        r#"
+        UPDATE telegram_payment_events
+        SET subscription_id = $2,
+            payment_status = 'paid',
+            telegram_payment_charge_id = $3,
+            provider_payment_charge_id = $4,
+            paid_at = $5,
+            raw_successful_payment = $6::jsonb,
+            updated_at = NOW()
+        WHERE id = $1
+        "#,
+    )
+    .bind(payment_id)
+    .bind(subscription.id)
+    .bind(&successful_payment.telegram_payment_charge_id)
+    .bind(&successful_payment.provider_payment_charge_id)
+    .bind(paid_at)
+    .bind(raw_successful_payment)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(subscription)
+}
+
+async fn fetch_subscription_by_id_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    subscription_id: i64,
+) -> Result<TelegramSubscriptionRecord, sqlx::Error> {
+    let row = sqlx::query(
+        r#"
+        SELECT id, telegram_user_id, chat_id, plan_code, status,
+               current_period_start_at, current_period_end_at
+        FROM telegram_subscriptions
+        WHERE id = $1
+        "#,
+    )
+    .bind(subscription_id)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(TelegramSubscriptionRecord {
+        id: row.get("id"),
+        telegram_user_id: row.get("telegram_user_id"),
+        chat_id: row.get("chat_id"),
+        plan_code: row.get("plan_code"),
+        status: row.get("status"),
+        current_period_start_at: row.get("current_period_start_at"),
+        current_period_end_at: row.get("current_period_end_at"),
+    })
 }
 
 pub async fn get_state_i64(pool: &sqlx::PgPool, key: &str) -> Result<Option<i64>, sqlx::Error> {
@@ -2470,6 +3193,75 @@ mod tests {
     }
 
     #[test]
+    fn parses_payment_actions() {
+        assert_eq!(
+            PaymentAction::parse("payment:subscribe"),
+            Some(PaymentAction::Subscribe)
+        );
+        assert_eq!(
+            PaymentAction::parse("payment:buy:monthly"),
+            Some(PaymentAction::Buy(StarsPackageCode::Monthly))
+        );
+        assert_eq!(PaymentAction::parse("payment:refund"), None);
+        assert_eq!(PaymentAction::parse("payment:subscribe:extra"), None);
+        assert_eq!(PaymentAction::parse("payment:buy:yearly"), None);
+        assert_eq!(PaymentAction::parse("payment:buy:monthly:extra"), None);
+    }
+
+    #[test]
+    fn builds_short_stars_invoice_payload() {
+        let package = StarsPackageCode::Monthly.package();
+        let payload = build_stars_invoice_payload(
+            1_104_647_539,
+            package,
+            Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap(),
+        );
+
+        assert!(payload.contains("1_104_647_539".replace('_', "").as_str()));
+        assert!(payload.starts_with("stars:"));
+        assert!(payload.contains(":monthly:"));
+        assert!(payload.len() <= 128);
+    }
+
+    #[test]
+    fn looks_up_stars_packages() {
+        let monthly = StarsPackageCode::parse("monthly").expect("monthly package");
+
+        assert_eq!(monthly.package().stars_amount, 150);
+        assert_eq!(monthly.package().period_days, 30);
+        assert_eq!(StarsPackageCode::parse("yearly"), None);
+    }
+
+    #[test]
+    fn validates_pre_checkout_payment() {
+        let payment = PendingStarsPayment {
+            id: 1,
+            telegram_user_id: 12345,
+            chat_id: 67890,
+            payment_status: "pending".to_string(),
+            currency: TELEGRAM_STARS_CURRENCY.to_string(),
+            stars_amount: 150,
+            period_days: 30,
+            subscription_id: None,
+        };
+
+        assert!(
+            validate_pre_checkout_payment(Some(&payment), 12345, TELEGRAM_STARS_CURRENCY, 150,)
+                .is_ok()
+        );
+        assert!(
+            validate_pre_checkout_payment(Some(&payment), 999, TELEGRAM_STARS_CURRENCY, 150,)
+                .is_err()
+        );
+        assert!(validate_pre_checkout_payment(Some(&payment), 12345, "USD", 150).is_err());
+        assert!(
+            validate_pre_checkout_payment(Some(&payment), 12345, TELEGRAM_STARS_CURRENCY, 151,)
+                .is_err()
+        );
+        assert!(validate_pre_checkout_payment(None, 12345, TELEGRAM_STARS_CURRENCY, 150).is_err());
+    }
+
+    #[test]
     fn formats_heartbeat_notification_message() {
         let heartbeat = StoredHeartbeat {
             id: 1,
@@ -3003,6 +3795,177 @@ mod tests {
             .expect("finished session should exist");
         assert_eq!(resolved.session_status, "finished");
         assert!(resolved.resolved_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn records_stars_payment_and_extends_subscription(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let telegram_user_id = 8_880_000_001_i64;
+        let chat_id = 8_880_000_002_i64;
+
+        sqlx::query(
+            "DELETE FROM telegram_payment_events WHERE telegram_user_id = $1 OR chat_id = $2",
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $2, '999888777666555', 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .execute(database.pool())
+        .await?;
+
+        let monthly = StarsPackageCode::Monthly.package();
+        let first_paid_at = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+        let first_payload = build_stars_invoice_payload(telegram_user_id, monthly, first_paid_at);
+        create_pending_stars_payment(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &first_payload,
+            monthly.stars_amount,
+            monthly.period_days,
+        )
+        .await?;
+
+        let first_payment = TelegramSuccessfulPayment {
+            currency: TELEGRAM_STARS_CURRENCY.to_string(),
+            total_amount: monthly.stars_amount,
+            invoice_payload: first_payload,
+            telegram_payment_charge_id: "stars-charge-first".to_string(),
+            provider_payment_charge_id: "provider-charge-first".to_string(),
+            subscription_expiration_date: None,
+            is_recurring: None,
+            is_first_recurring: None,
+        };
+
+        let first_subscription = mark_stars_payment_paid_and_extend_subscription(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &first_payment,
+            first_paid_at,
+        )
+        .await?;
+        let first_end = first_subscription
+            .current_period_end_at
+            .expect("first payment should set period end");
+        assert_eq!(
+            first_end.signed_duration_since(first_paid_at).num_days(),
+            i64::from(monthly.period_days)
+        );
+
+        let mismatch_paid_at = first_paid_at + chrono::Duration::hours(12);
+        let mismatch_payload =
+            build_stars_invoice_payload(telegram_user_id, monthly, mismatch_paid_at);
+        create_pending_stars_payment(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &mismatch_payload,
+            monthly.stars_amount,
+            monthly.period_days,
+        )
+        .await?;
+
+        let mismatch_payment = TelegramSuccessfulPayment {
+            currency: TELEGRAM_STARS_CURRENCY.to_string(),
+            total_amount: monthly.stars_amount + 1,
+            invoice_payload: mismatch_payload,
+            telegram_payment_charge_id: "stars-charge-mismatch".to_string(),
+            provider_payment_charge_id: "provider-charge-mismatch".to_string(),
+            subscription_expiration_date: None,
+            is_recurring: None,
+            is_first_recurring: None,
+        };
+
+        assert!(mark_stars_payment_paid_and_extend_subscription(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &mismatch_payment,
+            mismatch_paid_at,
+        )
+        .await
+        .is_err());
+
+        let second_paid_at = first_paid_at + chrono::Duration::days(1);
+        let second_payload = build_stars_invoice_payload(telegram_user_id, monthly, second_paid_at);
+        create_pending_stars_payment(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &second_payload,
+            monthly.stars_amount,
+            monthly.period_days,
+        )
+        .await?;
+
+        let second_payment = TelegramSuccessfulPayment {
+            currency: TELEGRAM_STARS_CURRENCY.to_string(),
+            total_amount: monthly.stars_amount,
+            invoice_payload: second_payload,
+            telegram_payment_charge_id: "stars-charge-second".to_string(),
+            provider_payment_charge_id: "provider-charge-second".to_string(),
+            subscription_expiration_date: None,
+            is_recurring: None,
+            is_first_recurring: None,
+        };
+
+        let second_subscription = mark_stars_payment_paid_and_extend_subscription(
+            database.pool(),
+            telegram_user_id,
+            chat_id,
+            &second_payment,
+            second_paid_at,
+        )
+        .await?;
+        let second_end = second_subscription
+            .current_period_end_at
+            .expect("second payment should set period end");
+
+        assert_eq!(
+            second_end.signed_duration_since(first_end).num_days(),
+            i64::from(monthly.period_days)
+        );
+
+        let paid_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telegram_payment_events WHERE telegram_user_id = $1 AND payment_status = 'paid'",
+        )
+        .bind(telegram_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(paid_events, 2);
 
         Ok(())
     }
