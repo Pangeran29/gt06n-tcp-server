@@ -20,7 +20,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:5000".parse().expect("default bind address must be valid"),
+            bind_addr: "0.0.0.0:5000"
+                .parse()
+                .expect("default bind address must be valid"),
             http_api_bind_addr: "0.0.0.0:8080"
                 .parse()
                 .expect("default http api bind address must be valid"),
@@ -143,7 +145,10 @@ mod tests {
             ("HTTP_API_BIND_ADDR", "127.0.0.1:8080"),
             ("RUST_LOG", "debug"),
             ("GT06_READ_BUFFER_CAPACITY", "8192"),
-            ("DATABASE_URL", "postgres://postgres:postgres@localhost/gt06"),
+            (
+                "DATABASE_URL",
+                "postgres://postgres:postgres@localhost/gt06",
+            ),
             ("DATABASE_MAX_CONNECTIONS", "8"),
             ("DATABASE_WRITE_TIMEOUT_MS", "9000"),
             ("TELEGRAM_BOT_TOKEN", "123456:abc"),

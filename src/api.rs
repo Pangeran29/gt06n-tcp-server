@@ -35,9 +35,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::InvalidStartAt | Self::InvalidEndAt => StatusCode::BAD_REQUEST,
             Self::MissingDatabase => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Database(_) | Self::Query(_) | Self::Bind(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::Database(_) | Self::Query(_) | Self::Bind(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         let body = Json(ApiErrorBody {
@@ -91,7 +89,9 @@ struct LocationPoint {
 
 impl HttpApiServer {
     pub async fn from_config(config: &Config) -> Result<Self, ApiError> {
-        let database = Database::connect(config).await?.ok_or(ApiError::MissingDatabase)?;
+        let database = Database::connect(config)
+            .await?
+            .ok_or(ApiError::MissingDatabase)?;
         let state = Arc::new(AppState {
             pool: database.pool().clone(),
         });
@@ -112,7 +112,9 @@ impl HttpApiServer {
 
     pub async fn run(self) -> Result<(), ApiError> {
         let listener = tokio::net::TcpListener::bind(self.bind_addr).await?;
-        axum::serve(listener, self.router).await.map_err(ApiError::Bind)
+        axum::serve(listener, self.router)
+            .await
+            .map_err(ApiError::Bind)
     }
 }
 

@@ -162,7 +162,8 @@ impl FrameDecoder {
             let payload_start = 4;
             let payload_end = payload_start + payload_len;
             let payload = frame_bytes[payload_start..payload_end].to_vec();
-            let serial = u16::from_be_bytes([frame_bytes[payload_end], frame_bytes[payload_end + 1]]);
+            let serial =
+                u16::from_be_bytes([frame_bytes[payload_end], frame_bytes[payload_end + 1]]);
 
             return Ok(Some(Frame {
                 protocol_number,
@@ -360,8 +361,12 @@ fn decode_location_payload(
         Vec::new()
     };
 
-    let (latitude, longitude) =
-        decode_coordinates(raw_latitude, raw_longitude, course_status, hemisphere_encoding);
+    let (latitude, longitude) = decode_coordinates(
+        raw_latitude,
+        raw_longitude,
+        course_status,
+        hemisphere_encoding,
+    );
 
     Ok(Gt06Message::Location(LocationPacket {
         timestamp,
@@ -450,8 +455,8 @@ mod tests {
     use super::{
         crc16_x25, decode_message, decode_terminal_info_flags, encode_ack, format_byte_bits,
         format_bytes_hex, resolve_acc_high, resolve_engine_status_guess, EngineStatus,
-        FrameDecoder, Gt06Message, ProtocolError, PROTOCOL_EXTENDED_LOCATION,
-        PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
+        FrameDecoder, Gt06Message, ProtocolError, PROTOCOL_EXTENDED_LOCATION, PROTOCOL_HEARTBEAT,
+        PROTOCOL_LOCATION, PROTOCOL_LOGIN,
     };
 
     fn build_frame(protocol_number: u8, payload: &[u8], serial: u16) -> Vec<u8> {
@@ -561,9 +566,9 @@ mod tests {
     #[test]
     fn decodes_extended_location_frame() {
         let payload = [
-            0x1A, 0x04, 0x09, 0x12, 0x29, 0x18, 0xC8, 0x00, 0xAA, 0x66, 0xA7, 0x0B, 0x74,
-            0xF3, 0xDD, 0x00, 0x10, 0x00, 0x01, 0xFE, 0x0A, 0x05, 0x06, 0x00, 0x42, 0x46,
-            0x00, 0x05, 0x00,
+            0x1A, 0x04, 0x09, 0x12, 0x29, 0x18, 0xC8, 0x00, 0xAA, 0x66, 0xA7, 0x0B, 0x74, 0xF3,
+            0xDD, 0x00, 0x10, 0x00, 0x01, 0xFE, 0x0A, 0x05, 0x06, 0x00, 0x42, 0x46, 0x00, 0x05,
+            0x00,
         ];
         let frame = build_frame(PROTOCOL_EXTENDED_LOCATION, &payload, 7);
         let mut buffer = BytesMut::from(frame.as_slice());
@@ -599,9 +604,8 @@ mod tests {
     #[test]
     fn decodes_location_frame() {
         let payload = [
-            0x24, 0x04, 0x09, 0x12, 0x34, 0x56, 0xC8, 0x00, 0xA9, 0xE3, 0x58, 0x01, 0x2A,
-            0x66, 0x10, 0x3C, 0x00, 0x1E, 0x01, 0xCC, 0x00, 0x01, 0x00, 0x2A, 0x00, 0x00,
-            0x01,
+            0x24, 0x04, 0x09, 0x12, 0x34, 0x56, 0xC8, 0x00, 0xA9, 0xE3, 0x58, 0x01, 0x2A, 0x66,
+            0x10, 0x3C, 0x00, 0x1E, 0x01, 0xCC, 0x00, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x01,
         ];
         let frame = build_frame(PROTOCOL_LOCATION, &payload, 3);
         let mut buffer = BytesMut::from(frame.as_slice());
@@ -641,7 +645,11 @@ mod tests {
 
     #[test]
     fn rejects_invalid_checksum() {
-        let mut frame = build_frame(PROTOCOL_LOGIN, &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45], 1);
+        let mut frame = build_frame(
+            PROTOCOL_LOGIN,
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45],
+            1,
+        );
         let checksum_index = frame.len() - 4;
         frame[checksum_index] ^= 0xFF;
 
@@ -652,7 +660,11 @@ mod tests {
 
     #[test]
     fn waits_for_more_data_when_frame_is_truncated() {
-        let frame = build_frame(PROTOCOL_LOGIN, &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45], 1);
+        let frame = build_frame(
+            PROTOCOL_LOGIN,
+            &[0x01, 0x23, 0x45, 0x67, 0x89, 0x01, 0x23, 0x45],
+            1,
+        );
         let mut buffer = BytesMut::from(&frame[..frame.len() - 2]);
         let result = FrameDecoder::next_frame(&mut buffer).unwrap();
         assert!(result.is_none());

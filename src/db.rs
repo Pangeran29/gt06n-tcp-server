@@ -11,8 +11,8 @@ use crate::config::Config;
 use crate::events::DeviceEventHandler;
 use crate::events::{CompositeEventHandler, DeviceEvent, LoggingEventHandler};
 use crate::protocol::{
-    decode_terminal_info_flags, format_bytes_hex, resolve_acc_high,
-    resolve_engine_status_guess, EngineStatus, GpsTimestamp,
+    decode_terminal_info_flags, format_bytes_hex, resolve_acc_high, resolve_engine_status_guess,
+    EngineStatus, GpsTimestamp,
 };
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -342,10 +342,8 @@ async fn insert_heartbeat(
     packet: &crate::protocol::HeartbeatPacket,
 ) -> Result<PgQueryResult, sqlx::Error> {
     let flags = decode_terminal_info_flags(packet.terminal_info);
-    let effective_acc_high = resolve_acc_high(
-        flags.acc_high,
-        fetch_previous_acc_high(tx, imei).await?,
-    );
+    let effective_acc_high =
+        resolve_acc_high(flags.acc_high, fetch_previous_acc_high(tx, imei).await?);
     let engine_status_guess = resolve_engine_status_guess(effective_acc_high);
 
     sqlx::query(
@@ -389,10 +387,8 @@ async fn update_device_latest_heartbeat(
     packet: &crate::protocol::HeartbeatPacket,
 ) -> Result<PgQueryResult, sqlx::Error> {
     let flags = decode_terminal_info_flags(packet.terminal_info);
-    let effective_acc_high = resolve_acc_high(
-        flags.acc_high,
-        fetch_previous_acc_high(tx, imei).await?,
-    );
+    let effective_acc_high =
+        resolve_acc_high(flags.acc_high, fetch_previous_acc_high(tx, imei).await?);
     let engine_status_guess = resolve_engine_status_guess(effective_acc_high);
 
     sqlx::query(
@@ -543,7 +539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_bootstrap_succeeds_on_clean_database() -> Result<(), Box<dyn std::error::Error>> {
+    async fn migration_bootstrap_succeeds_on_clean_database(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
             return Ok(());
         };
@@ -552,7 +549,9 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database should be configured");
+        let database = Database::connect(&config)
+            .await?
+            .expect("database should be configured");
 
         MIGRATOR.run(database.pool()).await?;
         let row = sqlx::query(
@@ -561,7 +560,10 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
 
-        assert_eq!(row.try_get::<Option<String>, _>("devices")?, Some("devices".to_string()));
+        assert_eq!(
+            row.try_get::<Option<String>, _>("devices")?,
+            Some("devices".to_string())
+        );
         assert_eq!(
             row.try_get::<Option<String>, _>("locations")?,
             Some("device_locations".to_string())
@@ -575,7 +577,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_login_heartbeat_and_location_history() -> Result<(), Box<dyn std::error::Error>> {
+    async fn persists_login_heartbeat_and_location_history(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
             return Ok(());
         };
@@ -584,10 +587,14 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database should be configured");
-        sqlx::query("TRUNCATE device_heartbeats, device_locations, devices RESTART IDENTITY CASCADE")
-            .execute(database.pool())
-            .await?;
+        let database = Database::connect(&config)
+            .await?
+            .expect("database should be configured");
+        sqlx::query(
+            "TRUNCATE device_heartbeats, device_locations, devices RESTART IDENTITY CASCADE",
+        )
+        .execute(database.pool())
+        .await?;
 
         super::persist_event(
             database.pool(),
@@ -663,7 +670,10 @@ mod tests {
         .await?;
 
         assert_eq!(device_row.get::<String, _>("imei"), "866221070478388");
-        assert_eq!(device_row.get::<String, _>("latest_engine_status_guess"), "on");
+        assert_eq!(
+            device_row.get::<String, _>("latest_engine_status_guess"),
+            "on"
+        );
         assert!(device_row.get::<bool, _>("latest_acc_high"));
         assert!(device_row.get::<bool, _>("latest_vibration_detected"));
         assert!((device_row.get::<f64, _>("latest_latitude") - (-6.204_066_6)).abs() < 0.001);

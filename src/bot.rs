@@ -123,7 +123,9 @@ const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedStick
 
 impl TelegramBot {
     pub async fn from_config(config: &Config) -> Result<Self, BotError> {
-        let database = Database::connect(config).await?.ok_or(BotError::MissingDatabase)?;
+        let database = Database::connect(config)
+            .await?
+            .ok_or(BotError::MissingDatabase)?;
         let token = config
             .telegram_bot_token
             .as_ref()
@@ -190,8 +192,7 @@ impl TelegramBot {
 
         for heartbeat in heartbeats {
             let notification_chat_ids =
-                fetch_notification_chat_ids_for_imei(self.database.pool(), &heartbeat.imei)
-                    .await?;
+                fetch_notification_chat_ids_for_imei(self.database.pool(), &heartbeat.imei).await?;
 
             if notification_chat_ids.is_empty() {
                 set_state_i64(
@@ -233,7 +234,8 @@ impl TelegramBot {
         status: &str,
         chat_id: i64,
     ) -> Result<(), BotError> {
-        let existing = fetch_notification_state(self.database.pool(), &heartbeat.imei, chat_id).await?;
+        let existing =
+            fetch_notification_state(self.database.pool(), &heartbeat.imei, chat_id).await?;
 
         if status == "on" {
             return self
@@ -248,9 +250,12 @@ impl TelegramBot {
                 if let Some(session) =
                     fetch_latest_theft_off_session(self.database.pool(), &heartbeat.imei, chat_id)
                         .await?
-                        .filter(|session| session.ride_status_message_id == Some(existing.last_message_id))
+                        .filter(|session| {
+                            session.ride_status_message_id == Some(existing.last_message_id)
+                        })
                 {
-                    let off_started_at = session.resolved_at.unwrap_or(heartbeat.server_received_at);
+                    let off_started_at =
+                        session.resolved_at.unwrap_or(heartbeat.server_received_at);
                     let off_text =
                         format_theft_engine_off_follow_up_message(off_started_at, Utc::now());
 
@@ -299,9 +304,12 @@ impl TelegramBot {
                 }
             }
             _ => {
-                let message_id = if let Some(session) =
-                    fetch_active_reported_theft_session(self.database.pool(), &heartbeat.imei, chat_id)
-                        .await?
+                let message_id = if let Some(session) = fetch_active_reported_theft_session(
+                    self.database.pool(),
+                    &heartbeat.imei,
+                    chat_id,
+                )
+                .await?
                 {
                     let message_id = self
                         .send_message_internal(chat_id, format_theft_engine_off_message(), None)
@@ -319,8 +327,9 @@ impl TelegramBot {
                     fetch_active_pending_session(self.database.pool(), &heartbeat.imei, chat_id)
                         .await?
                 {
-                    if let Err(error) =
-                        self.clear_inline_keyboard(chat_id, session.prompt_message_id).await
+                    if let Err(error) = self
+                        .clear_inline_keyboard(chat_id, session.prompt_message_id)
+                        .await
                     {
                         warn!(
                             error = %error,
@@ -330,54 +339,25 @@ impl TelegramBot {
                         );
                     }
 
-                    resolve_engine_session(self.database.pool(), session.id, "finished").await?;
-                    self.send_message(chat_id, format_session_finished_message())
-                        .await?;
-                    let ride_summary = fetch_ride_summary(
-                        self.database.pool(),
-                        &heartbeat.imei,
-                        session.created_at,
-                        heartbeat.server_received_at,
-                    )
-                    .await?;
-                    let latest_location =
-                        fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei)
-                            .await?;
-                    self.send_message(
+                    self.finish_ride_session_and_send_summary(
                         chat_id,
-                        &format_ride_summary_message(
-                            &session,
-                            heartbeat.server_received_at,
-                            ride_summary.as_ref(),
-                            latest_location.as_ref(),
-                        ),
+                        &heartbeat.imei,
+                        &session,
+                        heartbeat.server_received_at,
                     )
                     .await?
-                } else if let Some(session) =
-                    fetch_active_confirmed_safe_session(self.database.pool(), &heartbeat.imei, chat_id)
-                        .await?
+                } else if let Some(session) = fetch_active_confirmed_safe_session(
+                    self.database.pool(),
+                    &heartbeat.imei,
+                    chat_id,
+                )
+                .await?
                 {
-                    resolve_engine_session(self.database.pool(), session.id, "finished").await?;
-                    self.send_message(chat_id, format_session_finished_message())
-                        .await?;
-                    let ride_summary = fetch_ride_summary(
-                        self.database.pool(),
-                        &heartbeat.imei,
-                        session.created_at,
-                        heartbeat.server_received_at,
-                    )
-                    .await?;
-                    let latest_location =
-                        fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei)
-                            .await?;
-                    self.send_message(
+                    self.finish_ride_session_and_send_summary(
                         chat_id,
-                        &format_ride_summary_message(
-                            &session,
-                            heartbeat.server_received_at,
-                            ride_summary.as_ref(),
-                            latest_location.as_ref(),
-                        ),
+                        &heartbeat.imei,
+                        &session,
+                        heartbeat.server_received_at,
                     )
                     .await?
                 } else {
@@ -420,10 +400,7 @@ impl TelegramBot {
             None => None,
         };
 
-        if !should_start_new_engine_on_session(
-            heartbeat.server_received_at,
-            last_on_heartbeat_at,
-        ) {
+        if !should_start_new_engine_on_session(heartbeat.server_received_at, last_on_heartbeat_at) {
             let message_id = latest_pending
                 .map(|session| session.prompt_message_id)
                 .or(existing.as_ref().map(|state| state.last_message_id))
@@ -482,26 +459,24 @@ impl TelegramBot {
                 return Ok(());
             }
 
-            resolve_engine_session(self.database.pool(), session.id, "finished").await?;
-            self.send_message(chat_id, format_session_finished_message())
-                .await?;
-            let ride_summary = fetch_ride_summary(
-                self.database.pool(),
+            self.finish_ride_session_and_send_summary(
+                chat_id,
                 &heartbeat.imei,
-                session.created_at,
+                session,
                 heartbeat.server_received_at,
             )
             .await?;
-            let latest_location =
-                fetch_latest_location_for_imei(self.database.pool(), &heartbeat.imei).await?;
-            self.send_message(
+        }
+
+        if let Some(session) =
+            fetch_active_confirmed_safe_session(self.database.pool(), &heartbeat.imei, chat_id)
+                .await?
+        {
+            self.finish_ride_session_and_send_summary(
                 chat_id,
-                &format_ride_summary_message(
-                    session,
-                    heartbeat.server_received_at,
-                    ride_summary.as_ref(),
-                    latest_location.as_ref(),
-                ),
+                &heartbeat.imei,
+                &session,
+                heartbeat.server_received_at,
             )
             .await?;
         }
@@ -528,6 +503,33 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn finish_ride_session_and_send_summary(
+        &self,
+        chat_id: i64,
+        imei: &str,
+        session: &EngineSession,
+        ended_at: DateTime<Utc>,
+    ) -> Result<i64, BotError> {
+        resolve_engine_session(self.database.pool(), session.id, "finished").await?;
+        self.send_message(chat_id, format_session_finished_message())
+            .await?;
+        let ride_summary =
+            fetch_ride_summary(self.database.pool(), imei, session.created_at, ended_at).await?;
+        let latest_location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
+
+        Ok(self
+            .send_message(
+                chat_id,
+                &format_ride_summary_message(
+                    session,
+                    ended_at,
+                    ride_summary.as_ref(),
+                    latest_location.as_ref(),
+                ),
+            )
+            .await?)
+    }
+
     async fn handle_message(&self, message: TelegramMessage) -> Result<(), BotError> {
         let Some(from) = message.from.as_ref() else {
             return Ok(());
@@ -545,7 +547,8 @@ impl TelegramBot {
                 .await;
         }
 
-        let Some(user) = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?
+        let Some(user) =
+            fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?
         else {
             return Ok(());
         };
@@ -619,32 +622,30 @@ impl TelegramBot {
         let user = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?;
 
         match command {
-            BotCommand::Start => {
-                match user {
-                    Some(user) if user.bound_imei.is_some() => {
-                        self.send_message_internal(
-                            chat_id,
-                            &format_start_status_message(),
-                            Some(start_menu_keyboard()),
-                        )
-                        .await?;
-                    }
-                    _ => {
-                        upsert_telegram_user_registration_state(
-                            self.database.pool(),
-                            telegram_user_id,
-                            chat_id,
-                            TelegramRegistrationStatus::AwaitingImei,
-                        )
-                        .await?;
-                        self.send_message(
-                            chat_id,
-                            "Welcome. Please send your device IMEI to bind this Telegram account.",
-                        )
-                        .await?;
-                    }
+            BotCommand::Start => match user {
+                Some(user) if user.bound_imei.is_some() => {
+                    self.send_message_internal(
+                        chat_id,
+                        &format_start_status_message(),
+                        Some(start_menu_keyboard()),
+                    )
+                    .await?;
                 }
-            }
+                _ => {
+                    upsert_telegram_user_registration_state(
+                        self.database.pool(),
+                        telegram_user_id,
+                        chat_id,
+                        TelegramRegistrationStatus::AwaitingImei,
+                    )
+                    .await?;
+                    self.send_message(
+                        chat_id,
+                        "Welcome. Please send your device IMEI to bind this Telegram account.",
+                    )
+                    .await?;
+                }
+            },
             BotCommand::Help => {
                 self.send_message(chat_id, HELP_TEXT).await?;
             }
@@ -675,9 +676,7 @@ impl TelegramBot {
         if let Some(action) = TheftAlertAction::parse(data) {
             self.answer_callback_query(&callback_query.id, "", false)
                 .await?;
-            return self
-                .handle_theft_alert_action(message, action)
-                .await;
+            return self.handle_theft_alert_action(message, action).await;
         }
 
         let Some(action) = SessionAction::parse(data) else {
@@ -685,9 +684,12 @@ impl TelegramBot {
         };
         let prompt_message_id = i64::from(message.message_id.unwrap_or_default());
 
-        let Some(session) =
-            fetch_engine_session_by_prompt_message(self.database.pool(), chat_id, prompt_message_id)
-                .await?
+        let Some(session) = fetch_engine_session_by_prompt_message(
+            self.database.pool(),
+            chat_id,
+            prompt_message_id,
+        )
+        .await?
         else {
             self.answer_callback_query(
                 &callback_query.id,
@@ -709,22 +711,20 @@ impl TelegramBot {
         }
 
         if session.session_status != "pending_confirmation" {
-            self.answer_callback_query(
-                &callback_query.id,
-                "This session already ended.",
-                false,
-            )
-            .await?;
+            self.answer_callback_query(&callback_query.id, "This session already ended.", false)
+                .await?;
             return Ok(());
         }
 
         self.answer_callback_query(&callback_query.id, "", false)
             .await?;
-        self.clear_inline_keyboard(chat_id, prompt_message_id).await?;
+        self.clear_inline_keyboard(chat_id, prompt_message_id)
+            .await?;
 
         match action {
             SessionAction::Yes => {
-                self.send_message(chat_id, format_ride_safe_message()).await?;
+                self.send_message(chat_id, format_ride_safe_message())
+                    .await?;
                 if let Err(error) = self.send_engine_on_sticker(chat_id).await {
                     warn!(error = %error, "failed to send engine-on sticker");
                 }
@@ -761,7 +761,8 @@ impl TelegramBot {
         let bound_imei = user.as_ref().and_then(|value| value.bound_imei.as_deref());
 
         let session = if let Some(session_id) = session_id {
-            let Some(session) = fetch_engine_session_by_id(self.database.pool(), session_id).await?
+            let Some(session) =
+                fetch_engine_session_by_id(self.database.pool(), session_id).await?
             else {
                 return Ok(());
             };
@@ -781,14 +782,18 @@ impl TelegramBot {
         } else if let Some(bound_imei) = bound_imei {
             bound_imei
         } else {
-            self.send_message(chat_id, "This Telegram account is not bound yet. Use /start first.")
-                .await?;
+            self.send_message(
+                chat_id,
+                "This Telegram account is not bound yet. Use /start first.",
+            )
+            .await?;
             return Ok(());
         };
 
         match action {
             TheftAlertAction::StreamLocation { .. } => {
-                let latest_location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
+                let latest_location =
+                    fetch_latest_location_for_imei(self.database.pool(), imei).await?;
                 let latest_session_created_at = if session.is_some() {
                     None
                 } else {
@@ -799,7 +804,9 @@ impl TelegramBot {
                 let start_at = select_stream_location_start_at(
                     session.as_ref().map(|value| value.created_at),
                     latest_session_created_at,
-                    latest_location.as_ref().and_then(|value| value.last_seen_at),
+                    latest_location
+                        .as_ref()
+                        .and_then(|value| value.last_seen_at),
                 );
                 let live_tracking_link =
                     start_at.and_then(|value| build_live_tracking_link(imei, value));
@@ -808,7 +815,8 @@ impl TelegramBot {
             }
             TheftAlertAction::CheckLatestStatus { .. } => {
                 let location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
-                let latest_heartbeat = fetch_latest_heartbeat_for_imei(self.database.pool(), imei).await?;
+                let latest_heartbeat =
+                    fetch_latest_heartbeat_for_imei(self.database.pool(), imei).await?;
                 let fallback_session = match session {
                     Some(session) => session,
                     None => fetch_latest_engine_session_for_imei_chat(
@@ -876,7 +884,8 @@ impl TelegramBot {
         let text = format_engine_on_confirmation_message(heartbeat);
         let keyboard = engine_session_confirmation_keyboard();
 
-        self.send_message_internal(chat_id, &text, Some(keyboard)).await
+        self.send_message_internal(chat_id, &text, Some(keyboard))
+            .await
     }
 
     async fn send_engine_on_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
@@ -976,7 +985,8 @@ impl TelegramBot {
         chat_id: i64,
         message_id: i64,
     ) -> Result<(), reqwest::Error> {
-        self.edit_message_reply_markup(chat_id, message_id, None).await
+        self.edit_message_reply_markup(chat_id, message_id, None)
+            .await
     }
 
     async fn edit_message_reply_markup(
@@ -1488,7 +1498,13 @@ fn format_latest_motor_status_message_at(
         .map(|value| connection_status_label(value.gsm_signal_strength))
         .unwrap_or("Unknown");
     let gps_tracking_status = heartbeat
-        .map(|value| if value.gps_tracking_on { "Active" } else { "Inactive" })
+        .map(|value| {
+            if value.gps_tracking_on {
+                "Active"
+            } else {
+                "Inactive"
+            }
+        })
         .unwrap_or("Unknown");
     let battery_level = heartbeat
         .map(|value| gps_battery_label(value.voltage_level).to_string())
@@ -1535,7 +1551,10 @@ fn format_latest_motor_status_message_at(
     )
 }
 
-fn format_relative_time_compact(reference_time: DateTime<Utc>, event_time: DateTime<Utc>) -> String {
+fn format_relative_time_compact(
+    reference_time: DateTime<Utc>,
+    event_time: DateTime<Utc>,
+) -> String {
     let duration = reference_time
         .signed_duration_since(event_time)
         .to_std()
@@ -1628,8 +1647,7 @@ pub fn format_latest_location_message(location: &StoredLocation) -> String {
 }
 
 fn format_start_status_message() -> String {
-    "🛵 welcome to @tryheartbeatsbot 🛣 \n\nclick /help for more information."
-        .to_string()
+    "🛵 welcome to @tryheartbeatsbot 🛣 \n\nclick /help for more information.".to_string()
 }
 
 fn build_status_session(
@@ -1747,7 +1765,8 @@ async fn fetch_telegram_user_by_user_id(
     .await?;
 
     Ok(row.and_then(|row| {
-        let registration_status = parse_registration_status(row.get::<String, _>("registration_status").as_str())?;
+        let registration_status =
+            parse_registration_status(row.get::<String, _>("registration_status").as_str())?;
         Some(TelegramUserRecord {
             telegram_user_id: row.get("telegram_user_id"),
             chat_id: row.get("chat_id"),
@@ -1774,9 +1793,8 @@ async fn fetch_telegram_user_by_chat_id(
     .await?;
 
     Ok(row.and_then(|row| {
-        let registration_status = parse_registration_status(
-            row.get::<String, _>("registration_status").as_str(),
-        )?;
+        let registration_status =
+            parse_registration_status(row.get::<String, _>("registration_status").as_str())?;
         Some(TelegramUserRecord {
             telegram_user_id: row.get("telegram_user_id"),
             chat_id: row.get("chat_id"),
@@ -2534,12 +2552,8 @@ pub async fn fetch_ride_summary(
         let longitude: f64 = row.get("longitude");
 
         if let Some((previous_latitude, previous_longitude)) = previous {
-            total_distance_km += haversine_distance_km(
-                previous_latitude,
-                previous_longitude,
-                latitude,
-                longitude,
-            );
+            total_distance_km +=
+                haversine_distance_km(previous_latitude, previous_longitude, latitude, longitude);
         }
 
         previous = Some((latitude, longitude));
@@ -2581,7 +2595,10 @@ mod tests {
     fn parses_commands() {
         assert_eq!(BotCommand::parse("/start"), Some(BotCommand::Start));
         assert_eq!(BotCommand::parse("/help"), Some(BotCommand::Help));
-        assert_eq!(BotCommand::parse("/latest_location@my_bot"), Some(BotCommand::Unknown("/latest_location".to_string())));
+        assert_eq!(
+            BotCommand::parse("/latest_location@my_bot"),
+            Some(BotCommand::Unknown("/latest_location".to_string()))
+        );
         assert_eq!(BotCommand::parse("hello"), None);
     }
 
@@ -2594,8 +2611,14 @@ mod tests {
 
     #[test]
     fn parses_session_actions() {
-        assert_eq!(SessionAction::parse("engine_session:yes"), Some(SessionAction::Yes));
-        assert_eq!(SessionAction::parse("engine_session:no"), Some(SessionAction::No));
+        assert_eq!(
+            SessionAction::parse("engine_session:yes"),
+            Some(SessionAction::Yes)
+        );
+        assert_eq!(
+            SessionAction::parse("engine_session:no"),
+            Some(SessionAction::No)
+        );
         assert_eq!(SessionAction::parse("engine_session:maybe"), None);
     }
 
@@ -2603,15 +2626,21 @@ mod tests {
     fn parses_theft_alert_actions() {
         assert_eq!(
             TheftAlertAction::parse("theft_alert:stream_location:12"),
-            Some(TheftAlertAction::StreamLocation { session_id: Some(12) })
+            Some(TheftAlertAction::StreamLocation {
+                session_id: Some(12)
+            })
         );
         assert_eq!(
             TheftAlertAction::parse("theft_alert:check_latest_status:9"),
-            Some(TheftAlertAction::CheckLatestStatus { session_id: Some(9) })
+            Some(TheftAlertAction::CheckLatestStatus {
+                session_id: Some(9)
+            })
         );
         assert_eq!(
             TheftAlertAction::parse("theft_alert:contact_support:5"),
-            Some(TheftAlertAction::ContactSupport { session_id: Some(5) })
+            Some(TheftAlertAction::ContactSupport {
+                session_id: Some(5)
+            })
         );
         assert_eq!(
             TheftAlertAction::parse("theft_alert:stream_location"),
@@ -2775,8 +2804,7 @@ mod tests {
     fn builds_history_tracking_link_with_encoded_start_and_end_at() {
         let start_at = Utc.with_ymd_and_hms(2026, 4, 18, 10, 0, 0).unwrap();
         let end_at = Utc.with_ymd_and_hms(2026, 4, 18, 11, 0, 0).unwrap();
-        let link =
-            build_history_tracking_link("866221070478388", start_at, end_at).expect("link");
+        let link = build_history_tracking_link("866221070478388", start_at, end_at).expect("link");
 
         assert_eq!(
             link,
@@ -2788,8 +2816,7 @@ mod tests {
     fn selects_stream_location_start_time_preferring_explicit_session() {
         let explicit_session_created_at =
             Some(Utc.with_ymd_and_hms(2026, 4, 18, 10, 0, 0).unwrap());
-        let latest_session_created_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
+        let latest_session_created_at = Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
         let latest_location_last_seen_at =
             Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
 
@@ -2804,8 +2831,7 @@ mod tests {
 
     #[test]
     fn selects_stream_location_start_time_preferring_latest_session_for_start_menu() {
-        let latest_session_created_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
+        let latest_session_created_at = Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
         let latest_location_last_seen_at =
             Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
 
@@ -2823,8 +2849,7 @@ mod tests {
         let latest_location_last_seen_at =
             Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
 
-        let start_at =
-            select_stream_location_start_at(None, None, latest_location_last_seen_at);
+        let start_at = select_stream_location_start_at(None, None, latest_location_last_seen_at);
 
         assert_eq!(start_at, latest_location_last_seen_at);
     }
@@ -2945,8 +2970,7 @@ mod tests {
         };
         let requested_at = Utc.with_ymd_and_hms(2026, 4, 17, 10, 1, 2).unwrap();
 
-        let text =
-            format_latest_motor_status_initial_message(&session, None, None, requested_at);
+        let text = format_latest_motor_status_initial_message(&session, None, None, requested_at);
         assert!(text.contains("🛠️ Motor Diagnostics Report"));
         assert!(text.contains("📍 Last Known Location"));
         assert!(text.contains("Location is not available yet."));
@@ -3002,7 +3026,9 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database configured");
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
         sqlx::query("TRUNCATE telegram_bot_state, telegram_device_notifications RESTART IDENTITY")
             .execute(database.pool())
             .await?;
@@ -3033,7 +3059,9 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database configured");
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
         sqlx::query(
             "TRUNCATE telegram_bot_state, telegram_device_notifications, device_heartbeats, device_locations, devices RESTART IDENTITY CASCADE",
         )
@@ -3075,8 +3103,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_and_restores_notification_state(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn stores_and_restores_notification_state() -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
             return Ok(());
         };
@@ -3085,20 +3112,14 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database configured");
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
         sqlx::query("TRUNCATE telegram_device_notifications RESTART IDENTITY")
             .execute(database.pool())
             .await?;
 
-        upsert_notification_state(
-            database.pool(),
-            "866221070478388",
-            12345,
-            "on",
-            777,
-            55,
-        )
-        .await?;
+        upsert_notification_state(database.pool(), "866221070478388", 12345, "on", 777, 55).await?;
 
         let state = fetch_notification_state(database.pool(), "866221070478388", 12345)
             .await?
@@ -3111,8 +3132,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creates_and_resolves_engine_session(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn creates_and_resolves_engine_session() -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
             return Ok(());
         };
@@ -3121,7 +3141,9 @@ mod tests {
             ("DATABASE_URL", database_url.as_str()),
             ("DATABASE_MAX_CONNECTIONS", "1"),
         ]);
-        let database = Database::connect(&config).await?.expect("database configured");
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
         sqlx::query("TRUNCATE telegram_engine_sessions RESTART IDENTITY")
             .execute(database.pool())
             .await?;

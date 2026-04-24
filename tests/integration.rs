@@ -4,7 +4,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use gt06n_tcp_server::config::Config;
 use gt06n_tcp_server::events::{DeviceEvent, DeviceEventHandler};
-use gt06n_tcp_server::protocol::{crc16_x25, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN};
+use gt06n_tcp_server::protocol::{
+    crc16_x25, PROTOCOL_HEARTBEAT, PROTOCOL_LOCATION, PROTOCOL_LOGIN,
+};
 use gt06n_tcp_server::server::Gt06TcpServer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -65,11 +67,14 @@ async fn accepts_login_heartbeat_and_location_packets() -> io::Result<()> {
     let heartbeat_frame = build_frame(PROTOCOL_HEARTBEAT, &[0x01, 0x05, 0x04, 0x00, 0x02], 2);
     client.write_all(&heartbeat_frame).await?;
     client.read_exact(&mut ack).await?;
-    assert_eq!(&ack[0..6], &[0x78, 0x78, 0x05, PROTOCOL_HEARTBEAT, 0x00, 0x02]);
+    assert_eq!(
+        &ack[0..6],
+        &[0x78, 0x78, 0x05, PROTOCOL_HEARTBEAT, 0x00, 0x02]
+    );
 
     let location_payload = [
-        0x24, 0x04, 0x09, 0x12, 0x34, 0x56, 0xC8, 0x00, 0xA9, 0xE3, 0x58, 0x01, 0x2A, 0x66,
-        0x10, 0x3C, 0x00, 0x1E, 0x01, 0xCC, 0x00, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x01,
+        0x24, 0x04, 0x09, 0x12, 0x34, 0x56, 0xC8, 0x00, 0xA9, 0xE3, 0x58, 0x01, 0x2A, 0x66, 0x10,
+        0x3C, 0x00, 0x1E, 0x01, 0xCC, 0x00, 0x01, 0x00, 0x2A, 0x00, 0x00, 0x01,
     ];
     let location_frame = build_frame(PROTOCOL_LOCATION, &location_payload, 3);
     client.write_all(&location_frame).await?;
@@ -89,7 +94,9 @@ async fn accepts_login_heartbeat_and_location_packets() -> io::Result<()> {
     assert!(matches!(events[0], DeviceEvent::Login { .. }));
     assert!(matches!(events[1], DeviceEvent::Heartbeat { .. }));
     match &events[2] {
-        DeviceEvent::Location { device_id, packet, .. } => {
+        DeviceEvent::Location {
+            device_id, packet, ..
+        } => {
             assert_eq!(device_id.as_deref(), Some("123456789012345"));
             assert!((packet.latitude - 6.185_435_6).abs() < 0.001);
             assert!((packet.longitude - 10.864_364_4).abs() < 0.001);
