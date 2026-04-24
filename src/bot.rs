@@ -29,6 +29,8 @@ pub enum BotError {
 pub enum BotCommand {
     Start,
     Help,
+    PaySupport,
+    Terms,
     Unknown(String),
 }
 
@@ -131,6 +133,8 @@ impl BotCommand {
         Some(match normalized {
             "/start" => Self::Start,
             "/help" => Self::Help,
+            "/paysupport" => Self::PaySupport,
+            "/terms" => Self::Terms,
             other if other.starts_with('/') => Self::Unknown(other.to_string()),
             _ => return None,
         })
@@ -630,6 +634,12 @@ impl TelegramBot {
             },
             BotCommand::Help => {
                 self.send_message(chat_id, HELP_TEXT).await?;
+            }
+            BotCommand::PaySupport => {
+                self.send_message(chat_id, PAY_SUPPORT_TEXT).await?;
+            }
+            BotCommand::Terms => {
+                self.send_message(chat_id, TERMS_TEXT).await?;
             }
             BotCommand::Unknown(command) => {
                 self.send_message(
@@ -1239,7 +1249,9 @@ impl TelegramBot {
     }
 }
 
-pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message";
+pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message\n/paysupport - Get payment support contact\n/terms - Read Heartbeats subscription terms";
+pub const PAY_SUPPORT_TEXT: &str = "For any questions, contact @jojojows";
+pub const TERMS_TEXT: &str = "Heartbeats is an online vehicle monitoring service. We provide affordable GPS tracking with advanced features through a monthly subscription. We manage the GPS platform, server infrastructure, internet data usage, and the Heartbeats application.\n\nMonthly subscription includes:\n- Real-time motorcycle tracking\n- Instant engine ON/OFF notifications\n- Ride analytics (distance, speed, riding time, and route map visualization)\n- More features coming soon\n\nSubscription Payment Policy:\nYour subscription must be renewed within 7 days after your 30-day access period ends.\nIf payment is overdue, a penalty fee of Rp 1.000 per day will be applied until payment is completed.\n\nGPS Device Policy:\nThe GPS device is provided as a loan unit.\nIf you stop using Heartbeats, you must return the device.\nTo arrange a return, please contact us via /paysupport.\n\nDevice Security Notice:\nHeartbeats can track the GPS device location in real-time.\nDo not attempt to steal, tamper with, or keep the device without permission.";
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -3138,6 +3150,11 @@ mod tests {
     fn parses_commands() {
         assert_eq!(BotCommand::parse("/start"), Some(BotCommand::Start));
         assert_eq!(BotCommand::parse("/help"), Some(BotCommand::Help));
+        assert_eq!(
+            BotCommand::parse("/paysupport"),
+            Some(BotCommand::PaySupport)
+        );
+        assert_eq!(BotCommand::parse("/terms"), Some(BotCommand::Terms));
         assert_eq!(
             BotCommand::parse("/latest_location@my_bot"),
             Some(BotCommand::Unknown("/latest_location".to_string()))
