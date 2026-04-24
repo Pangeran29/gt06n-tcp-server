@@ -414,6 +414,11 @@ impl TelegramBot {
         session: &EngineSession,
         ended_at: DateTime<Utc>,
     ) -> Result<i64, BotError> {
+        if let Some(message_id) = session.ride_status_message_id {
+            resolve_engine_session(self.database.pool(), session.id, "finished").await?;
+            return Ok(message_id);
+        }
+
         self.send_message(chat_id, format_session_finished_message())
             .await?;
         let ride_summary =
@@ -430,6 +435,8 @@ impl TelegramBot {
                     latest_location.as_ref(),
                 ),
             )
+            .await?;
+        set_engine_session_ride_status_message_id(self.database.pool(), session.id, message_id)
             .await?;
         resolve_engine_session(self.database.pool(), session.id, "finished").await?;
 
