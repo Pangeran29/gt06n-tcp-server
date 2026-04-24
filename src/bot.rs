@@ -123,6 +123,13 @@ impl TheftAlertAction {
             _ => return None,
         })
     }
+
+    fn requires_active_subscription(&self) -> bool {
+        matches!(
+            self,
+            Self::StreamLocation { .. } | Self::CheckLatestStatus { .. }
+        )
+    }
 }
 
 impl BotCommand {
@@ -743,6 +750,37 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn ensure_active_subscription_for_callback(
+        &self,
+        callback_query_id: &str,
+        chat_id: i64,
+        telegram_user_id: i64,
+        message_id: Option<i32>,
+    ) -> Result<bool, BotError> {
+        if has_active_subscription(self.database.pool(), telegram_user_id, Utc::now()).await? {
+            return Ok(true);
+        }
+
+        self.answer_callback_query(callback_query_id, "Subscription required.", false)
+            .await?;
+
+        if let Some(message_id) = message_id {
+            let message_id = i64::from(message_id);
+            if let Err(error) = self.clear_inline_keyboard(chat_id, message_id).await {
+                warn!(
+                    error = %error,
+                    chat_id,
+                    message_id,
+                    "failed to clear protected feature keyboard for inactive subscription"
+                );
+            }
+        }
+
+        self.send_subscription_required_menu(chat_id).await?;
+
+        Ok(false)
+    }
+
     async fn ensure_bound_for_payment(
         &self,
         callback_query_id: &str,
@@ -831,6 +869,19 @@ impl TelegramBot {
         let chat_id = message.chat.id;
 
         if let Some(action) = TheftAlertAction::parse(data) {
+            if action.requires_active_subscription()
+                && !self
+                    .ensure_active_subscription_for_callback(
+                        &callback_query.id,
+                        chat_id,
+                        callback_query.from.id,
+                        message.message_id,
+                    )
+                    .await?
+            {
+                return Ok(());
+            }
+
             self.answer_callback_query(&callback_query.id, "", false)
                 .await?;
             return self.handle_theft_alert_action(message, action).await;
@@ -840,6 +891,18 @@ impl TelegramBot {
             return Ok(());
         };
         let prompt_message_id = i64::from(message.message_id.unwrap_or_default());
+
+        if !self
+            .ensure_active_subscription_for_callback(
+                &callback_query.id,
+                chat_id,
+                callback_query.from.id,
+                message.message_id,
+            )
+            .await?
+        {
+            return Ok(());
+        }
 
         let Some(session) = fetch_engine_session_by_prompt_message(
             self.database.pool(),
@@ -2312,13 +2375,19 @@ async fn fetch_notification_chat_ids_for_imei(
 ) -> Result<Vec<i64>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT chat_id
-        FROM telegram_users
-        WHERE bound_imei = $1
-          AND registration_status = 'bound'
+        SELECT tu.chat_id
+        FROM telegram_users tu
+        INNER JOIN telegram_subscriptions ts
+            ON ts.telegram_user_id = tu.telegram_user_id
+           AND ts.plan_code = $2
+           AND ts.status = 'active'
+           AND ts.current_period_end_at > NOW()
+        WHERE tu.bound_imei = $1
+          AND tu.registration_status = 'bound'
         "#,
     )
     .bind(imei)
+    .bind(TELEGRAM_STARS_PLAN_CODE)
     .fetch_all(pool)
     .await?;
 
@@ -3814,6 +3883,158 @@ mod tests {
             .expect("finished session should exist");
         assert_eq!(resolved.session_status, "finished");
         assert!(resolved.resolved_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checks_active_subscription_state() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let active_user_id = 8_881_000_001_i64;
+        let expired_user_id = 8_881_000_002_i64;
+        let missing_user_id = 8_881_000_003_i64;
+        let reference_time = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(active_user_id)
+            .bind(missing_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(active_user_id)
+            .bind(missing_user_id)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES
+                ($1, $1, '999888777666551', 'bound', NOW(), NOW()),
+                ($2, $2, '999888777666552', 'bound', NOW(), NOW()),
+                ($3, $3, '999888777666553', 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(active_user_id)
+        .bind(expired_user_id)
+        .bind(missing_user_id)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES
+                ($1, $1, $3, 'active', $4, $5, NOW(), NOW()),
+                ($2, $2, $3, 'active', $4, $6, NOW(), NOW())
+            "#,
+        )
+        .bind(active_user_id)
+        .bind(expired_user_id)
+        .bind(TELEGRAM_STARS_PLAN_CODE)
+        .bind(reference_time - chrono::Duration::days(1))
+        .bind(reference_time + chrono::Duration::days(1))
+        .bind(reference_time - chrono::Duration::seconds(1))
+        .execute(database.pool())
+        .await?;
+
+        assert!(has_active_subscription(database.pool(), active_user_id, reference_time).await?);
+        assert!(!has_active_subscription(database.pool(), expired_user_id, reference_time).await?);
+        assert!(!has_active_subscription(database.pool(), missing_user_id, reference_time).await?);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetches_notification_chat_ids_only_for_active_subscribers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let first_user_id = 8_882_000_001_i64;
+        let last_user_id = 8_882_000_005_i64;
+        let imei = "999888777666554";
+
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(first_user_id)
+            .bind(last_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(first_user_id)
+            .bind(last_user_id)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES
+                ($1, 91001, $6, 'bound', NOW(), NOW()),
+                ($2, 91002, $6, 'bound', NOW(), NOW()),
+                ($3, 91003, $6, 'bound', NOW(), NOW()),
+                ($4, 91004, $6, 'awaiting_imei', NOW(), NOW()),
+                ($5, 91005, NULL, 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(first_user_id)
+        .bind(first_user_id + 1)
+        .bind(first_user_id + 2)
+        .bind(first_user_id + 3)
+        .bind(last_user_id)
+        .bind(imei)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES
+                ($1, 91001, $6, 'active', NOW() - INTERVAL '1 day', NOW() + INTERVAL '1 day', NOW(), NOW()),
+                ($2, 91002, $6, 'active', NOW() - INTERVAL '2 days', NOW() - INTERVAL '1 day', NOW(), NOW()),
+                ($4, 91004, $6, 'active', NOW() - INTERVAL '1 day', NOW() + INTERVAL '1 day', NOW(), NOW()),
+                ($5, 91005, $6, 'active', NOW() - INTERVAL '1 day', NOW() + INTERVAL '1 day', NOW(), NOW())
+            "#,
+        )
+        .bind(first_user_id)
+        .bind(first_user_id + 1)
+        .bind(first_user_id + 2)
+        .bind(first_user_id + 3)
+        .bind(last_user_id)
+        .bind(TELEGRAM_STARS_PLAN_CODE)
+        .execute(database.pool())
+        .await?;
+
+        let chat_ids = fetch_notification_chat_ids_for_imei(database.pool(), imei).await?;
+        assert_eq!(chat_ids, vec![91001]);
 
         Ok(())
     }
