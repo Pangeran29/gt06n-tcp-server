@@ -10,6 +10,8 @@ The database design is built around three tables:
 - `device_locations`
 - `device_heartbeats`
 - `telegram_bot_state`
+- `telegram_subscriptions`
+- `telegram_payment_events`
 
 The design is intentionally simple:
 
@@ -160,3 +162,75 @@ Why it exists:
 - prevents duplicate notification processing after restart
 - keeps the bot decoupled from the TCP server
 - lets the bot resume from PostgreSQL-backed state instead of in-memory state
+
+### `telegram_subscriptions`
+
+Business meaning:
+
+- this is the current paid-access state for a Telegram user
+- one row represents one subscription plan for one Telegram account
+- the first plan is `monthly_stars`
+
+What it stores:
+
+- Telegram user id
+- chat id snapshot for future payment/subscription messaging
+- plan code
+- subscription status
+- current paid period start and end time
+- created / updated timestamps
+
+Allowed status values:
+
+- `active`
+- `expired`
+- `canceled`
+- `past_due`
+
+Why it exists:
+
+- gives the bot one fast place to check whether a Telegram user has paid access
+- keeps entitlement state separate from raw payment events
+- can support one-time 30-day Stars payments now and recurring Stars subscriptions later
+
+The payment owner is the Telegram user, not the IMEI. This matches Telegram Stars payments, which are paid by a Telegram account. Device-level or shared-device access can be added later without changing the payment ledger.
+
+### `telegram_payment_events`
+
+Business meaning:
+
+- this is the append-only payment ledger for Telegram Stars payment events
+- one row represents one payment attempt/result known to the bot
+
+What it stores:
+
+- Telegram user id
+- chat id snapshot
+- optional subscription reference
+- payment kind
+- payment status
+- plan code
+- Stars currency (`XTR`)
+- Stars amount
+- access period length in days
+- invoice payload
+- Telegram payment charge id
+- provider payment charge id, when present
+- paid timestamp
+- raw successful-payment JSON for future audit/debugging
+- created / updated timestamps
+
+Allowed payment status values:
+
+- `pending`
+- `paid`
+- `failed`
+- `refunded`
+
+Why it exists:
+
+- preserves payment history independently of the current subscription state
+- provides idempotency via unique `invoice_payload` and `telegram_payment_charge_id`
+- leaves room for refunds, failed attempts, and future recurring subscription renewals
+
+For the initial one-time Stars payment flow, a successful payment should later create or extend `telegram_subscriptions.current_period_end_at` by 30 days. Feature gating and invoice handling are intentionally separate from this schema layer.

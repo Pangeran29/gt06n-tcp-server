@@ -500,7 +500,7 @@ pub fn gps_timestamp_to_naive(timestamp: &GpsTimestamp) -> NaiveDateTime {
 mod tests {
     use std::env;
 
-    use chrono::{Datelike, Timelike};
+    use chrono::{DateTime, Datelike, Timelike, Utc};
     use sqlx::Row;
 
     use super::{engine_status_as_str, gps_timestamp_to_naive, Database, MIGRATOR};
@@ -555,7 +555,7 @@ mod tests {
 
         MIGRATOR.run(database.pool()).await?;
         let row = sqlx::query(
-            "SELECT to_regclass('public.devices') AS devices, to_regclass('public.device_locations') AS locations, to_regclass('public.device_heartbeats') AS heartbeats"
+            "SELECT to_regclass('public.devices') AS devices, to_regclass('public.device_locations') AS locations, to_regclass('public.device_heartbeats') AS heartbeats, to_regclass('public.telegram_subscriptions') AS telegram_subscriptions, to_regclass('public.telegram_payment_events') AS telegram_payment_events"
         )
         .fetch_one(database.pool())
         .await?;
@@ -571,6 +571,149 @@ mod tests {
         assert_eq!(
             row.try_get::<Option<String>, _>("heartbeats")?,
             Some("device_heartbeats".to_string())
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("telegram_subscriptions")?,
+            Some("telegram_subscriptions".to_string())
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("telegram_payment_events")?,
+            Some("telegram_payment_events".to_string())
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stores_telegram_stars_subscription_payment_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database should be configured");
+
+        let telegram_user_id = 9_990_000_001_i64;
+        let chat_id = 9_990_000_002_i64;
+        let period_start = Utc::now();
+        let period_end = period_start + chrono::Duration::days(30);
+        let invoice_payload = format!("stars-test-{telegram_user_id}");
+        let charge_id = format!("charge-test-{telegram_user_id}");
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $2, NULL, 'bound', NOW(), NOW())
+            ON CONFLICT (telegram_user_id) DO UPDATE
+            SET chat_id = EXCLUDED.chat_id,
+                registration_status = EXCLUDED.registration_status,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .execute(database.pool())
+        .await?;
+
+        let subscription_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES ($1, $2, 'monthly_stars', 'active', $3, $4, NOW(), NOW())
+            ON CONFLICT (telegram_user_id, plan_code) DO UPDATE
+            SET chat_id = EXCLUDED.chat_id,
+                status = EXCLUDED.status,
+                current_period_start_at = EXCLUDED.current_period_start_at,
+                current_period_end_at = EXCLUDED.current_period_end_at,
+                updated_at = EXCLUDED.updated_at
+            RETURNING id
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(period_start)
+        .bind(period_end)
+        .fetch_one(database.pool())
+        .await?;
+
+        sqlx::query(
+            "DELETE FROM telegram_payment_events WHERE invoice_payload = $1 OR telegram_payment_charge_id = $2",
+        )
+        .bind(&invoice_payload)
+        .bind(&charge_id)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_payment_events (
+                telegram_user_id, chat_id, subscription_id, payment_kind, payment_status,
+                plan_code, currency, stars_amount, period_days, invoice_payload,
+                telegram_payment_charge_id, provider_payment_charge_id, paid_at,
+                raw_successful_payment, created_at, updated_at
+            )
+            VALUES (
+                $1, $2, $3, 'one_time_stars', 'paid',
+                'monthly_stars', 'XTR', 199, 30, $4,
+                $5, NULL, $6, $7::jsonb, NOW(), NOW()
+            )
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(subscription_id)
+        .bind(&invoice_payload)
+        .bind(&charge_id)
+        .bind(period_start)
+        .bind(r#"{"currency":"XTR","total_amount":199}"#)
+        .execute(database.pool())
+        .await?;
+
+        let duplicate_payment = sqlx::query(
+            r#"
+            INSERT INTO telegram_payment_events (
+                telegram_user_id, chat_id, subscription_id, payment_kind, payment_status,
+                stars_amount, invoice_payload, telegram_payment_charge_id
+            )
+            VALUES ($1, $2, $3, 'one_time_stars', 'paid', 199, $4, $5)
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(subscription_id)
+        .bind(format!("{invoice_payload}-duplicate"))
+        .bind(&charge_id)
+        .execute(database.pool())
+        .await;
+        assert!(duplicate_payment.is_err());
+
+        let row = sqlx::query(
+            r#"
+            SELECT current_period_start_at, current_period_end_at
+            FROM telegram_subscriptions
+            WHERE id = $1
+            "#,
+        )
+        .bind(subscription_id)
+        .fetch_one(database.pool())
+        .await?;
+        let restored_start: DateTime<Utc> = row.get("current_period_start_at");
+        let restored_end: DateTime<Utc> = row.get("current_period_end_at");
+        assert_eq!(
+            restored_end
+                .signed_duration_since(restored_start)
+                .num_days(),
+            30
         );
 
         Ok(())
