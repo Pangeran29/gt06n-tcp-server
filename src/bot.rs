@@ -120,6 +120,8 @@ const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
+const THEFT_WARNING_STICKER_BYTES: &[u8] =
+    include_bytes!("../asset/AnimatedSticker - not my motor.tgs");
 
 impl TelegramBot {
     pub async fn from_config(config: &Config) -> Result<Self, BotError> {
@@ -267,6 +269,7 @@ impl TelegramBot {
                         &heartbeat.imei,
                         &active_sessions,
                         heartbeat.server_received_at,
+                        true,
                     )
                     .await?
                 {
@@ -346,6 +349,7 @@ impl TelegramBot {
             &heartbeat.imei,
             &active_sessions,
             heartbeat.server_received_at,
+            false,
         )
         .await?;
 
@@ -378,6 +382,7 @@ impl TelegramBot {
         imei: &str,
         sessions: &[EngineSession],
         ended_at: DateTime<Utc>,
+        send_theft_engine_off_alert: bool,
     ) -> Result<Option<i64>, BotError> {
         let mut last_message_id = None;
 
@@ -399,7 +404,13 @@ impl TelegramBot {
             }
 
             let message_id = self
-                .finish_ride_session_and_send_summary(chat_id, imei, session, ended_at)
+                .finish_ride_session_and_send_summary(
+                    chat_id,
+                    imei,
+                    session,
+                    ended_at,
+                    send_theft_engine_off_alert,
+                )
                 .await?;
             last_message_id = Some(message_id);
         }
@@ -413,6 +424,7 @@ impl TelegramBot {
         imei: &str,
         session: &EngineSession,
         ended_at: DateTime<Utc>,
+        send_theft_engine_off_alert: bool,
     ) -> Result<i64, BotError> {
         if let Some(message_id) = session.ride_status_message_id {
             resolve_engine_session(self.database.pool(), session.id, "finished").await?;
@@ -424,6 +436,14 @@ impl TelegramBot {
         let ride_summary =
             fetch_ride_summary(self.database.pool(), imei, session.created_at, ended_at).await?;
         let latest_location = fetch_latest_location_for_imei(self.database.pool(), imei).await?;
+
+        if send_theft_engine_off_alert && session.session_status == "reported_theft" {
+            self.send_message(
+                chat_id,
+                &format_theft_engine_off_message(latest_location.as_ref(), ended_at, Utc::now()),
+            )
+            .await?;
+        }
 
         let message_id = self
             .send_message(
@@ -645,13 +665,15 @@ impl TelegramBot {
                     .await?;
             }
             SessionAction::No => {
-                self.send_message(chat_id, "🧨").await?;
                 self.send_message_internal(
                     chat_id,
                     format_theft_warning_message(),
                     Some(theft_alert_keyboard(Some(session.id))),
                 )
                 .await?;
+                if let Err(error) = self.send_theft_warning_sticker(chat_id).await {
+                    warn!(error = %error, "failed to send theft-warning sticker");
+                }
                 update_engine_session_status(self.database.pool(), session.id, "reported_theft")
                     .await?;
             }
@@ -827,6 +849,27 @@ impl TelegramBot {
     async fn send_bind_success_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(BIND_SUCCESS_STICKER_BYTES.to_vec())
             .file_name("AnimatedSticker - hi.tgs")
+            .mime_str("application/x-tgsticker")?;
+
+        let form = multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("sticker", sticker_part);
+
+        let response = self
+            .client
+            .post(format!("{}/sendSticker", self.base_url))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn send_theft_warning_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
+        let sticker_part = multipart::Part::bytes(THEFT_WARNING_STICKER_BYTES.to_vec())
+            .file_name("AnimatedSticker - not my motor.tgs")
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()
@@ -1190,7 +1233,7 @@ pub fn format_engine_on_confirmation_message_with_duration(
 }
 
 pub fn format_ride_safe_message() -> &'static str {
-    "Ride safe, We are tracking you in case there's something wrong."
+    "Ride safe — we’ll keep tracking in the background for your safety."
 }
 
 pub fn format_session_finished_message() -> &'static str {
@@ -1198,7 +1241,7 @@ pub fn format_session_finished_message() -> &'static str {
 }
 
 pub fn format_theft_warning_message() -> &'static str {
-    "Pay attention\nThere's indication that your motor is being theft. Use button below to track your motor."
+    "🚨 THEFT SUSPECTED 🚨\nThis was NOT you.\n\nAct fast — the first few minutes are crucial.\nTap below to start live tracking."
 }
 
 pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
@@ -1209,29 +1252,28 @@ pub fn format_theft_location_message(location: Option<&StoredLocation>) -> Strin
     }
 }
 
-pub fn format_theft_engine_off_message() -> &'static str {
-    "Motor terdeteksi mati (berhenti).\nYou can still tracking your motor via GPS device battery mode."
-}
-
-pub fn format_theft_engine_off_follow_up_message(
-    off_started_at: DateTime<Utc>,
+pub fn format_theft_engine_off_message(
+    latest_location: Option<&StoredLocation>,
+    engine_off_at: DateTime<Utc>,
     current_time: DateTime<Utc>,
 ) -> String {
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let off_started_wib = wib.from_utc_datetime(&off_started_at.naive_utc());
+    let engine_off_wib = wib.from_utc_datetime(&engine_off_at.naive_utc());
     let duration = current_time
-        .signed_duration_since(off_started_at)
+        .signed_duration_since(engine_off_at)
         .to_std()
         .unwrap_or_default();
     let total_seconds = duration.as_secs();
     let hours = total_seconds / 3600;
     let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
+    let location_link = latest_location_link(latest_location)
+        .unwrap_or_else(|| "Location is not available yet.".to_string());
 
     format!(
-        "{}\nOff from: {} -> now\nDuration: {:02}:{:02}:{:02}",
-        format_theft_engine_off_message(),
-        off_started_wib.format("%d %b %Y %H:%M:%S WIB"),
+        "🚨 URGENT THEFT ALERT 🚨\nYour motor has STOPPED / ENGINE OFF detected.\n\n📍 Last Known Location:\n{}\n\n⚠️ This may indicate the motor has been hidden or moved into an indoor area.\nGPS tracking can still continue in battery mode (as long as device power remains).\n\nEngine OFF since: {}\nDuration: {:02}:{:02}:{:02} (until now)\n\n➡️ Recommended: Check the location immediately or contact local authorities.",
+        location_link,
+        engine_off_wib.format("%d %b %Y %H:%M WIB"),
         hours,
         minutes,
         seconds,
@@ -1370,9 +1412,9 @@ fn format_latest_motor_status_message_at(
         })
         .unwrap_or("UNKNOWN");
     let movement_status = match location.and_then(|value| value.speed_kph) {
-        Some(speed) if speed > 0 => format!("Moving ({speed} km/h)"),
-        Some(_) => "Stationary".to_string(),
-        None => "Stationary".to_string(),
+        Some(speed) if speed > 0 => format!("MOVING at {speed} km/h"),
+        Some(_) => "STATIONARY".to_string(),
+        None => "UNKNOWN".to_string(),
     };
     let signal_status = heartbeat
         .map(|value| connection_status_label(value.gsm_signal_strength))
@@ -1412,21 +1454,32 @@ fn format_latest_motor_status_message_at(
         })
         .unwrap_or_else(|| "ONGOING".to_string());
     let report_time_wib = wib.from_utc_datetime(&reference_time.naive_utc());
+    let session_timing = if session_ended == "ONGOING" {
+        format!(
+            "Tracking started at {} and is still ongoing.",
+            session_started_wib.format("%H:%M:%S WIB"),
+        )
+    } else {
+        format!(
+            "Tracking started at {} and ended at {}.",
+            session_started_wib.format("%H:%M:%S WIB"),
+            session_ended,
+        )
+    };
 
     format!(
-        "🛠️ Motor Diagnostics Report\n📅 {} — {} WIB\n\n📍 Last Known Location\n{}\n\nStatus: {}\nLast Update: {}\n\n⚙️ Engine Status\n\nEngine: {}\n\n📡 GPS & Tracking\n\nGPS Signal: {}\nTracking Mode: {}\nPower Level: {}\n\n🧾 Session Info\n\nSession State: {}\nStarted: {}\nEnded: {}{}",
+        "Motor Diagnostics Report ({} — {} WIB)\n\nYour motor was last detected {} (updated {}).\nLocation:\n{}\n\nEngine status: {}\nGPS signal: {} (Tracking {})\nDevice power: {}\n\nSession status: {}\n{}{}",
         report_time_wib.format("%d %b %Y"),
         report_time_wib.format("%H:%M"),
-        map_link,
-        movement_status.to_uppercase(),
+        movement_status,
         last_update,
+        map_link,
         engine_status,
         signal_status.to_uppercase(),
         gps_tracking_status.to_uppercase(),
         battery_level.to_uppercase(),
         session_status.to_uppercase(),
-        session_started_wib.format("%H:%M:%S WIB"),
-        session_ended,
+        session_timing,
         battery_warning,
     )
 }
@@ -2466,8 +2519,9 @@ mod tests {
     #[test]
     fn formats_theft_warning_message() {
         let text = format_theft_warning_message();
-        assert!(text.contains("Pay attention"));
-        assert!(text.contains("Use button below to track your motor"));
+        assert!(text.contains("THEFT SUSPECTED"));
+        assert!(text.contains("This was NOT you."));
+        assert!(text.contains("Tap below to start live tracking."));
     }
 
     #[test]
@@ -2479,20 +2533,26 @@ mod tests {
 
     #[test]
     fn formats_theft_engine_off_message() {
-        let text = format_theft_engine_off_message();
-        assert!(text.contains("Motor terdeteksi mati (berhenti)"));
-        assert!(text.contains("battery mode"));
-    }
-
-    #[test]
-    fn formats_theft_engine_off_follow_up_message() {
         let started = Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap();
         let newest = Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 7).unwrap();
+        let location = StoredLocation {
+            imei: "866221070478388".to_string(),
+            last_seen_at: Some(started),
+            gps_timestamp: None,
+            latitude: Some(-6.216754),
+            longitude: Some(106.768455),
+            speed_kph: Some(0),
+            course: None,
+            satellite_count: None,
+        };
 
-        let text = format_theft_engine_off_follow_up_message(started, newest);
-        assert!(text.contains("Motor terdeteksi mati (berhenti)"));
-        assert!(text.contains("-> now"));
+        let text = format_theft_engine_off_message(Some(&location), started, newest);
+        assert!(text.contains("URGENT THEFT ALERT"));
+        assert!(text.contains("Your motor has STOPPED / ENGINE OFF detected."));
+        assert!(text.contains("https://maps.google.com/?q=-6.216754,106.768455"));
+        assert!(text.contains("Engine OFF since: 17 Apr 2026 17:00 WIB"));
         assert!(text.contains("Duration: 00:05:07"));
+        assert!(text.contains("Recommended: Check the location immediately"));
     }
 
     #[test]
@@ -2676,9 +2736,9 @@ mod tests {
             trigger_heartbeat_id: 7,
             prompt_message_id: 99,
             ride_status_message_id: None,
-            session_status: "theft_engine_off".to_string(),
+            session_status: "reported_theft".to_string(),
             created_at: Utc.with_ymd_and_hms(2026, 4, 17, 10, 0, 0).unwrap(),
-            resolved_at: None,
+            resolved_at: Some(Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 7).unwrap()),
         };
         let heartbeat = StoredHeartbeat {
             id: 8,
@@ -2710,16 +2770,15 @@ mod tests {
             Some(&location),
             Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 19).unwrap(),
         );
-        assert!(text.contains("🛠️ Motor Diagnostics Report"));
-        assert!(text.contains("📍 Last Known Location"));
+        assert!(text.contains("Motor Diagnostics Report (17 Apr 2026"));
+        assert!(text.contains("Location:"));
         assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
-        assert!(text.contains("Status: STATIONARY"));
-        assert!(text.contains("Last Update: 12s ago"));
-        assert!(text.contains("Engine: OFF"));
-        assert!(text.contains("GPS Signal: OK"));
-        assert!(text.contains("Tracking Mode: ACTIVE"));
-        assert!(text.contains("Power Level: UNKNOWN"));
-        assert!(text.contains("Session State: THEFT_ENGINE_OFF"));
+        assert!(text.contains("Your motor was last detected STATIONARY (updated 12s ago)."));
+        assert!(text.contains("Engine status: OFF"));
+        assert!(text.contains("GPS signal: OK (Tracking ACTIVE)"));
+        assert!(text.contains("Device power: UNKNOWN"));
+        assert!(text.contains("Session status: REPORTED_THEFT"));
+        assert!(text.contains("Tracking started at 17:00:00 WIB and ended at 17:05:07 WIB."));
     }
 
     #[test]
@@ -2738,12 +2797,10 @@ mod tests {
         let requested_at = Utc.with_ymd_and_hms(2026, 4, 17, 10, 1, 2).unwrap();
 
         let text = format_latest_motor_status_initial_message(&session, None, None, requested_at);
-        assert!(text.contains("🛠️ Motor Diagnostics Report"));
-        assert!(text.contains("📍 Last Known Location"));
         assert!(text.contains("Location is not available yet."));
-        assert!(text.contains("Status: STATIONARY"));
-        assert!(text.contains("Last Update: unknown"));
-        assert!(text.contains("Session State: REPORTED_THEFT"));
+        assert!(text.contains("Your motor was last detected UNKNOWN (updated unknown)."));
+        assert!(text.contains("Session status: REPORTED_THEFT"));
+        assert!(text.contains("Tracking started at 17:00:00 WIB and is still ongoing."));
     }
 
     #[test]
@@ -2779,7 +2836,7 @@ mod tests {
             None,
             Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
         );
-        assert!(text.contains("Power Level: EMPTY"));
+        assert!(text.contains("Device power: EMPTY"));
         assert!(text.contains("Warning: GPS device battery is empty."));
     }
 
