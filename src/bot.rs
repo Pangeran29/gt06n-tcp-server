@@ -2078,7 +2078,9 @@ pub fn format_payment_success_message(current_period_end_at: Option<DateTime<Utc
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    format!("Payment successful. Your Heartbeats access is active until {active_until}.")
+    format!(
+        "Payment successful. Your Heartbeats access is active until {active_until}.\n\nType /start to start the Heartbeats and /help to see detail usage."
+    )
 }
 
 fn should_start_new_engine_on_session(
