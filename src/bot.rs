@@ -242,10 +242,11 @@ impl TelegramBot {
         let heartbeats = fetch_new_heartbeats(self.database.pool(), last_notified).await?;
 
         for heartbeat in heartbeats {
-            let notification_chat_ids =
-                fetch_notification_chat_ids_for_imei(self.database.pool(), &heartbeat.imei).await?;
+            let notification_recipients =
+                fetch_notification_recipients_for_imei(self.database.pool(), &heartbeat.imei)
+                    .await?;
 
-            if notification_chat_ids.is_empty() {
+            if notification_recipients.is_empty() {
                 set_state_i64(
                     self.database.pool(),
                     "last_notified_heartbeat_id",
@@ -256,9 +257,32 @@ impl TelegramBot {
             }
 
             if let Some(status) = heartbeat.notification_status() {
-                for chat_id in notification_chat_ids {
-                    self.process_heartbeat_notification_for_chat(&heartbeat, status, chat_id)
+                for recipient in notification_recipients {
+                    if recipient.has_active_subscription {
+                        if let Err(error) = self
+                            .process_heartbeat_notification_for_chat(
+                                &heartbeat,
+                                status,
+                                recipient.chat_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                error = %error,
+                                imei = %heartbeat.imei,
+                                heartbeat_id = heartbeat.id,
+                                chat_id = recipient.chat_id,
+                                "failed to process heartbeat notification for chat; continuing with remaining recipients"
+                            );
+                        }
+                    } else if status == "off" {
+                        self.finish_inactive_subscription_sessions(
+                            &heartbeat.imei,
+                            recipient.chat_id,
+                            heartbeat.server_received_at,
+                        )
                         .await?;
+                    }
                 }
             } else {
                 info!(
@@ -465,6 +489,38 @@ impl TelegramBot {
         }
 
         Ok(last_message_id)
+    }
+
+    async fn finish_inactive_subscription_sessions(
+        &self,
+        imei: &str,
+        chat_id: i64,
+        ended_at: DateTime<Utc>,
+    ) -> Result<(), BotError> {
+        let sessions = fetch_active_engine_sessions(self.database.pool(), imei, chat_id).await?;
+
+        for session in sessions {
+            if session.session_status == "pending_confirmation" {
+                if let Err(error) = self
+                    .clear_inline_keyboard(chat_id, session.prompt_message_id)
+                    .await
+                {
+                    warn!(
+                        error = %error,
+                        imei = %imei,
+                        chat_id,
+                        session_id = session.id,
+                        message_id = session.prompt_message_id,
+                        "failed to clear pending confirmation keyboard before silently finishing inactive subscription session"
+                    );
+                }
+            }
+
+            resolve_engine_session_at(self.database.pool(), session.id, "finished", ended_at)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn finish_ride_session_and_send_summary(
@@ -720,6 +776,8 @@ impl TelegramBot {
 
                 self.answer_callback_query(&callback_query.id, "", false)
                     .await?;
+                self.send_stars_subscription_invoice(chat_id, package, &invoice_payload)
+                    .await?;
                 if let Err(error) = self
                     .clear_inline_keyboard(chat_id, payment_menu_message_id)
                     .await
@@ -731,8 +789,6 @@ impl TelegramBot {
                         "failed to clear subscription payment keyboard"
                     );
                 }
-                self.send_stars_subscription_invoice(chat_id, package, &invoice_payload)
-                    .await?;
             }
         }
 
@@ -1582,6 +1638,12 @@ pub struct TelegramSubscriptionRecord {
     pub current_period_end_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NotificationRecipient {
+    chat_id: i64,
+    has_active_subscription: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StarsPackageCode {
     Monthly,
@@ -1716,7 +1778,7 @@ pub fn format_session_finished_message() -> &'static str {
 }
 
 pub fn format_theft_warning_message() -> &'static str {
-    "🚨 THEFT SUSPECTED 🚨\nThis was NOT you.\n\nAct fast — the first few minutes are crucial.\nTap below to start live tracking."
+    "THEFT SUSPECTED\n\nAct fast — the first few minutes are crucial.\nTap below to start live tracking."
 }
 
 pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
@@ -2369,21 +2431,25 @@ async fn is_device_bound_to_another_user(
     Ok(row.is_some())
 }
 
-async fn fetch_notification_chat_ids_for_imei(
+async fn fetch_notification_recipients_for_imei(
     pool: &sqlx::PgPool,
     imei: &str,
-) -> Result<Vec<i64>, sqlx::Error> {
+) -> Result<Vec<NotificationRecipient>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT tu.chat_id
+        SELECT tu.chat_id,
+               EXISTS (
+                   SELECT 1
+                   FROM telegram_subscriptions ts
+                   WHERE ts.telegram_user_id = tu.telegram_user_id
+                     AND ts.plan_code = $2
+                     AND ts.status = 'active'
+                     AND ts.current_period_end_at > NOW()
+               ) AS has_active_subscription
         FROM telegram_users tu
-        INNER JOIN telegram_subscriptions ts
-            ON ts.telegram_user_id = tu.telegram_user_id
-           AND ts.plan_code = $2
-           AND ts.status = 'active'
-           AND ts.current_period_end_at > NOW()
         WHERE tu.bound_imei = $1
           AND tu.registration_status = 'bound'
+        ORDER BY tu.chat_id ASC
         "#,
     )
     .bind(imei)
@@ -2391,7 +2457,13 @@ async fn fetch_notification_chat_ids_for_imei(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|row| row.get("chat_id")).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| NotificationRecipient {
+            chat_id: row.get("chat_id"),
+            has_active_subscription: row.get("has_active_subscription"),
+        })
+        .collect())
 }
 
 async fn has_active_subscription(
@@ -2913,17 +2985,27 @@ pub async fn resolve_engine_session(
     session_id: i64,
     session_status: &str,
 ) -> Result<(), sqlx::Error> {
+    resolve_engine_session_at(pool, session_id, session_status, Utc::now()).await
+}
+
+pub async fn resolve_engine_session_at(
+    pool: &sqlx::PgPool,
+    session_id: i64,
+    session_status: &str,
+    resolved_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
         UPDATE telegram_engine_sessions
         SET session_status = $2,
-            updated_at = NOW(),
-            resolved_at = NOW()
+            updated_at = $3,
+            resolved_at = $3
         WHERE id = $1
         "#,
     )
     .bind(session_id)
     .bind(session_status)
+    .bind(resolved_at)
     .execute(pool)
     .await?;
 
@@ -3961,7 +4043,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_notification_chat_ids_only_for_active_subscribers(
+    async fn fetches_notification_recipients_with_subscription_state(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
             return Ok(());
@@ -4033,8 +4115,67 @@ mod tests {
         .execute(database.pool())
         .await?;
 
-        let chat_ids = fetch_notification_chat_ids_for_imei(database.pool(), imei).await?;
-        assert_eq!(chat_ids, vec![91001]);
+        let recipients = fetch_notification_recipients_for_imei(database.pool(), imei).await?;
+        assert_eq!(
+            recipients,
+            vec![
+                NotificationRecipient {
+                    chat_id: 91001,
+                    has_active_subscription: true,
+                },
+                NotificationRecipient {
+                    chat_id: 91002,
+                    has_active_subscription: false,
+                },
+                NotificationRecipient {
+                    chat_id: 91003,
+                    has_active_subscription: false,
+                },
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolves_engine_session_at_specific_time() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let chat_id = 8_883_000_001_i64;
+        let started_at = Utc.with_ymd_and_hms(2026, 4, 25, 9, 0, 0).unwrap();
+        let ended_at = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
+
+        sqlx::query("DELETE FROM telegram_engine_sessions WHERE chat_id = $1")
+            .bind(chat_id)
+            .execute(database.pool())
+            .await?;
+
+        let session_id = create_engine_session(
+            database.pool(),
+            "999888777666557",
+            chat_id,
+            123,
+            456,
+            started_at,
+        )
+        .await?;
+
+        resolve_engine_session_at(database.pool(), session_id, "finished", ended_at).await?;
+        let session = fetch_engine_session_by_prompt_message(database.pool(), chat_id, 456)
+            .await?
+            .expect("session should exist");
+
+        assert_eq!(session.session_status, "finished");
+        assert_eq!(session.resolved_at, Some(ended_at));
 
         Ok(())
     }
