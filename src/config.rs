@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -53,7 +54,10 @@ impl Default for Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let _ = dotenvy::dotenv();
+        if dotenvy::dotenv().is_err() {
+            let manifest_env = Path::new(env!("CARGO_MANIFEST_DIR")).join(".env");
+            let _ = dotenvy::from_path(manifest_env);
+        }
         Self::from_pairs(env::vars())
     }
 

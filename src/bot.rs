@@ -665,6 +665,7 @@ impl TelegramBot {
                             chat_id,
                             &format_start_status_message(),
                             Some(subscribed_start_menu_keyboard()),
+                            None,
                         )
                         .await?;
                     } else {
@@ -762,7 +763,7 @@ impl TelegramBot {
                     .await?;
                 let payment_message =
                     format_midtrans_payment_message(&created.payment_url, created.expires_at);
-                self.send_message(chat_id, &payment_message).await?;
+                self.send_message_html(chat_id, &payment_message).await?;
                 if let Err(error) = self
                     .clear_inline_keyboard(chat_id, payment_menu_message_id)
                     .await
@@ -785,6 +786,7 @@ impl TelegramBot {
             chat_id,
             &format_subscription_menu_message(),
             Some(subscription_payment_keyboard()),
+            None,
         )
         .await?;
 
@@ -952,6 +954,7 @@ impl TelegramBot {
                     chat_id,
                     format_theft_warning_message(),
                     Some(theft_alert_keyboard(Some(session.id))),
+                    None,
                 )
                 .await?;
                 if let Err(error) = self.send_theft_warning_sticker(chat_id).await {
@@ -1093,7 +1096,12 @@ impl TelegramBot {
     }
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<i64, reqwest::Error> {
-        self.send_message_internal(chat_id, text, None).await
+        self.send_message_internal(chat_id, text, None, None).await
+    }
+
+    async fn send_message_html(&self, chat_id: i64, text: &str) -> Result<i64, reqwest::Error> {
+        self.send_message_internal(chat_id, text, None, Some("HTML"))
+            .await
     }
 
     async fn send_engine_on_confirmation(
@@ -1104,7 +1112,7 @@ impl TelegramBot {
         let text = format_engine_on_confirmation_message(heartbeat);
         let keyboard = engine_session_confirmation_keyboard();
 
-        self.send_message_internal(chat_id, &text, Some(keyboard))
+        self.send_message_internal(chat_id, &text, Some(keyboard), None)
             .await
     }
 
@@ -1176,11 +1184,13 @@ impl TelegramBot {
         chat_id: i64,
         text: &str,
         reply_markup: Option<InlineKeyboardMarkup>,
+        parse_mode: Option<&str>,
     ) -> Result<i64, reqwest::Error> {
         let request = SendMessageRequest {
             chat_id,
             text: text.to_string(),
             reply_markup,
+            parse_mode: parse_mode.map(ToString::to_string),
         };
 
         let response = self
@@ -1309,6 +1319,8 @@ struct SendMessageRequest {
     text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     reply_markup: Option<InlineKeyboardMarkup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1896,7 +1908,8 @@ fn format_start_status_message() -> String {
 }
 
 fn format_subscription_menu_message() -> String {
-    "Unlock full Heartbeats access and protect your motorcycle with smart GPS tracking.".to_string()
+    "Get full access to Heartbeats and monitor your motorcycle in real-time, anytime."
+        .to_string()
 }
 
 fn build_status_session(
@@ -1934,7 +1947,7 @@ pub fn format_payment_success_message(current_period_end_at: Option<DateTime<Utc
         .unwrap_or_else(|| "unknown".to_string());
 
     format!(
-        "Payment successful. Your Heartbeats access is active until {active_until}.\n\nType /start to start the Heartbeats and /help to see detail usage."
+        "✅ Payment Successful\n\nYour Heartbeats access is now active until {active_until}.\n\nYou're all set to start tracking and monitoring your motorcycle.\nType /start to begin or /help to see available features."
     )
 }
 

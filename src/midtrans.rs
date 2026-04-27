@@ -231,8 +231,12 @@ pub fn map_midtrans_status(transaction_status: &str) -> Option<MidtransPaymentSt
 pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<Utc>) -> String {
     let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid WIB offset");
     let expires_at = wib.from_utc_datetime(&expires_at.naive_utc());
+    let escaped_payment_url = payment_url
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     format!(
-        "Heartbeats Monthly Access\nRp 2.000 / 30 days\n\nOpen this Midtrans payment link to complete your payment:\n{payment_url}\n\nThis payment expires at {}.",
+        "🔒 Heartbeats Monthly Access\nRp 50.000 — 30 Days\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\n⏳ Payment link expires: {}",
         expires_at.format("%d %b %Y %H:%M WIB")
     )
 }
