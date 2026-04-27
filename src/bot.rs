@@ -165,6 +165,7 @@ const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
+const NOT_SUBSCRIBED_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - no.tgs");
 const THEFT_WARNING_STICKER_BYTES: &[u8] =
     include_bytes!("../asset/AnimatedSticker - not my motor.tgs");
 
@@ -669,6 +670,9 @@ impl TelegramBot {
                         )
                         .await?;
                     } else {
+                        if let Err(error) = self.send_not_subscribed_sticker(chat_id).await {
+                            warn!(error = %error, "failed to send not-subscribed sticker");
+                        }
                         self.send_subscription_required_menu(chat_id).await?;
                     }
                 }
@@ -1140,6 +1144,27 @@ impl TelegramBot {
     async fn send_bind_success_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(BIND_SUCCESS_STICKER_BYTES.to_vec())
             .file_name("AnimatedSticker - hi.tgs")
+            .mime_str("application/x-tgsticker")?;
+
+        let form = multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("sticker", sticker_part);
+
+        let response = self
+            .client
+            .post(format!("{}/sendSticker", self.base_url))
+            .multipart(form)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn send_not_subscribed_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
+        let sticker_part = multipart::Part::bytes(NOT_SUBSCRIBED_STICKER_BYTES.to_vec())
+            .file_name("AnimatedSticker - no.tgs")
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()

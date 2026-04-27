@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
-use reqwest::Client;
+use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use thiserror::Error;
@@ -20,6 +20,9 @@ use crate::midtrans::{
     apply_midtrans_webhook, map_midtrans_status, verify_midtrans_signature,
     MidtransWebhookApplyOutcome, MidtransWebhookNotification,
 };
+
+const PAYMENT_SUCCESS_STICKER_BYTES: &[u8] =
+    include_bytes!("../asset/AnimatedSticker - payment success.tgs");
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -249,6 +252,14 @@ async fn post_midtrans_webhook(
     let status = match outcome {
         MidtransWebhookApplyOutcome::Paid(subscription) => {
             if let Some(token) = state.telegram_bot_token.as_deref() {
+                send_telegram_sticker(
+                    &state.http_client,
+                    token,
+                    subscription.chat_id,
+                    PAYMENT_SUCCESS_STICKER_BYTES,
+                    "AnimatedSticker - payment success.tgs",
+                )
+                .await?;
                 let text = format_payment_success_message(subscription.current_period_end_at);
                 send_telegram_message(&state.http_client, token, subscription.chat_id, &text)
                     .await?;
@@ -282,6 +293,31 @@ async fn send_telegram_message(
     let response = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
         .json(&request)
+        .send()
+        .await?
+        .error_for_status()?;
+    let _ = response.bytes().await?;
+    Ok(())
+}
+
+async fn send_telegram_sticker(
+    client: &Client,
+    token: &str,
+    chat_id: i64,
+    sticker_bytes: &[u8],
+    file_name: &str,
+) -> Result<(), reqwest::Error> {
+    let sticker_part = multipart::Part::bytes(sticker_bytes.to_vec())
+        .file_name(file_name.to_string())
+        .mime_str("application/x-tgsticker")?;
+
+    let form = multipart::Form::new()
+        .text("chat_id", chat_id.to_string())
+        .part("sticker", sticker_part);
+
+    let response = client
+        .post(format!("https://api.telegram.org/bot{token}/sendSticker"))
+        .multipart(form)
         .send()
         .await?
         .error_for_status()?;
