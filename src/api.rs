@@ -59,7 +59,6 @@ impl IntoResponse for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
         };
-
         let body = Json(ApiErrorBody {
             error: self.to_string(),
         });
