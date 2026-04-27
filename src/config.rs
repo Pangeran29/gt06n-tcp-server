@@ -15,6 +15,12 @@ pub struct Config {
     pub telegram_admin_chat_id: Option<i64>,
     pub telegram_poll_timeout_secs: u64,
     pub telegram_heartbeat_poll_interval_ms: u64,
+    pub midtrans_server_key: Option<String>,
+    pub midtrans_client_key: Option<String>,
+    pub midtrans_merchant_id: Option<String>,
+    pub midtrans_is_production: bool,
+    pub midtrans_payment_expiry_hours: i64,
+    pub midtrans_plan_price_idr: i64,
 }
 
 impl Default for Config {
@@ -35,6 +41,12 @@ impl Default for Config {
             telegram_admin_chat_id: None,
             telegram_poll_timeout_secs: 30,
             telegram_heartbeat_poll_interval_ms: 3_000,
+            midtrans_server_key: None,
+            midtrans_client_key: None,
+            midtrans_merchant_id: None,
+            midtrans_is_production: false,
+            midtrans_payment_expiry_hours: 24,
+            midtrans_plan_price_idr: 2_000,
         }
     }
 }
@@ -124,6 +136,43 @@ impl Config {
             }
         }
 
+        if let Some(server_key) = vars.get("MIDTRANS_SERVER_KEY") {
+            if !server_key.trim().is_empty() {
+                config.midtrans_server_key = Some(server_key.clone());
+            }
+        }
+
+        if let Some(client_key) = vars.get("MIDTRANS_CLIENT_KEY") {
+            if !client_key.trim().is_empty() {
+                config.midtrans_client_key = Some(client_key.clone());
+            }
+        }
+
+        if let Some(merchant_id) = vars.get("MIDTRANS_MERCHANT_ID") {
+            if !merchant_id.trim().is_empty() {
+                config.midtrans_merchant_id = Some(merchant_id.clone());
+            }
+        }
+
+        if let Some(is_production) = vars.get("MIDTRANS_IS_PRODUCTION") {
+            config.midtrans_is_production = matches!(
+                is_production.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            );
+        }
+
+        if let Some(expiry_hours) = vars.get("MIDTRANS_PAYMENT_EXPIRY_HOURS") {
+            if let Ok(parsed) = expiry_hours.parse() {
+                config.midtrans_payment_expiry_hours = parsed;
+            }
+        }
+
+        if let Some(price_idr) = vars.get("MIDTRANS_PLAN_PRICE_IDR") {
+            if let Ok(parsed) = price_idr.parse() {
+                config.midtrans_plan_price_idr = parsed;
+            }
+        }
+
         config
     }
 }
@@ -155,6 +204,12 @@ mod tests {
             ("TELEGRAM_ADMIN_CHAT_ID", "998877"),
             ("TELEGRAM_POLL_TIMEOUT_SECS", "45"),
             ("TELEGRAM_HEARTBEAT_POLL_INTERVAL_MS", "2500"),
+            ("MIDTRANS_SERVER_KEY", "server-key"),
+            ("MIDTRANS_CLIENT_KEY", "client-key"),
+            ("MIDTRANS_MERCHANT_ID", "merchant-id"),
+            ("MIDTRANS_IS_PRODUCTION", "true"),
+            ("MIDTRANS_PAYMENT_EXPIRY_HOURS", "12"),
+            ("MIDTRANS_PLAN_PRICE_IDR", "75000"),
         ]);
 
         assert_eq!(config.bind_addr, "127.0.0.1:6000".parse().unwrap());
@@ -171,5 +226,11 @@ mod tests {
         assert_eq!(config.telegram_admin_chat_id, Some(998877));
         assert_eq!(config.telegram_poll_timeout_secs, 45);
         assert_eq!(config.telegram_heartbeat_poll_interval_ms, 2500);
+        assert_eq!(config.midtrans_server_key.as_deref(), Some("server-key"));
+        assert_eq!(config.midtrans_client_key.as_deref(), Some("client-key"));
+        assert_eq!(config.midtrans_merchant_id.as_deref(), Some("merchant-id"));
+        assert!(config.midtrans_is_production);
+        assert_eq!(config.midtrans_payment_expiry_hours, 12);
+        assert_eq!(config.midtrans_plan_price_idr, 75_000);
     }
 }

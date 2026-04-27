@@ -585,8 +585,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_telegram_stars_subscription_payment_state(
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    async fn stores_midtrans_subscription_payment_state() -> Result<(), Box<dyn std::error::Error>>
+    {
         let Some(database_url) = database_url() else {
             return Ok(());
         };
@@ -603,8 +603,8 @@ mod tests {
         let chat_id = 9_990_000_002_i64;
         let period_start = Utc::now();
         let period_end = period_start + chrono::Duration::days(30);
-        let invoice_payload = format!("stars-test-{telegram_user_id}");
-        let charge_id = format!("charge-test-{telegram_user_id}");
+        let order_id = format!("hb-{telegram_user_id}-{}", period_start.timestamp_millis());
+        let transaction_id = format!("midtrans-transaction-{telegram_user_id}");
 
         sqlx::query(
             r#"
@@ -647,52 +647,52 @@ mod tests {
         .await?;
 
         sqlx::query(
-            "DELETE FROM telegram_payment_events WHERE invoice_payload = $1 OR telegram_payment_charge_id = $2",
+            "DELETE FROM telegram_payment_events WHERE provider_order_id = $1 OR provider_transaction_id = $2",
         )
-        .bind(&invoice_payload)
-        .bind(&charge_id)
+        .bind(&order_id)
+        .bind(&transaction_id)
         .execute(database.pool())
         .await?;
 
         sqlx::query(
             r#"
             INSERT INTO telegram_payment_events (
-                telegram_user_id, chat_id, subscription_id, payment_kind, payment_status,
-                plan_code, currency, stars_amount, period_days, invoice_payload,
-                telegram_payment_charge_id, provider_payment_charge_id, paid_at,
-                raw_successful_payment, created_at, updated_at
+                telegram_user_id, chat_id, subscription_id, payment_provider, payment_kind,
+                payment_status, plan_code, currency, gross_amount_idr, period_days,
+                provider_order_id, provider_transaction_id, payment_type, paid_at,
+                raw_webhook_notification, created_at, updated_at
             )
             VALUES (
-                $1, $2, $3, 'one_time_stars', 'paid',
-                'monthly_stars', 'XTR', 199, 30, $4,
-                $5, NULL, $6, $7::jsonb, NOW(), NOW()
+                $1, $2, $3, 'midtrans', 'snap_subscription',
+                'paid', 'monthly_stars', 'IDR', 2000, 30,
+                $4, $5, 'qris', $6, $7::jsonb, NOW(), NOW()
             )
             "#,
         )
         .bind(telegram_user_id)
         .bind(chat_id)
         .bind(subscription_id)
-        .bind(&invoice_payload)
-        .bind(&charge_id)
+        .bind(&order_id)
+        .bind(&transaction_id)
         .bind(period_start)
-        .bind(r#"{"currency":"XTR","total_amount":199}"#)
+        .bind(r#"{"transaction_status":"settlement","gross_amount":"2000.00"}"#)
         .execute(database.pool())
         .await?;
 
         let duplicate_payment = sqlx::query(
             r#"
             INSERT INTO telegram_payment_events (
-                telegram_user_id, chat_id, subscription_id, payment_kind, payment_status,
-                stars_amount, invoice_payload, telegram_payment_charge_id
+                telegram_user_id, chat_id, subscription_id, payment_provider, payment_kind,
+                payment_status, gross_amount_idr, provider_order_id, provider_transaction_id
             )
-            VALUES ($1, $2, $3, 'one_time_stars', 'paid', 199, $4, $5)
+            VALUES ($1, $2, $3, 'midtrans', 'snap_subscription', 'paid', 2000, $4, $5)
             "#,
         )
         .bind(telegram_user_id)
         .bind(chat_id)
         .bind(subscription_id)
-        .bind(format!("{invoice_payload}-duplicate"))
-        .bind(&charge_id)
+        .bind(format!("{order_id}-duplicate"))
+        .bind(&transaction_id)
         .execute(database.pool())
         .await;
         assert!(duplicate_payment.is_err());
