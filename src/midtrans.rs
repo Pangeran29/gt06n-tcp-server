@@ -14,6 +14,7 @@ pub const MIDTRANS_PAYMENT_PROVIDER: &str = "midtrans";
 pub const MIDTRANS_PAYMENT_KIND: &str = "snap_subscription";
 pub const MIDTRANS_CURRENCY: &str = "IDR";
 pub const MIDTRANS_PERIOD_DAYS: i32 = 30;
+const MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR: i64 = 45_000;
 
 #[derive(Debug, Error)]
 pub enum MidtransError {
@@ -150,17 +151,48 @@ impl MidtransClient {
         order_id: &str,
         created_at: DateTime<Utc>,
     ) -> Result<MidtransCreatedPayment, MidtransError> {
+        let item_details = if self.price_idr >= MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR {
+            vec![
+                MidtransItemDetail {
+                    id: "internet_data".to_string(),
+                    price: 15_000,
+                    quantity: 1,
+                    name: "Data internet".to_string(),
+                },
+                MidtransItemDetail {
+                    id: "sewa_alat".to_string(),
+                    price: 20_000,
+                    quantity: 1,
+                    name: "Sewa alat".to_string(),
+                },
+                MidtransItemDetail {
+                    id: "server".to_string(),
+                    price: 10_000,
+                    quantity: 1,
+                    name: "Server".to_string(),
+                },
+                MidtransItemDetail {
+                    id: "biaya_layanan".to_string(),
+                    price: self.price_idr - MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR,
+                    quantity: 1,
+                    name: "Biaya layanan".to_string(),
+                },
+            ]
+        } else {
+            vec![MidtransItemDetail {
+                id: MIDTRANS_PLAN_CODE.to_string(),
+                price: self.price_idr,
+                quantity: 1,
+                name: "Akses Heartbeats 30 Hari".to_string(),
+            }]
+        };
+
         let request = MidtransSnapRequest {
             transaction_details: MidtransTransactionDetails {
                 order_id: order_id.to_string(),
                 gross_amount: self.price_idr,
             },
-            item_details: vec![MidtransItemDetail {
-                id: MIDTRANS_PLAN_CODE.to_string(),
-                price: self.price_idr,
-                quantity: 1,
-                name: "Heartbeats 30 Days Access".to_string(),
-            }],
+            item_details,
             expiry: MidtransSnapExpiry {
                 start_time: created_at.format("%Y-%m-%d %H:%M:%S %z").to_string(),
                 duration: self.expiry_hours,
