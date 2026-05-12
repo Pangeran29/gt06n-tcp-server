@@ -155,7 +155,7 @@ impl MidtransClient {
             vec![
                 MidtransItemDetail {
                     id: "internet_data".to_string(),
-                    price: 15_000,
+                    price: 10_000,
                     quantity: 1,
                     name: "Data internet".to_string(),
                 },
@@ -166,17 +166,11 @@ impl MidtransClient {
                     name: "Sewa alat".to_string(),
                 },
                 MidtransItemDetail {
-                    id: "server".to_string(),
-                    price: 10_000,
+                    id: "server dan biaya layanan".to_string(),
+                    price: 5_000,
                     quantity: 1,
                     name: "Server".to_string(),
-                },
-                MidtransItemDetail {
-                    id: "biaya_layanan".to_string(),
-                    price: self.price_idr - MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR,
-                    quantity: 1,
-                    name: "Biaya layanan".to_string(),
-                },
+                }
             ]
         } else {
             vec![MidtransItemDetail {
