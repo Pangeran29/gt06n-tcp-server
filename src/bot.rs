@@ -1555,11 +1555,11 @@ pub fn format_engine_status_notification(heartbeat: &StoredHeartbeat, status: &s
     match status {
         "on" => format!(
             "Motor Dinyalakan\nKalau ini bukan kamu, segera cek lokasi motor.\n{}",
-            wib.format("%d %b %Y • %H:%M WIB")
+            wib.format("%d %b %Y - %H:%M WIB")
         ),
         "off" => format!(
             "Motor Dimatikan\nAktivitas terdeteksi pada motor kamu.\n{}",
-            wib.format("%d %b %Y • %H:%M WIB")
+            wib.format("%d %b %Y - %H:%M WIB")
         ),
         _ => format_heartbeat_notification(heartbeat),
     }
@@ -1577,12 +1577,12 @@ pub fn format_engine_on_confirmation_message_with_duration(
     let _ = started_at;
 
     format!(
-        "🚨 Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?",
+        "Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?",
     )
 }
 
 pub fn format_ride_safe_message() -> &'static str {
-    "Ride safe — we’ll keep tracking in the background for your safety."
+    "Ride safe - we'll keep tracking in the background for your safety."
 }
 
 pub fn format_session_finished_message() -> &'static str {
@@ -1590,7 +1590,7 @@ pub fn format_session_finished_message() -> &'static str {
 }
 
 pub fn format_theft_warning_message() -> &'static str {
-    "🚨 THEFT SUSPECTED 🚨\nThis was NOT you.\n\nAct fast — the first few minutes are crucial.\nTap below to start live tracking."
+    "THEFT SUSPECTED\nThis was NOT you.\n\nAct fast - the first few minutes are crucial.\nTap below to start live tracking."
 }
 
 pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
@@ -1620,7 +1620,7 @@ pub fn format_theft_engine_off_message(
         .unwrap_or_else(|| "Location is not available yet.".to_string());
 
     format!(
-        "🚨 URGENT THEFT ALERT 🚨\nYour motor has STOPPED / ENGINE OFF detected.\n\n📍 Last Known Location:\n{}\n\n⚠️ This may indicate the motor has been hidden or moved into an indoor area.\nGPS tracking can still continue in battery mode (as long as device power remains).\n\nEngine OFF since: {}\nDuration: {:02}:{:02}:{:02} (until now)\n\n➡️ Recommended: Check the location immediately or contact local authorities.",
+        "URGENT THEFT ALERT\nYour motor has STOPPED / ENGINE OFF detected.\n\nLast Known Location:\n{}\n\nWarning: This may indicate the motor has been hidden or moved into an indoor area.\nGPS tracking can still continue in battery mode (as long as device power remains).\n\nEngine OFF since: {}\nDuration: {:02}:{:02}:{:02} (until now)\n\nRecommended: Check the location immediately or contact local authorities.",
         location_link,
         engine_off_wib.format("%d %b %Y %H:%M WIB"),
         hours,
@@ -1635,7 +1635,7 @@ pub fn format_stream_location_message(live_tracking_link: Option<&str>) -> Strin
         .to_string();
 
     format!(
-        "📍 Live Tracking Activated\nTrack your motor in real-time using this link:\n{}\n\n🔗 This link is shareable — send it to someone you trust if you need help tracking.",
+        "Live Tracking Activated\nTrack your motor in real-time using this link:\n{}\n\nThis link is shareable - send it to someone you trust if you need help tracking.",
         link
     )
 }
@@ -1675,7 +1675,7 @@ pub fn format_latest_motor_status_initial_message(
 }
 
 pub fn format_contact_support_message() -> &'static str {
-    "1. Hubungi Call Center 110\n'Halo Polisi, saya ingin melaporkan pencurian motor yang baru saja terjadi. Posisi pelaku sedang terpantau di GPS saya. Mohon bantuan untuk pengejaran.'\n\n2. Datangi SPKT Polsek/Polres\nLangsung ke bagian SPKT (Sentra Pelayanan Kepolisian Terpadu). Tunjukkan aplikasi GPS yang sedang live kepada petugas. Polisi akan langsung berkoordinasi dengan tim Buser/Resmob untuk bergerak ke titik tersebut.\n\n3. Bawa Bukti Kepemilikan\nSiapkan STNK/BPKB (asli atau foto) dan KTP. Polisi butuh ini untuk memastikan itu benar motor Anda sebelum mereka melakukan penindakan atau penangkapan.\n\n 4. Minta Pendampingan Unit Lapangan\nSetelah melapor, minta izin untuk mendampingi petugas (di mobil patroli) atau memberikan akses akun GPS Anda kepada petugas agar mereka bisa mengejar target secara akurat.\n\n⚠️ PENTING: Jangan mendatangi lokasi GPS sendirian. Biarkan polisi yang melakukan tindakan penggerebekan demi keselamatan Anda."
+    "1. Hubungi Call Center 110\n'Halo Polisi, saya ingin melaporkan pencurian motor yang baru saja terjadi. Posisi pelaku sedang terpantau di GPS saya. Mohon bantuan untuk pengejaran.'\n\n2. Datangi SPKT Polsek/Polres\nLangsung ke bagian SPKT (Sentra Pelayanan Kepolisian Terpadu). Tunjukkan aplikasi GPS yang sedang live kepada petugas. Polisi akan langsung berkoordinasi dengan tim Buser/Resmob untuk bergerak ke titik tersebut.\n\n3. Bawa Bukti Kepemilikan\nSiapkan STNK/BPKB (asli atau foto) dan KTP. Polisi butuh ini untuk memastikan itu benar motor Anda sebelum mereka melakukan penindakan atau penangkapan.\n\n4. Minta Pendampingan Unit Lapangan\nSetelah melapor, minta izin untuk mendampingi petugas (di mobil patroli) atau memberikan akses akun GPS Anda kepada petugas agar mereka bisa mengejar target secara akurat.\n\nPENTING: Jangan mendatangi lokasi GPS sendirian. Biarkan polisi yang melakukan tindakan penggerebekan demi keselamatan Anda."
 }
 
 pub fn format_ride_summary_message(
@@ -1710,7 +1710,7 @@ pub fn format_ride_summary_message(
     };
 
     format!(
-        "🏍️ Ride Summary ({})\n⏱️ {} → {} WIB ({})\n📍 {:.2} km\n⚡ Avg Speed: {:.2} km/h\n\n🗺️ History: [View Route]\n{}\n\n📌 Last Location: [Open in Google Maps]\n{}",
+        "Ride Summary ({})\n{} -> {} WIB ({})\n{:.2} km\nAvg Speed: {:.2} km/h\n\nHistory: [View Route]\n{}\n\nLast Location: [Open in Google Maps]\n{}",
         started_wib.format("%d %b %Y"),
         started_wib.format("%H:%M"),
         off_wib.format("%H:%M"),
@@ -1768,15 +1768,6 @@ fn format_latest_motor_status_message_at(
     let signal_status = heartbeat
         .map(|value| connection_status_label(value.gsm_signal_strength))
         .unwrap_or("Unknown");
-    let gps_tracking_status = heartbeat
-        .map(|value| {
-            if value.gps_tracking_on {
-                "Active"
-            } else {
-                "Inactive"
-            }
-        })
-        .unwrap_or("Unknown");
     let battery_level = heartbeat
         .map(|value| gps_battery_label(value.voltage_level).to_string())
         .unwrap_or_else(|| "Unknown".to_string());
@@ -1794,7 +1785,6 @@ fn format_latest_motor_status_message_at(
         })
         .unwrap_or("");
     let session_started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
-    let session_status = session.session_status.as_str();
     let session_ended = session
         .resolved_at
         .map(|value| {
@@ -1802,32 +1792,23 @@ fn format_latest_motor_status_message_at(
             value.format("%H:%M:%S WIB").to_string()
         })
         .unwrap_or_else(|| "ONGOING".to_string());
-    let report_time_wib = wib.from_utc_datetime(&reference_time.naive_utc());
     let session_timing = if session_ended == "ONGOING" {
         format!(
-            "Tracking started at {} and is still ongoing.",
+            "Session active since {}",
             session_started_wib.format("%H:%M:%S WIB"),
         )
     } else {
-        format!(
-            "Tracking started at {} and ended at {}.",
-            session_started_wib.format("%H:%M:%S WIB"),
-            session_ended,
-        )
+        format!("Session ended at {}", session_ended)
     };
 
     format!(
-        "Motor Diagnostics Report ({} — {} WIB)\n\nYour motor was last detected {} (updated {}).\nLocation:\n{}\n\nEngine status: {}\nGPS signal: {} (Tracking {})\nDevice power: {}\n\nSession status: {}\n{}{}",
-        report_time_wib.format("%d %b %Y"),
-        report_time_wib.format("%H:%M"),
+        "{}\n\n{} - Updated {}\n\nEngine: {}\nGPS: {}\nPower: {}\n\n{}{}",
+        map_link,
         movement_status,
         last_update,
-        map_link,
         engine_status,
         signal_status.to_uppercase(),
-        gps_tracking_status.to_uppercase(),
         battery_level.to_uppercase(),
-        session_status.to_uppercase(),
         session_timing,
         battery_warning,
     )
@@ -1875,7 +1856,7 @@ pub fn format_ride_session_status_message(
 
     format!(
         "Current Session\nYou started riding at {}.\nIt has been {:02}:{:02}:{:02} on the road so far.\nGPS tracking is currently {} and your connection quality is {}.",
-        start.format("%d %b %Y • %H:%M WIB"),
+        start.format("%d %b %Y - %H:%M WIB"),
         hours,
         minutes,
         seconds,
@@ -1916,7 +1897,7 @@ pub fn format_latest_location_message(location: &StoredLocation) -> String {
         .unwrap_or_else(|| "unknown".to_string());
 
     format!(
-        "Latest location\nIMEI: {}\nGPS time: {}\nServer last seen: {}\nLatitude: {}\nLongitude: {}\nSpeed: {} km/h\nCourse: {}°\nSatellites: {}",
+        "Latest location\nIMEI: {}\nGPS time: {}\nServer last seen: {}\nLatitude: {}\nLongitude: {}\nSpeed: {} km/h\nCourse: {} deg\nSatellites: {}",
         location.imei,
         gps_timestamp,
         last_seen_at,
@@ -1929,12 +1910,11 @@ pub fn format_latest_location_message(location: &StoredLocation) -> String {
 }
 
 fn format_start_status_message() -> String {
-    "🛵 welcome to @tryheartbeatsbot 🛣 \n\nclick /help for more information.".to_string()
+    "Welcome to @tryheartbeatsbot\n\nClick /help for more information.".to_string()
 }
 
 fn format_subscription_menu_message() -> String {
-    "Get full access to Heartbeats and monitor your motorcycle in real-time, anytime."
-        .to_string()
+    "Get full access to Heartbeats and monitor your motorcycle in real-time, anytime.".to_string()
 }
 
 fn build_status_session(
@@ -1972,7 +1952,7 @@ pub fn format_payment_success_message(current_period_end_at: Option<DateTime<Utc
         .unwrap_or_else(|| "unknown".to_string());
 
     format!(
-        "✅ Payment Successful\n\nYour Heartbeats access is now active until {active_until}.\n\nYou're all set to start tracking and monitoring your motorcycle.\nType /start to begin or /help to see available features."
+        "Payment Successful\n\nYour Heartbeats access is now active until {active_until}.\n\nYou're all set to start tracking and monitoring your motorcycle.\nType /start to begin or /help to see available features."
     )
 }
 
@@ -3034,13 +3014,13 @@ mod tests {
             Some(&summary),
             Some(&latest_location),
         );
-        assert!(text.contains("🏍️ Ride Summary (17 Apr 2026)"));
-        assert!(text.contains("⏱️ 17:00 → 17:05 WIB (5m 0s)"));
-        assert!(text.contains("📍 3.25 km"));
-        assert!(text.contains("⚡ Avg Speed: 39.00 km/h"));
-        assert!(text.contains("🗺️ History: [View Route]"));
+        assert!(text.contains("Ride Summary (17 Apr 2026)"));
+        assert!(text.contains("17:00 -> 17:05 WIB (5m 0s)"));
+        assert!(text.contains("3.25 km"));
+        assert!(text.contains("Avg Speed: 39.00 km/h"));
+        assert!(text.contains("History: [View Route]"));
         assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z"));
-        assert!(text.contains("📌 Last Location: [Open in Google Maps]"));
+        assert!(text.contains("Last Location: [Open in Google Maps]"));
         assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
     }
 
@@ -3055,10 +3035,10 @@ mod tests {
         let text = format_stream_location_message(Some(
             "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z",
         ));
-        assert!(text.contains("📍 Live Tracking Activated"));
+        assert!(text.contains("Live Tracking Activated"));
         assert!(text.contains("Track your motor in real-time using this link:"));
         assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"));
-        assert!(text.contains("🔗 This link is shareable"));
+        assert!(text.contains("This link is shareable"));
     }
 
     #[test]
@@ -3215,15 +3195,12 @@ mod tests {
             Some(&location),
             Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 19).unwrap(),
         );
-        assert!(text.contains("Motor Diagnostics Report (17 Apr 2026"));
-        assert!(text.contains("Location:"));
         assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
-        assert!(text.contains("Your motor was last detected STATIONARY (updated 12s ago)."));
-        assert!(text.contains("Engine status: OFF"));
-        assert!(text.contains("GPS signal: OK (Tracking ACTIVE)"));
-        assert!(text.contains("Device power: UNKNOWN"));
-        assert!(text.contains("Session status: REPORTED_THEFT"));
-        assert!(text.contains("Tracking started at 17:00:00 WIB and ended at 17:05:07 WIB."));
+        assert!(text.contains("STATIONARY - Updated 12s ago"));
+        assert!(text.contains("Engine: OFF"));
+        assert!(text.contains("GPS: OK"));
+        assert!(text.contains("Power: UNKNOWN"));
+        assert!(text.contains("Session ended at 17:05:07 WIB"));
     }
 
     #[test]
@@ -3243,9 +3220,8 @@ mod tests {
 
         let text = format_latest_motor_status_initial_message(&session, None, None, requested_at);
         assert!(text.contains("Location is not available yet."));
-        assert!(text.contains("Your motor was last detected UNKNOWN (updated unknown)."));
-        assert!(text.contains("Session status: REPORTED_THEFT"));
-        assert!(text.contains("Tracking started at 17:00:00 WIB and is still ongoing."));
+        assert!(text.contains("UNKNOWN - Updated unknown"));
+        assert!(text.contains("Session active since 17:00:00 WIB"));
     }
 
     #[test]
@@ -3281,7 +3257,7 @@ mod tests {
             None,
             Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
         );
-        assert!(text.contains("Device power: EMPTY"));
+        assert!(text.contains("Power: EMPTY"));
         assert!(text.contains("Warning: GPS device battery is empty."));
     }
 

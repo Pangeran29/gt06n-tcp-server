@@ -170,7 +170,7 @@ impl MidtransClient {
                     price: 5_000,
                     quantity: 1,
                     name: "Server".to_string(),
-                }
+                },
             ]
         } else {
             vec![MidtransItemDetail {
