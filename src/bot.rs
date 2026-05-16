@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -64,6 +64,29 @@ enum TheftAlertAction {
     StreamLocation { session_id: Option<i64> },
     CheckLatestStatus { session_id: Option<i64> },
     ContactSupport { session_id: Option<i64> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsKind {
+    Sessions,
+    Metrics,
+    TotalKm,
+    TotalDrivingTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsRange {
+    Select,
+    Today,
+    Yesterday,
+    Month,
+    Custom,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AnalyticsAction {
+    kind: AnalyticsKind,
+    range: AnalyticsRange,
 }
 
 impl SessionAction {
@@ -134,6 +157,84 @@ impl TheftAlertAction {
     }
 }
 
+impl AnalyticsKind {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "sessions" => Self::Sessions,
+            "metrics" => Self::Metrics,
+            "km" => Self::TotalKm,
+            "time" => Self::TotalDrivingTime,
+            _ => return None,
+        })
+    }
+
+    fn callback_value(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Metrics => "metrics",
+            Self::TotalKm => "km",
+            Self::TotalDrivingTime => "time",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "driving session",
+            Self::Metrics => "metrics",
+            Self::TotalKm => "total km",
+            Self::TotalDrivingTime => "total driving time",
+        }
+    }
+}
+
+impl AnalyticsRange {
+    fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "select" => Self::Select,
+            "today" => Self::Today,
+            "yesterday" => Self::Yesterday,
+            "month" => Self::Month,
+            "custom" => Self::Custom,
+            _ => return None,
+        })
+    }
+
+    fn callback_value(self) -> &'static str {
+        match self {
+            Self::Select => "select",
+            Self::Today => "today",
+            Self::Yesterday => "yesterday",
+            Self::Month => "month",
+            Self::Custom => "custom",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Select => "Select range",
+            Self::Today => "Today",
+            Self::Yesterday => "Yesterday",
+            Self::Month => "This month",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+impl AnalyticsAction {
+    fn parse(data: &str) -> Option<Self> {
+        let mut parts = data.split(':');
+        let prefix = parts.next()?;
+        let kind = AnalyticsKind::parse(parts.next()?)?;
+        let range = AnalyticsRange::parse(parts.next()?)?;
+
+        if prefix != "analytics" || parts.next().is_some() {
+            return None;
+        }
+
+        Some(Self { kind, range })
+    }
+}
+
 impl BotCommand {
     pub fn parse(text: &str) -> Option<Self> {
         let command = text.split_whitespace().next()?;
@@ -162,6 +263,7 @@ pub struct TelegramBot {
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
+const MAX_DRIVING_SESSION_REPORT_ITEMS: usize = 10;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
@@ -589,6 +691,12 @@ impl TelegramBot {
             return Ok(());
         };
 
+        if let Some(kind) = get_pending_analytics_kind(self.database.pool(), chat_id).await? {
+            return self
+                .handle_custom_analytics_input(chat_id, telegram_user_id, &user, kind, text)
+                .await;
+        }
+
         if user.registration_status != TelegramRegistrationStatus::AwaitingImei {
             return Ok(());
         }
@@ -640,6 +748,49 @@ impl TelegramBot {
             warn!(error = %error, "failed to send bind-success sticker");
         }
         self.send_subscription_required_menu(chat_id).await?;
+
+        Ok(())
+    }
+
+    async fn handle_custom_analytics_input(
+        &self,
+        chat_id: i64,
+        telegram_user_id: i64,
+        user: &TelegramUserRecord,
+        kind: AnalyticsKind,
+        text: &str,
+    ) -> Result<(), BotError> {
+        let Some(imei) = user.bound_imei.as_deref() else {
+            clear_pending_analytics_kind(self.database.pool(), chat_id).await?;
+            self.send_message(
+                chat_id,
+                "This Telegram account is not bound yet. Use /start first.",
+            )
+            .await?;
+            return Ok(());
+        };
+
+        if !has_active_subscription(self.database.pool(), telegram_user_id, Utc::now()).await? {
+            clear_pending_analytics_kind(self.database.pool(), chat_id).await?;
+            self.send_subscription_required_menu(chat_id).await?;
+            return Ok(());
+        }
+
+        let range = match parse_custom_analytics_range(text) {
+            Some(range) if range.started_at < range.ended_at => range,
+            _ => {
+                self.send_message(
+                    chat_id,
+                    "Invalid date range. Please send it like:\n2026-05-16 08:00 to 2026-05-16 18:00",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        clear_pending_analytics_kind(self.database.pool(), chat_id).await?;
+        self.send_analytics_report(chat_id, imei, kind, range, Utc::now())
+            .await?;
 
         Ok(())
     }
@@ -870,6 +1021,26 @@ impl TelegramBot {
         };
         let chat_id = message.chat.id;
 
+        if let Some(action) = AnalyticsAction::parse(data) {
+            if !self
+                .ensure_active_subscription_for_callback(
+                    &callback_query.id,
+                    chat_id,
+                    callback_query.from.id,
+                    message.message_id,
+                )
+                .await?
+            {
+                return Ok(());
+            }
+
+            self.answer_callback_query(&callback_query.id, "", false)
+                .await?;
+            return self
+                .handle_analytics_action(chat_id, callback_query.from.id, action)
+                .await;
+        }
+
         if let Some(action) = TheftAlertAction::parse(data) {
             if action.requires_active_subscription()
                 && !self
@@ -968,6 +1139,181 @@ impl TelegramBot {
                     .await?;
             }
         }
+
+        Ok(())
+    }
+
+    async fn handle_analytics_action(
+        &self,
+        chat_id: i64,
+        telegram_user_id: i64,
+        action: AnalyticsAction,
+    ) -> Result<(), BotError> {
+        let Some(user) =
+            fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?
+        else {
+            self.send_message(
+                chat_id,
+                "This Telegram account is not bound yet. Use /start first.",
+            )
+            .await?;
+            return Ok(());
+        };
+
+        let Some(imei) = user.bound_imei.as_deref() else {
+            self.send_message(
+                chat_id,
+                "This Telegram account is not bound yet. Use /start first.",
+            )
+            .await?;
+            return Ok(());
+        };
+
+        if action.range == AnalyticsRange::Select {
+            self.send_message_internal(
+                chat_id,
+                &format!("Choose range for {}.", action.kind.label()),
+                Some(analytics_range_keyboard(action.kind)),
+                None,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if action.range == AnalyticsRange::Custom {
+            set_pending_analytics_kind(self.database.pool(), chat_id, action.kind).await?;
+            self.send_message(
+                chat_id,
+                "Send custom range in WIB:\nYYYY-MM-DD HH:mm to YYYY-MM-DD HH:mm\n\nExample:\n2026-05-16 08:00 to 2026-05-16 18:00",
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let range = resolve_preset_analytics_range(action.range, Utc::now())
+            .expect("preset analytics range should resolve");
+        self.send_analytics_report(chat_id, imei, action.kind, range, Utc::now())
+            .await?;
+
+        Ok(())
+    }
+
+    async fn send_analytics_report(
+        &self,
+        chat_id: i64,
+        imei: &str,
+        kind: AnalyticsKind,
+        range: AnalyticsDateRange,
+        reference_time: DateTime<Utc>,
+    ) -> Result<(), BotError> {
+        let text = match kind {
+            AnalyticsKind::Sessions => {
+                let sessions = fetch_analytics_sessions(
+                    self.database.pool(),
+                    imei,
+                    chat_id,
+                    range.started_at,
+                    range.ended_at,
+                    reference_time,
+                )
+                .await?;
+                let mut session_reports = Vec::with_capacity(sessions.len());
+                let effective_range_end = reference_time.min(range.ended_at);
+
+                for session in sessions {
+                    let clipped_start = session.created_at.max(range.started_at);
+                    let clipped_end = session
+                        .resolved_at
+                        .unwrap_or(effective_range_end)
+                        .min(effective_range_end);
+                    let summary = if clipped_start < clipped_end {
+                        fetch_ride_summary(self.database.pool(), imei, clipped_start, clipped_end)
+                            .await?
+                    } else {
+                        Some(RideSummary {
+                            total_distance_km: 0.0,
+                            average_speed_kph: 0.0,
+                        })
+                    };
+
+                    session_reports.push(AnalyticsSessionReport {
+                        session,
+                        clipped_start,
+                        clipped_end,
+                        total_distance_km: summary
+                            .as_ref()
+                            .map(|value| value.total_distance_km)
+                            .unwrap_or(0.0),
+                        route_link: build_history_tracking_link(imei, clipped_start, clipped_end),
+                    });
+                }
+
+                format_driving_sessions_report(&range, &session_reports, reference_time)
+            }
+            AnalyticsKind::Metrics => {
+                let sessions = fetch_analytics_sessions(
+                    self.database.pool(),
+                    imei,
+                    chat_id,
+                    range.started_at,
+                    range.ended_at,
+                    reference_time,
+                )
+                .await?;
+                let effective_range_end = reference_time.min(range.ended_at);
+                let summary = fetch_analytics_ride_summary(
+                    self.database.pool(),
+                    imei,
+                    &sessions,
+                    range.started_at,
+                    effective_range_end,
+                )
+                .await?;
+                let total_seconds =
+                    total_clipped_session_seconds(&sessions, range.started_at, effective_range_end);
+
+                format_metrics_report(&range, Some(&summary), total_seconds)
+            }
+            AnalyticsKind::TotalKm => {
+                let sessions = fetch_analytics_sessions(
+                    self.database.pool(),
+                    imei,
+                    chat_id,
+                    range.started_at,
+                    range.ended_at,
+                    reference_time,
+                )
+                .await?;
+                let effective_range_end = reference_time.min(range.ended_at);
+                let summary = fetch_analytics_ride_summary(
+                    self.database.pool(),
+                    imei,
+                    &sessions,
+                    range.started_at,
+                    effective_range_end,
+                )
+                .await?;
+
+                format_total_km_report(&range, Some(&summary))
+            }
+            AnalyticsKind::TotalDrivingTime => {
+                let sessions = fetch_analytics_sessions(
+                    self.database.pool(),
+                    imei,
+                    chat_id,
+                    range.started_at,
+                    range.ended_at,
+                    reference_time,
+                )
+                .await?;
+                let effective_range_end = reference_time.min(range.ended_at);
+                let total_seconds =
+                    total_clipped_session_seconds(&sessions, range.started_at, effective_range_end);
+                format_total_driving_time_report(&range, total_seconds)
+            }
+        };
+
+        self.send_message(chat_id, &text).await?;
 
         Ok(())
     }
@@ -1412,16 +1758,61 @@ fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
 
 fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
-        inline_keyboard: vec![vec![
-            InlineKeyboardButton {
-                text: "stream location".to_string(),
-                callback_data: theft_alert_callback_data("stream_location", None),
-            },
-            InlineKeyboardButton {
-                text: "health check".to_string(),
-                callback_data: theft_alert_callback_data("check_latest_status", None),
-            },
-        ]],
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: "stream location".to_string(),
+                    callback_data: theft_alert_callback_data("stream_location", None),
+                },
+                InlineKeyboardButton {
+                    text: "health check".to_string(),
+                    callback_data: theft_alert_callback_data("check_latest_status", None),
+                },
+            ],
+            vec![
+                InlineKeyboardButton {
+                    text: "driving session".to_string(),
+                    callback_data: analytics_callback_data(
+                        AnalyticsKind::Sessions,
+                        AnalyticsRange::Select,
+                    ),
+                },
+                InlineKeyboardButton {
+                    text: "metrics".to_string(),
+                    callback_data: analytics_callback_data(
+                        AnalyticsKind::Metrics,
+                        AnalyticsRange::Select,
+                    ),
+                },
+            ],
+        ],
+    }
+}
+
+fn analytics_range_keyboard(kind: AnalyticsKind) -> InlineKeyboardMarkup {
+    InlineKeyboardMarkup {
+        inline_keyboard: vec![
+            vec![
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Today.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Today),
+                },
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Yesterday.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Yesterday),
+                },
+            ],
+            vec![
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Month.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Month),
+                },
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Custom.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Custom),
+                },
+            ],
+        ],
     }
 }
 
@@ -1439,6 +1830,14 @@ fn theft_alert_callback_data(action: &str, session_id: Option<i64>) -> String {
         Some(session_id) => format!("theft_alert:{action}:{session_id}"),
         None => format!("theft_alert:{action}"),
     }
+}
+
+fn analytics_callback_data(kind: AnalyticsKind, range: AnalyticsRange) -> String {
+    format!(
+        "analytics:{}:{}",
+        kind.callback_value(),
+        range.callback_value()
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1472,6 +1871,30 @@ pub struct StoredLocation {
 pub struct RideSummary {
     pub total_distance_km: f64,
     pub average_speed_kph: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticsDateRange {
+    pub label: String,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyticsSession {
+    pub id: i64,
+    pub session_status: String,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyticsSessionReport {
+    pub session: AnalyticsSession,
+    pub clipped_start: DateTime<Utc>,
+    pub clipped_end: DateTime<Utc>,
+    pub total_distance_km: f64,
+    pub route_link: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1576,9 +1999,8 @@ pub fn format_engine_on_confirmation_message_with_duration(
     let _ = heartbeat;
     let _ = started_at;
 
-    format!(
-        "Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?",
-    )
+    "Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?"
+        .to_string()
 }
 
 pub fn format_ride_safe_message() -> &'static str {
@@ -1917,6 +2339,224 @@ fn format_subscription_menu_message() -> String {
     "Get full access to Heartbeats and monitor your motorcycle in real-time, anytime.".to_string()
 }
 
+fn resolve_preset_analytics_range(
+    range: AnalyticsRange,
+    reference_time: DateTime<Utc>,
+) -> Option<AnalyticsDateRange> {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let reference_wib = reference_time.with_timezone(&wib);
+    let today = reference_wib.date_naive();
+    let today_start = wib_datetime_to_utc(today.and_hms_opt(0, 0, 0)?);
+
+    match range {
+        AnalyticsRange::Today => Some(AnalyticsDateRange {
+            label: "Today".to_string(),
+            started_at: today_start,
+            ended_at: reference_time,
+        }),
+        AnalyticsRange::Yesterday => {
+            let yesterday = today.checked_sub_signed(chrono::Duration::days(1))?;
+            let started_at = wib_datetime_to_utc(yesterday.and_hms_opt(0, 0, 0)?);
+            let ended_at = today_start;
+
+            Some(AnalyticsDateRange {
+                label: "Yesterday".to_string(),
+                started_at,
+                ended_at,
+            })
+        }
+        AnalyticsRange::Month => {
+            let month_start_date = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)?;
+            Some(AnalyticsDateRange {
+                label: "This month".to_string(),
+                started_at: wib_datetime_to_utc(month_start_date.and_hms_opt(0, 0, 0)?),
+                ended_at: reference_time,
+            })
+        }
+        AnalyticsRange::Select | AnalyticsRange::Custom => None,
+    }
+}
+
+fn parse_custom_analytics_range(value: &str) -> Option<AnalyticsDateRange> {
+    let (start, end) = value.trim().split_once(" to ")?;
+    let started_at = parse_wib_datetime(start.trim())?;
+    let ended_at = parse_wib_datetime(end.trim())?;
+
+    Some(AnalyticsDateRange {
+        label: "Custom range".to_string(),
+        started_at,
+        ended_at,
+    })
+}
+
+fn parse_wib_datetime(value: &str) -> Option<DateTime<Utc>> {
+    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").ok()?;
+    Some(wib_datetime_to_utc(parsed))
+}
+
+fn wib_datetime_to_utc(value: NaiveDateTime) -> DateTime<Utc> {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    wib.from_local_datetime(&value)
+        .single()
+        .expect("WIB has no ambiguous local datetime")
+        .with_timezone(&Utc)
+}
+
+fn format_analytics_range_label(range: &AnalyticsDateRange) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let started_at = range.started_at.with_timezone(&wib);
+    let ended_at = range.ended_at.with_timezone(&wib);
+
+    format!(
+        "{}\n{} - {} WIB",
+        range.label,
+        started_at.format("%d %b %Y %H:%M"),
+        ended_at.format("%d %b %Y %H:%M")
+    )
+}
+
+fn format_duration_compact_from_seconds(total_seconds: u64) -> String {
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn clipped_session_seconds(
+    session: &AnalyticsSession,
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> u64 {
+    let effective_end = session.resolved_at.unwrap_or(range_end);
+    let clipped_start = session.created_at.max(range_start);
+    let clipped_end = effective_end.min(range_end);
+
+    clipped_end
+        .signed_duration_since(clipped_start)
+        .to_std()
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn total_clipped_session_seconds(
+    sessions: &[AnalyticsSession],
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> u64 {
+    sessions
+        .iter()
+        .map(|session| clipped_session_seconds(session, range_start, range_end))
+        .sum()
+}
+
+fn format_driving_sessions_report(
+    range: &AnalyticsDateRange,
+    sessions: &[AnalyticsSessionReport],
+    reference_time: DateTime<Utc>,
+) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let mut lines = vec![
+        "Driving Sessions".to_string(),
+        format_analytics_range_label(range),
+        String::new(),
+    ];
+
+    if sessions.is_empty() {
+        lines.push("No driving sessions found in this range.".to_string());
+        return lines.join("\n");
+    }
+
+    for (index, report) in sessions
+        .iter()
+        .take(MAX_DRIVING_SESSION_REPORT_ITEMS)
+        .enumerate()
+    {
+        let start = report.session.created_at.with_timezone(&wib);
+        let end = report
+            .session
+            .resolved_at
+            .map(|value| value.with_timezone(&wib).format("%H:%M").to_string())
+            .unwrap_or_else(|| "ONGOING".to_string());
+        let effective_range_end = reference_time.min(range.ended_at);
+        let duration_seconds =
+            clipped_session_seconds(&report.session, range.started_at, effective_range_end);
+        let route_link = report
+            .route_link
+            .as_deref()
+            .unwrap_or("Route link is not available yet.");
+
+        lines.push(format!(
+            "{}. {} -> {} ({}) - {}\n   Total KM: {:.2} km\n   Route: {}",
+            index + 1,
+            start.format("%d %b %H:%M"),
+            end,
+            format_duration_compact_from_seconds(duration_seconds),
+            report.session.session_status,
+            report.total_distance_km,
+            route_link,
+        ));
+    }
+
+    if sessions.len() > MAX_DRIVING_SESSION_REPORT_ITEMS {
+        lines.push(format!(
+            "Showing {} of {} sessions. Use a smaller custom range for more detail.",
+            MAX_DRIVING_SESSION_REPORT_ITEMS,
+            sessions.len()
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_total_km_report(range: &AnalyticsDateRange, summary: Option<&RideSummary>) -> String {
+    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
+    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
+
+    format!(
+        "Total KM\n{}\n\nTotal distance: {:.2} km\nAverage speed: {:.2} km/h",
+        format_analytics_range_label(range),
+        total_distance_km,
+        average_speed_kph
+    )
+}
+
+fn format_metrics_report(
+    range: &AnalyticsDateRange,
+    summary: Option<&RideSummary>,
+    total_seconds: u64,
+) -> String {
+    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
+    let driving_hours = total_seconds as f64 / 3600.0;
+    let average_speed_kph = if driving_hours > 0.0 {
+        total_distance_km / driving_hours
+    } else {
+        0.0
+    };
+
+    format!(
+        "Metrics\n{}\n\nTotal driving time: {}\nTotal distance: {:.2} km\nAverage speed: {:.2} km/h",
+        format_analytics_range_label(range),
+        format_duration_compact_from_seconds(total_seconds),
+        total_distance_km,
+        average_speed_kph,
+    )
+}
+
+fn format_total_driving_time_report(range: &AnalyticsDateRange, total_seconds: u64) -> String {
+    format!(
+        "Total Driving Time\n{}\n\nTotal driving time: {}",
+        format_analytics_range_label(range),
+        format_duration_compact_from_seconds(total_seconds)
+    )
+}
+
 fn build_status_session(
     imei: &str,
     chat_id: i64,
@@ -2005,6 +2645,52 @@ fn haversine_distance_km(
     let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
 
     earth_radius_km * c
+}
+
+fn total_route_distance_km(points: &[(f64, f64)]) -> f64 {
+    let points = filter_gps_spike_outliers(points);
+
+    points
+        .windows(2)
+        .map(|window| {
+            let (start_latitude, start_longitude) = window[0];
+            let (end_latitude, end_longitude) = window[1];
+
+            haversine_distance_km(start_latitude, start_longitude, end_latitude, end_longitude)
+        })
+        .sum()
+}
+
+fn filter_gps_spike_outliers(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    if points.len() < 3 {
+        return points.to_vec();
+    }
+
+    const SPIKE_KM: f64 = 0.08;
+
+    let mut cleaned = Vec::with_capacity(points.len());
+    cleaned.push(points[0]);
+
+    for index in 1..points.len() - 1 {
+        let previous = points[index - 1];
+        let current = points[index];
+        let next = points[index + 1];
+
+        let distance_from_previous =
+            haversine_distance_km(previous.0, previous.1, current.0, current.1);
+        let distance_to_next = haversine_distance_km(current.0, current.1, next.0, next.1);
+        let neighbour_distance = haversine_distance_km(previous.0, previous.1, next.0, next.1);
+        let is_spike = distance_from_previous > SPIKE_KM
+            && distance_to_next > SPIKE_KM
+            && neighbour_distance < distance_from_previous.max(distance_to_next) * 0.5;
+
+        if !is_spike {
+            cleaned.push(current);
+        }
+    }
+
+    cleaned.push(points[points.len() - 1]);
+    cleaned
 }
 
 pub async fn ensure_admin_chat_id(pool: &sqlx::PgPool, chat_id: i64) -> Result<(), sqlx::Error> {
@@ -2264,6 +2950,81 @@ pub async fn set_state_i64(pool: &sqlx::PgPool, key: &str, value: i64) -> Result
     .await?;
 
     Ok(())
+}
+
+pub async fn get_state_string(
+    pool: &sqlx::PgPool,
+    key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let row = sqlx::query("SELECT state_value FROM telegram_bot_state WHERE state_key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(row.map(|row| row.get("state_value")))
+}
+
+pub async fn set_state_string(
+    pool: &sqlx::PgPool,
+    key: &str,
+    value: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        INSERT INTO telegram_bot_state (state_key, state_value, updated_at)
+        VALUES ($1, $2, NOW())
+        ON CONFLICT (state_key) DO UPDATE
+        SET state_value = EXCLUDED.state_value,
+            updated_at = EXCLUDED.updated_at
+        "#,
+    )
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_state_key(pool: &sqlx::PgPool, key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM telegram_bot_state WHERE state_key = $1")
+        .bind(key)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+fn pending_analytics_state_key(chat_id: i64) -> String {
+    format!("analytics_pending:{chat_id}")
+}
+
+async fn get_pending_analytics_kind(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+) -> Result<Option<AnalyticsKind>, sqlx::Error> {
+    let key = pending_analytics_state_key(chat_id);
+
+    Ok(get_state_string(pool, &key)
+        .await?
+        .and_then(|value| AnalyticsKind::parse(&value)))
+}
+
+async fn set_pending_analytics_kind(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    kind: AnalyticsKind,
+) -> Result<(), sqlx::Error> {
+    let key = pending_analytics_state_key(chat_id);
+    set_state_string(pool, &key, kind.callback_value()).await
+}
+
+async fn clear_pending_analytics_kind(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+) -> Result<(), sqlx::Error> {
+    let key = pending_analytics_state_key(chat_id);
+    delete_state_key(pool, &key).await
 }
 
 pub async fn fetch_new_heartbeats(
@@ -2748,7 +3509,7 @@ pub async fn fetch_ride_summary(
         WHERE imei = $1
           AND server_received_at >= $2
           AND server_received_at <= $3
-        ORDER BY server_received_at ASC
+        ORDER BY server_received_at ASC, id ASC
         "#,
     )
     .bind(imei)
@@ -2764,20 +3525,11 @@ pub async fn fetch_ride_summary(
         }));
     }
 
-    let mut total_distance_km = 0.0;
-    let mut previous: Option<(f64, f64)> = None;
-
-    for row in rows {
-        let latitude: f64 = row.get("latitude");
-        let longitude: f64 = row.get("longitude");
-
-        if let Some((previous_latitude, previous_longitude)) = previous {
-            total_distance_km +=
-                haversine_distance_km(previous_latitude, previous_longitude, latitude, longitude);
-        }
-
-        previous = Some((latitude, longitude));
-    }
+    let points = rows
+        .into_iter()
+        .map(|row| (row.get("latitude"), row.get("longitude")))
+        .collect::<Vec<_>>();
+    let total_distance_km = total_route_distance_km(&points);
 
     let duration_hours = ended_at
         .signed_duration_since(started_at)
@@ -2795,6 +3547,82 @@ pub async fn fetch_ride_summary(
         total_distance_km,
         average_speed_kph,
     }))
+}
+
+async fn fetch_analytics_ride_summary(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    sessions: &[AnalyticsSession],
+    range_start: DateTime<Utc>,
+    range_end: DateTime<Utc>,
+) -> Result<RideSummary, sqlx::Error> {
+    let mut total_distance_km = 0.0;
+    let total_seconds = total_clipped_session_seconds(sessions, range_start, range_end);
+
+    for session in sessions {
+        let clipped_start = session.created_at.max(range_start);
+        let clipped_end = session.resolved_at.unwrap_or(range_end).min(range_end);
+
+        if clipped_start >= clipped_end {
+            continue;
+        }
+
+        let summary = fetch_ride_summary(pool, imei, clipped_start, clipped_end).await?;
+        total_distance_km += summary
+            .as_ref()
+            .map(|value| value.total_distance_km)
+            .unwrap_or(0.0);
+    }
+
+    let driving_hours = total_seconds as f64 / 3600.0;
+    let average_speed_kph = if driving_hours > 0.0 {
+        total_distance_km / driving_hours
+    } else {
+        0.0
+    };
+
+    Ok(RideSummary {
+        total_distance_km,
+        average_speed_kph,
+    })
+}
+
+pub async fn fetch_analytics_sessions(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    chat_id: i64,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+    reference_time: DateTime<Utc>,
+) -> Result<Vec<AnalyticsSession>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND chat_id = $2
+          AND created_at < $4
+          AND COALESCE(resolved_at, $5) > $3
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(imei)
+    .bind(chat_id)
+    .bind(started_at)
+    .bind(ended_at)
+    .bind(reference_time)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| AnalyticsSession {
+            id: row.get("id"),
+            session_status: row.get("session_status"),
+            created_at: row.get("created_at"),
+            resolved_at: row.get("resolved_at"),
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2892,6 +3720,201 @@ mod tests {
         assert_eq!(PaymentAction::parse("payment:subscribe:extra"), None);
         assert_eq!(PaymentAction::parse("payment:buy:yearly"), None);
         assert_eq!(PaymentAction::parse("payment:buy:monthly:extra"), None);
+    }
+
+    #[test]
+    fn parses_analytics_actions() {
+        assert_eq!(
+            AnalyticsAction::parse("analytics:sessions:today"),
+            Some(AnalyticsAction {
+                kind: AnalyticsKind::Sessions,
+                range: AnalyticsRange::Today,
+            })
+        );
+        assert_eq!(
+            AnalyticsAction::parse("analytics:km:custom"),
+            Some(AnalyticsAction {
+                kind: AnalyticsKind::TotalKm,
+                range: AnalyticsRange::Custom,
+            })
+        );
+        assert_eq!(
+            AnalyticsAction::parse("analytics:time:select"),
+            Some(AnalyticsAction {
+                kind: AnalyticsKind::TotalDrivingTime,
+                range: AnalyticsRange::Select,
+            })
+        );
+        assert_eq!(
+            AnalyticsAction::parse("analytics:metrics:month"),
+            Some(AnalyticsAction {
+                kind: AnalyticsKind::Metrics,
+                range: AnalyticsRange::Month,
+            })
+        );
+        assert_eq!(AnalyticsAction::parse("analytics:distance:today"), None);
+        assert_eq!(AnalyticsAction::parse("analytics:km:today:extra"), None);
+    }
+
+    #[test]
+    fn resolves_analytics_preset_ranges_in_wib() {
+        let reference_time = Utc.with_ymd_and_hms(2026, 5, 16, 8, 40, 9).unwrap();
+
+        let today = resolve_preset_analytics_range(AnalyticsRange::Today, reference_time).unwrap();
+        assert_eq!(
+            today.started_at,
+            Utc.with_ymd_and_hms(2026, 5, 15, 17, 0, 0).unwrap()
+        );
+        assert_eq!(today.ended_at, reference_time);
+
+        let yesterday =
+            resolve_preset_analytics_range(AnalyticsRange::Yesterday, reference_time).unwrap();
+        assert_eq!(
+            yesterday.started_at,
+            Utc.with_ymd_and_hms(2026, 5, 14, 17, 0, 0).unwrap()
+        );
+        assert_eq!(
+            yesterday.ended_at,
+            Utc.with_ymd_and_hms(2026, 5, 15, 17, 0, 0).unwrap()
+        );
+
+        let month = resolve_preset_analytics_range(AnalyticsRange::Month, reference_time).unwrap();
+        assert_eq!(
+            month.started_at,
+            Utc.with_ymd_and_hms(2026, 4, 30, 17, 0, 0).unwrap()
+        );
+        assert_eq!(month.ended_at, reference_time);
+    }
+
+    #[test]
+    fn parses_custom_analytics_range_as_wib() {
+        let range = parse_custom_analytics_range("2026-05-16 08:00 to 2026-05-16 18:30").unwrap();
+
+        assert_eq!(
+            range.started_at,
+            Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap()
+        );
+        assert_eq!(
+            range.ended_at,
+            Utc.with_ymd_and_hms(2026, 5, 16, 11, 30, 0).unwrap()
+        );
+        assert!(parse_custom_analytics_range("2026-05-16 08:00").is_none());
+        assert!(parse_custom_analytics_range("16-05-2026 08:00 to 16-05-2026 18:30").is_none());
+    }
+
+    #[test]
+    fn formats_driving_time_duration() {
+        assert_eq!(format_duration_compact_from_seconds(45), "45s");
+        assert_eq!(format_duration_compact_from_seconds(125), "2m 5s");
+        assert_eq!(format_duration_compact_from_seconds(3661), "1h 1m 1s");
+    }
+
+    #[test]
+    fn formats_combined_metrics_report() {
+        let range = AnalyticsDateRange {
+            label: "Custom range".to_string(),
+            started_at: Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap(),
+            ended_at: Utc.with_ymd_and_hms(2026, 5, 16, 3, 0, 0).unwrap(),
+        };
+        let summary = RideSummary {
+            total_distance_km: 42.0,
+            average_speed_kph: 21.0,
+        };
+
+        let text = format_metrics_report(&range, Some(&summary), 7200);
+
+        assert!(text.contains("Metrics"));
+        assert!(text.contains("Total driving time: 2h 0m 0s"));
+        assert!(text.contains("Total distance: 42.00 km"));
+        assert!(text.contains("Average speed: 21.00 km/h"));
+    }
+
+    #[test]
+    fn formats_driving_sessions_report_with_active_session() {
+        let range = AnalyticsDateRange {
+            label: "Today".to_string(),
+            started_at: Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap(),
+            ended_at: Utc.with_ymd_and_hms(2026, 5, 16, 3, 0, 0).unwrap(),
+        };
+        let sessions = vec![
+            AnalyticsSessionReport {
+                session: AnalyticsSession {
+                    id: 1,
+                    session_status: "finished".to_string(),
+                    created_at: Utc.with_ymd_and_hms(2026, 5, 16, 0, 30, 0).unwrap(),
+                    resolved_at: Some(Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap()),
+                },
+                clipped_start: Utc.with_ymd_and_hms(2026, 5, 16, 0, 30, 0).unwrap(),
+                clipped_end: Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap(),
+                total_distance_km: 2.35,
+                route_link: Some("https://example.test/route?start_at=1&end_at=2".to_string()),
+            },
+            AnalyticsSessionReport {
+                session: AnalyticsSession {
+                    id: 2,
+                    session_status: "confirmed_safe".to_string(),
+                    created_at: Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap(),
+                    resolved_at: None,
+                },
+                clipped_start: Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap(),
+                clipped_end: Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
+                total_distance_km: 0.74,
+                route_link: Some("https://example.test/route?start_at=3&end_at=4".to_string()),
+            },
+        ];
+
+        let text = format_driving_sessions_report(
+            &range,
+            &sessions,
+            Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
+        );
+
+        assert!(text.contains("Driving Sessions"));
+        assert!(text.contains("30m 0s"));
+        assert!(text.contains("ONGOING"));
+        assert!(text.contains("confirmed_safe"));
+        assert!(text.contains("Total KM: 2.35 km"));
+        assert!(text.contains("https://example.test/route?start_at=3&end_at=4"));
+    }
+
+    #[test]
+    fn limits_driving_sessions_report_length() {
+        let range = AnalyticsDateRange {
+            label: "This month".to_string(),
+            started_at: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
+            ended_at: Utc.with_ymd_and_hms(2026, 5, 31, 23, 59, 0).unwrap(),
+        };
+        let sessions = (0..=MAX_DRIVING_SESSION_REPORT_ITEMS)
+            .map(|index| {
+                let created_at = Utc
+                    .with_ymd_and_hms(2026, 5, 16, index as u32, 0, 0)
+                    .unwrap();
+                let resolved_at = created_at + chrono::Duration::minutes(30);
+
+                AnalyticsSessionReport {
+                    session: AnalyticsSession {
+                        id: index as i64 + 1,
+                        session_status: "finished".to_string(),
+                        created_at,
+                        resolved_at: Some(resolved_at),
+                    },
+                    clipped_start: created_at,
+                    clipped_end: resolved_at,
+                    total_distance_km: index as f64,
+                    route_link: Some(format!("https://example.test/route/{index}")),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let text = format_driving_sessions_report(
+            &range,
+            &sessions,
+            Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
+        );
+
+        assert!(text.contains("10. 16 May 16:00"));
+        assert!(!text.contains("11. 16 May 17:00"));
+        assert!(text.contains("Showing 10 of 11 sessions"));
     }
 
     #[test]
@@ -3028,6 +4051,22 @@ mod tests {
     fn computes_haversine_distance() {
         let distance = haversine_distance_km(-6.204066, 106.785514, -6.204500, 106.786000);
         assert!(distance > 0.05);
+    }
+
+    #[test]
+    fn ignores_single_point_gps_spikes_in_route_distance() {
+        let normal_start = (-6.204066, 106.785514);
+        let spike = (-6.000000, 106.000000);
+        let normal_end = (-6.204500, 106.786000);
+
+        let raw_distance = haversine_distance_km(normal_start.0, normal_start.1, spike.0, spike.1)
+            + haversine_distance_km(spike.0, spike.1, normal_end.0, normal_end.1);
+        let cleaned_distance = total_route_distance_km(&[normal_start, spike, normal_end]);
+        let expected_distance =
+            haversine_distance_km(normal_start.0, normal_start.1, normal_end.0, normal_end.1);
+
+        assert!(raw_distance > cleaned_distance * 10.0);
+        assert!((cleaned_distance - expected_distance).abs() < 0.001);
     }
 
     #[test]
@@ -3280,6 +4319,7 @@ mod tests {
 
         set_state_i64(database.pool(), "last_telegram_update_id", 42).await?;
         set_state_i64(database.pool(), "last_notified_heartbeat_id", 77).await?;
+        set_pending_analytics_kind(database.pool(), 12345, AnalyticsKind::TotalKm).await?;
 
         assert_eq!(
             get_state_i64(database.pool(), "last_telegram_update_id").await?,
@@ -3288,6 +4328,15 @@ mod tests {
         assert_eq!(
             get_state_i64(database.pool(), "last_notified_heartbeat_id").await?,
             Some(77)
+        );
+        assert_eq!(
+            get_pending_analytics_kind(database.pool(), 12345).await?,
+            Some(AnalyticsKind::TotalKm)
+        );
+        clear_pending_analytics_kind(database.pool(), 12345).await?;
+        assert_eq!(
+            get_pending_analytics_kind(database.pool(), 12345).await?,
+            None
         );
 
         Ok(())
@@ -3635,6 +4684,226 @@ mod tests {
 
         assert_eq!(session.session_status, "finished");
         assert_eq!(session.resolved_at, Some(ended_at));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetches_analytics_sessions_with_active_and_overlapping_rows(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let imei = "999888777666558";
+        let chat_id = 8_884_000_001_i64;
+
+        sqlx::query("DELETE FROM telegram_engine_sessions WHERE imei = $1 AND chat_id = $2")
+            .bind(imei)
+            .bind(chat_id)
+            .execute(database.pool())
+            .await?;
+
+        let range_start = Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap();
+        let range_end = Utc.with_ymd_and_hms(2026, 5, 16, 3, 0, 0).unwrap();
+        let reference_time = Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_engine_sessions (
+                imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id,
+                session_status, created_at, updated_at, resolved_at
+            )
+            VALUES
+                ($1, $2, 1, 101, NULL, 'finished', $3, NOW(), $4),
+                ($1, $2, 2, 102, NULL, 'confirmed_safe', $5, NOW(), NULL),
+                ($1, $2, 3, 103, NULL, 'finished', $6, NOW(), $7)
+            "#,
+        )
+        .bind(imei)
+        .bind(chat_id)
+        .bind(Utc.with_ymd_and_hms(2026, 5, 16, 0, 30, 0).unwrap())
+        .bind(Utc.with_ymd_and_hms(2026, 5, 16, 1, 30, 0).unwrap())
+        .bind(Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap())
+        .bind(Utc.with_ymd_and_hms(2026, 5, 15, 22, 0, 0).unwrap())
+        .bind(Utc.with_ymd_and_hms(2026, 5, 15, 23, 0, 0).unwrap())
+        .execute(database.pool())
+        .await?;
+
+        let sessions = fetch_analytics_sessions(
+            database.pool(),
+            imei,
+            chat_id,
+            range_start,
+            range_end,
+            reference_time,
+        )
+        .await?;
+        let total_seconds = total_clipped_session_seconds(&sessions, range_start, reference_time);
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(total_seconds, 3600);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetches_total_km_from_device_locations() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let imei = "999888777666559";
+
+        sqlx::query("DELETE FROM device_locations WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+
+        let device_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO devices (imei, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES ($1, NOW(), NOW(), NOW(), NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(imei)
+        .fetch_one(database.pool())
+        .await?;
+
+        let started_at = Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap();
+        let ended_at = Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_locations (
+                device_id, imei, server_received_at, gps_timestamp, protocol_number,
+                packet_family, latitude, longitude, speed_kph, course, course_status,
+                satellite_count, gps_info_length, extra_data_hex, peer_addr
+            )
+            VALUES
+                ($1, $2, $3, $3::timestamp, 18, 'location', -6.204066, 106.785514, 0, 0, 0, 8, 12, '', '127.0.0.1:5000'),
+                ($1, $2, $4, $4::timestamp, 18, 'location', -6.204500, 106.786000, 0, 0, 0, 8, 12, '', '127.0.0.1:5000')
+            "#,
+        )
+        .bind(device_id)
+        .bind(imei)
+        .bind(started_at)
+        .bind(ended_at)
+        .execute(database.pool())
+        .await?;
+
+        let summary = fetch_ride_summary(database.pool(), imei, started_at, ended_at)
+            .await?
+            .expect("summary");
+
+        assert!(summary.total_distance_km > 0.05);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn summarizes_analytics_distance_only_during_clipped_sessions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let imei = "999888777666560";
+
+        sqlx::query("DELETE FROM device_locations WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+
+        let device_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO devices (imei, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES ($1, NOW(), NOW(), NOW(), NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(imei)
+        .fetch_one(database.pool())
+        .await?;
+
+        let outside_before = Utc.with_ymd_and_hms(2026, 5, 16, 1, 20, 0).unwrap();
+        let inside_start = Utc.with_ymd_and_hms(2026, 5, 16, 1, 40, 0).unwrap();
+        let inside_end = Utc.with_ymd_and_hms(2026, 5, 16, 1, 50, 0).unwrap();
+        let outside_after = Utc.with_ymd_and_hms(2026, 5, 16, 2, 10, 0).unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_locations (
+                device_id, imei, server_received_at, gps_timestamp, protocol_number,
+                packet_family, latitude, longitude, speed_kph, course, course_status,
+                satellite_count, gps_info_length, extra_data_hex, peer_addr
+            )
+            VALUES
+                ($1, $2, $3, $3::timestamp, 18, 'location', -6.000000, 106.000000, 0, 0, 0, 8, 12, '', '127.0.0.1:5000'),
+                ($1, $2, $4, $4::timestamp, 18, 'location', -6.204066, 106.785514, 0, 0, 0, 8, 12, '', '127.0.0.1:5000'),
+                ($1, $2, $5, $5::timestamp, 18, 'location', -6.204500, 106.786000, 0, 0, 0, 8, 12, '', '127.0.0.1:5000'),
+                ($1, $2, $6, $6::timestamp, 18, 'location', -7.000000, 107.000000, 0, 0, 0, 8, 12, '', '127.0.0.1:5000')
+            "#,
+        )
+        .bind(device_id)
+        .bind(imei)
+        .bind(outside_before)
+        .bind(inside_start)
+        .bind(inside_end)
+        .bind(outside_after)
+        .execute(database.pool())
+        .await?;
+
+        let range_start = Utc.with_ymd_and_hms(2026, 5, 16, 1, 30, 0).unwrap();
+        let range_end = Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap();
+        let sessions = vec![AnalyticsSession {
+            id: 1,
+            session_status: "finished".to_string(),
+            created_at: Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap(),
+            resolved_at: Some(Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap()),
+        }];
+
+        let ride_only_summary =
+            fetch_analytics_ride_summary(database.pool(), imei, &sessions, range_start, range_end)
+                .await?;
+        let raw_range_summary = fetch_ride_summary(database.pool(), imei, range_start, range_end)
+            .await?
+            .expect("raw range summary");
+        let expected_distance = haversine_distance_km(-6.204066, 106.785514, -6.204500, 106.786000);
+
+        assert!((ride_only_summary.total_distance_km - expected_distance).abs() < 0.001);
+        assert!(raw_range_summary.total_distance_km > ride_only_summary.total_distance_km * 10.0);
+        assert!((ride_only_summary.average_speed_kph - (expected_distance * 2.0)).abs() < 0.001);
 
         Ok(())
     }

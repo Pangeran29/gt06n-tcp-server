@@ -92,6 +92,16 @@ Shown after binding and when an already-bound user sends `/start`.
   - Callback: `theft_alert:check_latest_status`
   - Sends the latest motor diagnostics report.
 
+- `driving session`
+  - Callback: `analytics:sessions:select`
+  - Opens a range picker, then lists driving sessions in that range, including per-session distance and route links.
+
+- `metrics`
+  - Callback: `analytics:metrics:select`
+  - Opens a range picker, then reports total driving time, total distance, and average speed in that range.
+
+Analytics range buttons use `analytics:{kind}:{range}` with `today`, `yesterday`, `month`, or `custom`. Custom range input is plain text in WIB: `YYYY-MM-DD HH:mm to YYYY-MM-DD HH:mm`.
+
 ### Theft-action buttons
 
 Shown after the user reports that an engine-on event was not them.
