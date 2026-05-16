@@ -262,7 +262,7 @@ pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<U
         .replace('<', "&lt;")
         .replace('>', "&gt;");
     format!(
-        "🔒 Heartbeats Monthly Access\nRp 50.000 — 30 Days\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\n⏳ Payment link expires: {}",
+        "🔒 Heartbeats Monthly Access\nRp 35.000 — 30 Days\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\n⏳ Payment link expires: {}",
         expires_at.format("%d %b %Y %H:%M WIB")
     )
 }
