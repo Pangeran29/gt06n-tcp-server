@@ -265,6 +265,8 @@ pub struct TelegramBot {
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
+const RIDING_TIME_MOVING_SPEED_KPH: i32 = 3;
+const RIDING_TIME_MAX_POINT_GAP_SECS: i64 = 5 * 60;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
@@ -1359,6 +1361,7 @@ impl TelegramBot {
                     } else {
                         Some(RideSummary {
                             total_distance_km: 0.0,
+                            riding_seconds: 0,
                             average_speed_kph: 0.0,
                         })
                     };
@@ -1371,6 +1374,10 @@ impl TelegramBot {
                             .as_ref()
                             .map(|value| value.total_distance_km)
                             .unwrap_or(0.0),
+                        riding_seconds: summary
+                            .as_ref()
+                            .map(|value| value.riding_seconds)
+                            .unwrap_or(0),
                         route_link: build_history_tracking_link(imei, clipped_start, clipped_end),
                     });
                 }
@@ -1396,10 +1403,8 @@ impl TelegramBot {
                     effective_range_end,
                 )
                 .await?;
-                let total_seconds =
-                    total_clipped_session_seconds(&sessions, range.started_at, effective_range_end);
 
-                format_metrics_report(&range, Some(&summary), total_seconds)
+                format_metrics_report(&range, Some(&summary))
             }
             AnalyticsKind::TotalKm => {
                 let sessions = fetch_analytics_sessions(
@@ -1434,8 +1439,15 @@ impl TelegramBot {
                 )
                 .await?;
                 let effective_range_end = reference_time.min(range.ended_at);
-                let total_seconds =
-                    total_clipped_session_seconds(&sessions, range.started_at, effective_range_end);
+                let summary = fetch_analytics_ride_summary(
+                    self.database.pool(),
+                    imei,
+                    &sessions,
+                    range.started_at,
+                    effective_range_end,
+                )
+                .await?;
+                let total_seconds = summary.riding_seconds;
                 format_total_driving_time_report(&range, total_seconds)
             }
         };
@@ -2015,6 +2027,7 @@ pub struct StoredLocation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RideSummary {
     pub total_distance_km: f64,
+    pub riding_seconds: u64,
     pub average_speed_kph: f64,
 }
 
@@ -2039,6 +2052,7 @@ pub struct AnalyticsSessionReport {
     pub clipped_start: DateTime<Utc>,
     pub clipped_end: DateTime<Utc>,
     pub total_distance_km: f64,
+    pub riding_seconds: u64,
     pub route_link: Option<String>,
 }
 
@@ -2639,6 +2653,7 @@ fn format_duration_minutes_from_seconds(total_seconds: u64) -> String {
     }
 }
 
+#[cfg(test)]
 fn clipped_session_seconds(
     session: &AnalyticsSession,
     range_start: DateTime<Utc>,
@@ -2655,6 +2670,7 @@ fn clipped_session_seconds(
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 fn total_clipped_session_seconds(
     sessions: &[AnalyticsSession],
     range_start: DateTime<Utc>,
@@ -2669,26 +2685,21 @@ fn total_clipped_session_seconds(
 fn format_driving_sessions_report(
     range: &AnalyticsDateRange,
     sessions: &[AnalyticsSessionReport],
-    reference_time: DateTime<Utc>,
+    _reference_time: DateTime<Utc>,
 ) -> String {
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
     let report_date = range.started_at.with_timezone(&wib).format("%d %b %Y");
-    let effective_range_end = reference_time.min(range.ended_at);
     let total_distance_km = sessions
         .iter()
         .map(|report| report.total_distance_km)
         .sum::<f64>();
     let total_seconds = sessions
         .iter()
-        .map(|report| {
-            clipped_session_seconds(&report.session, range.started_at, effective_range_end)
-        })
+        .map(|report| report.riding_seconds)
         .sum::<u64>();
     let longest_ride = sessions
         .iter()
-        .max_by_key(|report| {
-            clipped_session_seconds(&report.session, range.started_at, effective_range_end)
-        })
+        .max_by_key(|report| report.riding_seconds)
         .map(|report| {
             let start = report.clipped_start.with_timezone(&wib).format("%H:%M");
             let end = report
@@ -2740,19 +2751,17 @@ fn format_driving_sessions_report(
                     .to_string()
             })
             .unwrap_or_else(|| "ONGOING".to_string());
-        let duration_seconds =
-            clipped_session_seconds(&report.session, range.started_at, effective_range_end);
         let route_link = report
             .route_link
             .as_deref()
             .unwrap_or("Route link is not available yet.");
 
         lines.push(format!(
-            "{}. {} - {}\n   Duration: {} - Distance: {:.2} km\n   Route: {}",
+            "{}. {} - {}\n   Riding time: {} - Distance: {:.2} km\n   Route: {}",
             index + 1,
             start.format("%H:%M"),
             end,
-            format_duration_minutes_from_seconds(duration_seconds),
+            format_duration_minutes_from_seconds(report.riding_seconds),
             report.total_distance_km,
             route_link,
         ));
@@ -2773,18 +2782,10 @@ fn format_total_km_report(range: &AnalyticsDateRange, summary: Option<&RideSumma
     )
 }
 
-fn format_metrics_report(
-    range: &AnalyticsDateRange,
-    summary: Option<&RideSummary>,
-    total_seconds: u64,
-) -> String {
+fn format_metrics_report(range: &AnalyticsDateRange, summary: Option<&RideSummary>) -> String {
     let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
-    let driving_hours = total_seconds as f64 / 3600.0;
-    let average_speed_kph = if driving_hours > 0.0 {
-        total_distance_km / driving_hours
-    } else {
-        0.0
-    };
+    let total_seconds = summary.map(|value| value.riding_seconds).unwrap_or(0);
+    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
 
     format!(
         "Ride Stats - {}\n{}\n\n🏍️ Total Distance\n{:.2} km\n\n⏱️ Total Riding Time\n{}\n\n⚡ Average Riding Speed\n{:.1} km/h\n\n{}",
@@ -2943,6 +2944,31 @@ fn total_route_distance_km(points: &[(f64, f64)]) -> f64 {
             let (end_latitude, end_longitude) = window[1];
 
             haversine_distance_km(start_latitude, start_longitude, end_latitude, end_longitude)
+        })
+        .sum()
+}
+
+fn total_riding_seconds(points: &[(DateTime<Utc>, i32)]) -> u64 {
+    points
+        .windows(2)
+        .filter_map(|window| {
+            let (previous_time, previous_speed) = window[0];
+            let (current_time, current_speed) = window[1];
+
+            if previous_speed < RIDING_TIME_MOVING_SPEED_KPH
+                || current_speed < RIDING_TIME_MOVING_SPEED_KPH
+            {
+                return None;
+            }
+
+            let gap_seconds = current_time
+                .signed_duration_since(previous_time)
+                .num_seconds();
+            if !(1..=RIDING_TIME_MAX_POINT_GAP_SECS).contains(&gap_seconds) {
+                return None;
+            }
+
+            Some(gap_seconds as u64)
         })
         .sum()
 }
@@ -3790,7 +3816,7 @@ pub async fn fetch_ride_summary(
 ) -> Result<Option<RideSummary>, sqlx::Error> {
     let rows = sqlx::query(
         r#"
-        SELECT latitude, longitude
+        SELECT server_received_at, latitude, longitude, speed_kph
         FROM device_locations
         WHERE imei = $1
           AND server_received_at >= $2
@@ -3807,30 +3833,43 @@ pub async fn fetch_ride_summary(
     if rows.len() < 2 {
         return Ok(Some(RideSummary {
             total_distance_km: 0.0,
+            riding_seconds: 0,
             average_speed_kph: 0.0,
         }));
     }
 
-    let points = rows
+    let location_points = rows
         .into_iter()
-        .map(|row| (row.get("latitude"), row.get("longitude")))
+        .map(|row| {
+            (
+                row.get::<DateTime<Utc>, _>("server_received_at"),
+                row.get::<f64, _>("latitude"),
+                row.get::<f64, _>("longitude"),
+                row.get::<i32, _>("speed_kph"),
+            )
+        })
         .collect::<Vec<_>>();
-    let total_distance_km = total_route_distance_km(&points);
+    let coordinate_points = location_points
+        .iter()
+        .map(|(_, latitude, longitude, _)| (*latitude, *longitude))
+        .collect::<Vec<_>>();
+    let speed_points = location_points
+        .iter()
+        .map(|(server_received_at, _, _, speed_kph)| (*server_received_at, *speed_kph))
+        .collect::<Vec<_>>();
+    let total_distance_km = total_route_distance_km(&coordinate_points);
+    let riding_seconds = total_riding_seconds(&speed_points);
 
-    let duration_hours = ended_at
-        .signed_duration_since(started_at)
-        .to_std()
-        .unwrap_or_default()
-        .as_secs_f64()
-        / 3600.0;
-    let average_speed_kph = if duration_hours > 0.0 {
-        total_distance_km / duration_hours
+    let riding_hours = riding_seconds as f64 / 3600.0;
+    let average_speed_kph = if riding_hours > 0.0 {
+        total_distance_km / riding_hours
     } else {
         0.0
     };
 
     Ok(Some(RideSummary {
         total_distance_km,
+        riding_seconds,
         average_speed_kph,
     }))
 }
@@ -3843,7 +3882,7 @@ async fn fetch_analytics_ride_summary(
     range_end: DateTime<Utc>,
 ) -> Result<RideSummary, sqlx::Error> {
     let mut total_distance_km = 0.0;
-    let total_seconds = total_clipped_session_seconds(sessions, range_start, range_end);
+    let mut total_riding_seconds = 0;
 
     for session in sessions {
         let clipped_start = session.created_at.max(range_start);
@@ -3858,17 +3897,22 @@ async fn fetch_analytics_ride_summary(
             .as_ref()
             .map(|value| value.total_distance_km)
             .unwrap_or(0.0);
+        total_riding_seconds += summary
+            .as_ref()
+            .map(|value| value.riding_seconds)
+            .unwrap_or(0);
     }
 
-    let driving_hours = total_seconds as f64 / 3600.0;
-    let average_speed_kph = if driving_hours > 0.0 {
-        total_distance_km / driving_hours
+    let riding_hours = total_riding_seconds as f64 / 3600.0;
+    let average_speed_kph = if riding_hours > 0.0 {
+        total_distance_km / riding_hours
     } else {
         0.0
     };
 
     Ok(RideSummary {
         total_distance_km,
+        riding_seconds: total_riding_seconds,
         average_speed_kph,
     })
 }
@@ -4135,10 +4179,11 @@ mod tests {
         };
         let summary = RideSummary {
             total_distance_km: 42.0,
+            riding_seconds: 7200,
             average_speed_kph: 21.0,
         };
 
-        let text = format_metrics_report(&range, Some(&summary), 7200);
+        let text = format_metrics_report(&range, Some(&summary));
 
         assert!(text.contains("Ride Stats - Custom range"));
         assert!(text.contains("16 May 2026"));
@@ -4166,6 +4211,7 @@ mod tests {
                 clipped_start: Utc.with_ymd_and_hms(2026, 5, 16, 0, 30, 0).unwrap(),
                 clipped_end: Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap(),
                 total_distance_km: 2.35,
+                riding_seconds: 900,
                 route_link: Some("https://example.test/route?start_at=1&end_at=2".to_string()),
             },
             AnalyticsSessionReport {
@@ -4178,6 +4224,7 @@ mod tests {
                 clipped_start: Utc.with_ymd_and_hms(2026, 5, 16, 2, 0, 0).unwrap(),
                 clipped_end: Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
                 total_distance_km: 0.74,
+                riding_seconds: 1800,
                 route_link: Some("https://example.test/route?start_at=3&end_at=4".to_string()),
             },
         ];
@@ -4191,9 +4238,9 @@ mod tests {
         assert!(text.contains("Driving Report - 16 May 2026"));
         assert!(text.contains("2 sessions recorded"));
         assert!(text.contains("Total distance: 3.09 km"));
-        assert!(text.contains("Total driving time: 1h 0m"));
+        assert!(text.contains("Total driving time: 45m"));
         assert!(text.contains("Longest ride: 09:00 - ONGOING"));
-        assert!(text.contains("Duration: 30m - Distance: 2.35 km"));
+        assert!(text.contains("Riding time: 15m - Distance: 2.35 km"));
         assert!(text.contains("ONGOING"));
         assert!(text.contains("https://example.test/route?start_at=3&end_at=4"));
     }
@@ -4222,6 +4269,7 @@ mod tests {
                     clipped_start: created_at,
                     clipped_end: resolved_at,
                     total_distance_km: index as f64,
+                    riding_seconds: 60,
                     route_link: Some(format!("https://example.test/route/{index}")),
                 }
             })
@@ -4367,6 +4415,7 @@ mod tests {
         };
         let summary = RideSummary {
             total_distance_km: 3.25,
+            riding_seconds: 300,
             average_speed_kph: 39.0,
         };
         let latest_location = StoredLocation {
@@ -4416,6 +4465,23 @@ mod tests {
 
         assert!(raw_distance > cleaned_distance * 10.0);
         assert!((cleaned_distance - expected_distance).abs() < 0.001);
+    }
+
+    #[test]
+    fn calculates_riding_time_from_moving_gps_points() {
+        let base = Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap();
+        let points = vec![
+            (base, 0),
+            (base + chrono::Duration::minutes(1), 3),
+            (base + chrono::Duration::minutes(3), 4),
+            (base + chrono::Duration::minutes(4), 2),
+            (base + chrono::Duration::minutes(5), 5),
+            (base + chrono::Duration::minutes(11), 5),
+            (base + chrono::Duration::minutes(12), 5),
+        ];
+
+        assert_eq!(total_riding_seconds(&points), 180);
+        assert_eq!(total_riding_seconds(&points[..1]), 0);
     }
 
     #[test]
