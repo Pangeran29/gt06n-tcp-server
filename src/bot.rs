@@ -11,9 +11,11 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::Database;
 use crate::midtrans::{
-    build_midtrans_order_id, create_pending_midtrans_payment, format_midtrans_payment_message,
-    mark_midtrans_payment_created, MidtransClient, MIDTRANS_PLAN_CODE,
+    build_midtrans_order_id, create_pending_midtrans_payment,
+    format_midtrans_payment_message_with_quote, mark_midtrans_payment_created, MidtransClient,
+    MIDTRANS_PLAN_CODE,
 };
+use crate::subscription_maintenance::build_subscription_payment_quote;
 
 #[derive(Debug, Error)]
 pub enum BotError {
@@ -375,12 +377,43 @@ impl TelegramBot {
                             );
                         }
                     } else if status == "off" {
+                        if let Err(error) = self
+                            .process_inactive_subscription_notification_for_chat(
+                                &heartbeat,
+                                status,
+                                recipient.chat_id,
+                            )
+                            .await
+                        {
+                            warn!(
+                                error = %error,
+                                imei = %heartbeat.imei,
+                                heartbeat_id = heartbeat.id,
+                                chat_id = recipient.chat_id,
+                                "failed to process inactive subscription heartbeat notification for chat; continuing with remaining recipients"
+                            );
+                        }
                         self.finish_inactive_subscription_sessions(
                             &heartbeat.imei,
                             recipient.chat_id,
                             heartbeat.server_received_at,
                         )
                         .await?;
+                    } else if let Err(error) = self
+                        .process_inactive_subscription_notification_for_chat(
+                            &heartbeat,
+                            status,
+                            recipient.chat_id,
+                        )
+                        .await
+                    {
+                        warn!(
+                            error = %error,
+                            imei = %heartbeat.imei,
+                            heartbeat_id = heartbeat.id,
+                            chat_id = recipient.chat_id,
+                            "failed to process inactive subscription heartbeat notification for chat; continuing with remaining recipients"
+                        );
                     }
                 }
             } else {
@@ -398,6 +431,56 @@ impl TelegramBot {
             )
             .await?;
         }
+
+        Ok(())
+    }
+
+    async fn process_inactive_subscription_notification_for_chat(
+        &self,
+        heartbeat: &StoredHeartbeat,
+        status: &str,
+        chat_id: i64,
+    ) -> Result<(), BotError> {
+        let existing =
+            fetch_notification_state(self.database.pool(), &heartbeat.imei, chat_id).await?;
+
+        if existing
+            .as_ref()
+            .map(|state| state.last_status.as_str() == status)
+            .unwrap_or(false)
+        {
+            upsert_notification_state(
+                self.database.pool(),
+                &heartbeat.imei,
+                chat_id,
+                status,
+                existing
+                    .map(|state| state.last_message_id)
+                    .unwrap_or_default(),
+                heartbeat.id,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let message_id = self
+            .send_message_internal(
+                chat_id,
+                &format_inactive_subscription_engine_status_message(heartbeat, status),
+                Some(subscription_payment_keyboard()),
+                None,
+            )
+            .await?;
+
+        upsert_notification_state(
+            self.database.pool(),
+            &heartbeat.imei,
+            chat_id,
+            status,
+            message_id,
+            heartbeat.id,
+        )
+        .await?;
 
         Ok(())
     }
@@ -897,26 +980,43 @@ impl TelegramBot {
                 let created_at = Utc::now();
                 let order_id = build_midtrans_order_id(telegram_user_id, created_at);
                 let expires_at = created_at + chrono::Duration::hours(midtrans.expiry_hours());
+                let payment_quote = build_subscription_payment_quote(
+                    self.database.pool(),
+                    telegram_user_id,
+                    midtrans.price_idr(),
+                    created_at,
+                )
+                .await?;
 
                 create_pending_midtrans_payment(
                     self.database.pool(),
                     telegram_user_id,
                     chat_id,
                     &order_id,
-                    midtrans.price_idr(),
+                    payment_quote.total_amount_idr,
                     expires_at,
                 )
                 .await?;
 
                 let created = midtrans
-                    .create_snap_transaction(&order_id, created_at)
+                    .create_snap_transaction(
+                        &order_id,
+                        created_at,
+                        payment_quote.total_amount_idr,
+                        payment_quote.fine_amount_idr,
+                    )
                     .await?;
                 mark_midtrans_payment_created(self.database.pool(), &order_id, &created).await?;
 
                 self.answer_callback_query(&callback_query.id, "", false)
                     .await?;
-                let payment_message =
-                    format_midtrans_payment_message(&created.payment_url, created.expires_at);
+                let payment_message = format_midtrans_payment_message_with_quote(
+                    &created.payment_url,
+                    created.expires_at,
+                    payment_quote.base_amount_idr,
+                    payment_quote.fine_amount_idr,
+                    payment_quote.total_amount_idr,
+                );
                 self.send_message_html(chat_id, &payment_message).await?;
                 if let Err(error) = self
                     .clear_inline_keyboard(chat_id, payment_menu_message_id)
@@ -2030,6 +2130,25 @@ pub fn format_engine_status_notification(heartbeat: &StoredHeartbeat, status: &s
             wib.format("%d %b %Y - %H:%M WIB")
         ),
         _ => format_heartbeat_notification(heartbeat),
+    }
+}
+
+pub fn format_inactive_subscription_engine_status_message(
+    heartbeat: &StoredHeartbeat,
+    status: &str,
+) -> String {
+    let _ = heartbeat;
+
+    match status {
+        "on" => format!(
+            "Motor Dinyalakan\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
+        ),
+        "off" => format!(
+            "Motor Dimatikan\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
+        ),
+        _ => format!(
+            "Motor activity detected.\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
+        ),
     }
 }
 
@@ -3805,6 +3924,9 @@ mod tests {
         apply_midtrans_webhook, MidtransPaymentStatus, MidtransWebhookApplyOutcome,
         MidtransWebhookNotification,
     };
+    use crate::subscription_maintenance::{
+        build_subscription_payment_quote, SUBSCRIPTION_MAX_FINE_IDR,
+    };
 
     fn database_url() -> Option<String> {
         env::var("GT06_TEST_DATABASE_URL").ok()
@@ -4161,6 +4283,34 @@ mod tests {
 
         let off_text = format_engine_status_notification(&heartbeat, "off");
         assert!(off_text.contains("Motor Dimatikan"));
+    }
+
+    #[test]
+    fn formats_inactive_subscription_engine_status_messages() {
+        let heartbeat = StoredHeartbeat {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            server_received_at: Utc.with_ymd_and_hms(2026, 4, 15, 9, 5, 0).unwrap(),
+            terminal_info_raw: 69,
+            terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
+            engine_status_guess: "on".to_string(),
+            voltage_level: 6,
+            gsm_signal_strength: 3,
+        };
+
+        let on_text = format_inactive_subscription_engine_status_message(&heartbeat, "on");
+        assert!(on_text.contains("Motor Dinyalakan"));
+        assert!(on_text.contains("Renew your subscription"));
+        assert!(on_text.contains("live tracking"));
+        assert!(!on_text.contains("15 Apr 2026"));
+        assert!(!on_text.contains("Activity was detected"));
+
+        let off_text = format_inactive_subscription_engine_status_message(&heartbeat, "off");
+        assert!(off_text.contains("Motor Dimatikan"));
+        assert!(off_text.contains("Renew your subscription"));
     }
 
     #[test]
@@ -4750,6 +4900,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn builds_subscription_payment_quote_with_late_sanctions(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let active_user_id = 8_885_000_001_i64;
+        let late_user_id = 8_885_000_002_i64;
+        let very_late_user_id = 8_885_000_003_i64;
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+        let base_amount_idr = 35_000;
+
+        sqlx::query(
+            "DELETE FROM telegram_subscription_sanctions WHERE telegram_user_id BETWEEN $1 AND $2",
+        )
+        .bind(active_user_id)
+        .bind(very_late_user_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(active_user_id)
+            .bind(very_late_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(active_user_id)
+            .bind(very_late_user_id)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES
+                ($1, $1, '999888777666561', 'bound', NOW(), NOW()),
+                ($2, $2, '999888777666562', 'bound', NOW(), NOW()),
+                ($3, $3, '999888777666563', 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(active_user_id)
+        .bind(late_user_id)
+        .bind(very_late_user_id)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES
+                ($1, $1, $4, 'active', $5, $6, NOW(), NOW()),
+                ($2, $2, $4, 'active', $5, $7, NOW(), NOW()),
+                ($3, $3, $4, 'active', $5, $8, NOW(), NOW())
+            "#,
+        )
+        .bind(active_user_id)
+        .bind(late_user_id)
+        .bind(very_late_user_id)
+        .bind(MIDTRANS_PLAN_CODE)
+        .bind(now - chrono::Duration::days(40))
+        .bind(now + chrono::Duration::days(1))
+        .bind(Utc.with_ymd_and_hms(2026, 6, 30, 17, 0, 0).unwrap())
+        .bind(Utc.with_ymd_and_hms(2026, 6, 24, 17, 0, 0).unwrap())
+        .execute(database.pool())
+        .await?;
+
+        let active_quote =
+            build_subscription_payment_quote(database.pool(), active_user_id, base_amount_idr, now)
+                .await?;
+        let late_quote =
+            build_subscription_payment_quote(database.pool(), late_user_id, base_amount_idr, now)
+                .await?;
+        let very_late_quote = build_subscription_payment_quote(
+            database.pool(),
+            very_late_user_id,
+            base_amount_idr,
+            now,
+        )
+        .await?;
+
+        assert_eq!(active_quote.total_amount_idr, base_amount_idr);
+        assert_eq!(late_quote.fine_amount_idr, 3_000);
+        assert_eq!(late_quote.total_amount_idr, 38_000);
+        assert_eq!(very_late_quote.fine_amount_idr, SUBSCRIPTION_MAX_FINE_IDR);
+        assert_eq!(very_late_quote.total_amount_idr, 42_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn fetches_notification_recipients_with_subscription_state(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
@@ -5240,7 +5491,10 @@ mod tests {
             .current_period_end_at
             .expect("second payment should set period end");
 
-        assert_eq!(second_end.signed_duration_since(first_end).num_days(), 30);
+        assert_eq!(
+            second_end.signed_duration_since(second_paid_at).num_days(),
+            30
+        );
 
         let expired_at = first_paid_at + chrono::Duration::hours(2);
         let expired_order_id = build_midtrans_order_id(telegram_user_id, expired_at);

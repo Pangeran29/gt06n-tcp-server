@@ -8,6 +8,7 @@ use sqlx::Row;
 use thiserror::Error;
 
 use crate::config::Config;
+use crate::subscription_maintenance::resolve_subscription_sanction;
 
 pub const MIDTRANS_PLAN_CODE: &str = "monthly_stars";
 pub const MIDTRANS_PAYMENT_PROVIDER: &str = "midtrans";
@@ -150,9 +151,11 @@ impl MidtransClient {
         &self,
         order_id: &str,
         created_at: DateTime<Utc>,
+        gross_amount_idr: i64,
+        fine_amount_idr: i64,
     ) -> Result<MidtransCreatedPayment, MidtransError> {
-        let item_details = if self.price_idr >= MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR {
-            vec![
+        let mut item_details = if self.price_idr >= MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR {
+            let mut details = vec![
                 MidtransItemDetail {
                     id: "internet_data".to_string(),
                     price: 10_000,
@@ -171,7 +174,18 @@ impl MidtransClient {
                     quantity: 1,
                     name: "Server".to_string(),
                 },
-            ]
+            ];
+            let breakdown_total = 35_000;
+            let remainder = self.price_idr - breakdown_total;
+            if remainder > 0 {
+                details.push(MidtransItemDetail {
+                    id: "heartbeats_service".to_string(),
+                    price: remainder,
+                    quantity: 1,
+                    name: "Layanan Heartbeats".to_string(),
+                });
+            }
+            details
         } else {
             vec![MidtransItemDetail {
                 id: MIDTRANS_PLAN_CODE.to_string(),
@@ -180,11 +194,19 @@ impl MidtransClient {
                 name: "Akses Heartbeats 30 Hari".to_string(),
             }]
         };
+        if fine_amount_idr > 0 {
+            item_details.push(MidtransItemDetail {
+                id: "late_payment_sanction".to_string(),
+                price: fine_amount_idr,
+                quantity: 1,
+                name: "Denda keterlambatan".to_string(),
+            });
+        }
 
         let request = MidtransSnapRequest {
             transaction_details: MidtransTransactionDetails {
                 order_id: order_id.to_string(),
-                gross_amount: self.price_idr,
+                gross_amount: gross_amount_idr,
             },
             item_details,
             expiry: MidtransSnapExpiry {
@@ -265,6 +287,56 @@ pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<U
         "🔒 Heartbeats Monthly Access\nRp 35.000 — 30 Days\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\n⏳ Payment link expires: {}",
         expires_at.format("%d %b %Y %H:%M WIB")
     )
+}
+
+pub fn format_midtrans_payment_message_with_quote(
+    payment_url: &str,
+    expires_at: DateTime<Utc>,
+    base_amount_idr: i64,
+    fine_amount_idr: i64,
+    total_amount_idr: i64,
+) -> String {
+    let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid WIB offset");
+    let expires_at = wib.from_utc_datetime(&expires_at.naive_utc());
+    let escaped_payment_url = payment_url
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let fine_line = if fine_amount_idr > 0 {
+        format!("\nLate sanction: {}", format_idr(fine_amount_idr))
+    } else {
+        String::new()
+    };
+    let total_line = if fine_amount_idr > 0 {
+        format!("\nTotal: {}", format_idr(total_amount_idr))
+    } else {
+        String::new()
+    };
+
+    format!(
+        "Heartbeats Monthly Access\n{} - 30 Days{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
+        format_idr(base_amount_idr),
+        fine_line,
+        total_line,
+        expires_at.format("%d %b %Y %H:%M WIB")
+    )
+}
+
+fn format_idr(amount: i64) -> String {
+    let digits = amount.abs().to_string();
+    let mut formatted = String::new();
+    for (index, character) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            formatted.push('.');
+        }
+        formatted.push(character);
+    }
+    let formatted = formatted.chars().rev().collect::<String>();
+    if amount < 0 {
+        format!("-Rp {formatted}")
+    } else {
+        format!("Rp {formatted}")
+    }
 }
 
 pub async fn create_pending_midtrans_payment(
@@ -431,7 +503,7 @@ pub async fn apply_midtrans_webhook(
         return Ok(MidtransWebhookApplyOutcome::Ignored);
     }
 
-    let existing_subscription = sqlx::query(
+    let _existing_subscription = sqlx::query(
         r#"
         SELECT id, current_period_end_at
         FROM telegram_subscriptions
@@ -445,11 +517,7 @@ pub async fn apply_midtrans_webhook(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let base_time = existing_subscription
-        .as_ref()
-        .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("current_period_end_at"))
-        .filter(|value| *value > received_at)
-        .unwrap_or(received_at);
+    let base_time = received_at;
     let period_end = base_time + chrono::Duration::days(i64::from(period_days));
 
     let subscription_row = sqlx::query(
@@ -504,6 +572,8 @@ pub async fn apply_midtrans_webhook(
     .bind(raw_notification)
     .execute(&mut *tx)
     .await?;
+
+    resolve_subscription_sanction(&mut tx, subscription.id).await?;
 
     tx.commit().await?;
     Ok(MidtransWebhookApplyOutcome::Paid(subscription))
