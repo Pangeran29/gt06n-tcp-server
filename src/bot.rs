@@ -781,7 +781,7 @@ impl TelegramBot {
             _ => {
                 self.send_message(
                     chat_id,
-                    "Invalid date range. Please send it like:\n2026-05-16 08:00 to 2026-05-16 18:00",
+                    "Invalid date range. Please send it like:\n2026-05-16 to 2026-05-16",
                 )
                 .await?;
                 return Ok(());
@@ -1184,7 +1184,7 @@ impl TelegramBot {
             set_pending_analytics_kind(self.database.pool(), chat_id, action.kind).await?;
             self.send_message(
                 chat_id,
-                "Send custom range in WIB:\nYYYY-MM-DD HH:mm to YYYY-MM-DD HH:mm\n\nExample:\n2026-05-16 08:00 to 2026-05-16 18:00",
+                "Send custom date range in WIB:\nYYYY-MM-DD to YYYY-MM-DD\n\nExample:\n2026-05-16 to 2026-05-16",
             )
             .await?;
             return Ok(());
@@ -2379,8 +2379,8 @@ fn resolve_preset_analytics_range(
 
 fn parse_custom_analytics_range(value: &str) -> Option<AnalyticsDateRange> {
     let (start, end) = value.trim().split_once(" to ")?;
-    let started_at = parse_wib_datetime(start.trim())?;
-    let ended_at = parse_wib_datetime(end.trim())?;
+    let started_at = parse_wib_date_start(start.trim())?;
+    let ended_at = parse_wib_date_end(end.trim())?;
 
     Some(AnalyticsDateRange {
         label: "Custom range".to_string(),
@@ -2389,9 +2389,18 @@ fn parse_custom_analytics_range(value: &str) -> Option<AnalyticsDateRange> {
     })
 }
 
-fn parse_wib_datetime(value: &str) -> Option<DateTime<Utc>> {
-    let parsed = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M").ok()?;
-    Some(wib_datetime_to_utc(parsed))
+fn parse_wib_date_start(value: &str) -> Option<DateTime<Utc>> {
+    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(wib_datetime_to_utc(parsed.and_hms_opt(0, 0, 0)?))
+}
+
+fn parse_wib_date_end(value: &str) -> Option<DateTime<Utc>> {
+    let parsed = NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(wib_datetime_to_utc(
+        parsed
+            .checked_add_signed(chrono::Duration::days(1))?
+            .and_hms_opt(0, 0, 0)?,
+    ))
 }
 
 fn wib_datetime_to_utc(value: NaiveDateTime) -> DateTime<Utc> {
@@ -3787,19 +3796,20 @@ mod tests {
     }
 
     #[test]
-    fn parses_custom_analytics_range_as_wib() {
-        let range = parse_custom_analytics_range("2026-05-16 08:00 to 2026-05-16 18:30").unwrap();
+    fn parses_custom_analytics_date_range_as_full_wib_days() {
+        let range = parse_custom_analytics_range("2026-05-16 to 2026-05-17").unwrap();
 
         assert_eq!(
             range.started_at,
-            Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap()
+            Utc.with_ymd_and_hms(2026, 5, 15, 17, 0, 0).unwrap()
         );
         assert_eq!(
             range.ended_at,
-            Utc.with_ymd_and_hms(2026, 5, 16, 11, 30, 0).unwrap()
+            Utc.with_ymd_and_hms(2026, 5, 17, 17, 0, 0).unwrap()
         );
         assert!(parse_custom_analytics_range("2026-05-16 08:00").is_none());
-        assert!(parse_custom_analytics_range("16-05-2026 08:00 to 16-05-2026 18:30").is_none());
+        assert!(parse_custom_analytics_range("2026-05-16 08:00 to 2026-05-16 18:30").is_none());
+        assert!(parse_custom_analytics_range("16-05-2026 to 17-05-2026").is_none());
     }
 
     #[test]
