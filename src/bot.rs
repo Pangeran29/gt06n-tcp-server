@@ -2668,12 +2668,52 @@ fn format_metrics_report(
     };
 
     format!(
-        "Metrics\n{}\n\nTotal driving time: {}\nTotal distance: {:.2} km\nAverage speed: {:.2} km/h",
-        format_analytics_range_label(range),
-        format_duration_compact_from_seconds(total_seconds),
+        "Ride Stats - {}\n{}\n\n🏍️ Total Distance\n{:.2} km\n\n⏱️ Total Riding Time\n{}\n\n⚡ Average Riding Speed\n{:.1} km/h\n\n{}",
+        range.label,
+        format_ride_stats_date_range(range),
         total_distance_km,
+        format_duration_minutes_from_seconds(total_seconds),
         average_speed_kph,
+        format_ride_stats_summary_sentence(total_distance_km, total_seconds),
     )
+}
+
+fn format_ride_stats_date_range(range: &AnalyticsDateRange) -> String {
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let started_at = range.started_at.with_timezone(&wib);
+    let ended_at = range
+        .ended_at
+        .checked_sub_signed(chrono::Duration::seconds(1))
+        .unwrap_or(range.ended_at)
+        .with_timezone(&wib);
+
+    if started_at.date_naive() == ended_at.date_naive() {
+        return started_at.format("%d %b %Y").to_string();
+    }
+
+    if started_at.year() == ended_at.year() {
+        format!(
+            "{} - {}",
+            started_at.format("%d %b"),
+            ended_at.format("%d %b %Y")
+        )
+    } else {
+        format!(
+            "{} - {}",
+            started_at.format("%d %b %Y"),
+            ended_at.format("%d %b %Y")
+        )
+    }
+}
+
+fn format_ride_stats_summary_sentence(total_distance_km: f64, total_seconds: u64) -> &'static str {
+    if total_seconds == 0 {
+        "No ride activity was recorded in this period."
+    } else if total_distance_km >= 100.0 {
+        "Your motorcycle has been actively used throughout the month with consistent ride activity."
+    } else {
+        "Your motorcycle recorded ride activity during this period."
+    }
 }
 
 fn format_total_driving_time_report(range: &AnalyticsDateRange, total_seconds: u64) -> String {
@@ -3978,10 +4018,12 @@ mod tests {
 
         let text = format_metrics_report(&range, Some(&summary), 7200);
 
-        assert!(text.contains("Metrics"));
-        assert!(text.contains("Total driving time: 2h 0m 0s"));
-        assert!(text.contains("Total distance: 42.00 km"));
-        assert!(text.contains("Average speed: 21.00 km/h"));
+        assert!(text.contains("Ride Stats - Custom range"));
+        assert!(text.contains("16 May 2026"));
+        assert!(text.contains("Total Distance\n42.00 km"));
+        assert!(text.contains("Total Riding Time\n2h 0m"));
+        assert!(text.contains("Average Riding Speed\n21.0 km/h"));
+        assert!(text.contains("Your motorcycle recorded ride activity during this period."));
     }
 
     #[test]
