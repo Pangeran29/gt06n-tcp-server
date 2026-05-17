@@ -263,7 +263,6 @@ pub struct TelegramBot {
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
-const MAX_DRIVING_SESSION_REPORT_ITEMS: usize = 10;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
 const ENGINE_ON_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker.tgs");
 const BIND_SUCCESS_STICKER_BYTES: &[u8] = include_bytes!("../asset/AnimatedSticker - hi.tgs");
@@ -776,14 +775,14 @@ impl TelegramBot {
             return Ok(());
         }
 
-        let range = match parse_custom_analytics_range(text) {
+        let range = match parse_custom_analytics_range(kind, text) {
             Some(range) if range.started_at < range.ended_at => range,
             _ => {
-                self.send_message(
-                    chat_id,
-                    "Invalid date range. Please send it like:\n2026-05-16 to 2026-05-16",
-                )
-                .await?;
+                let error_message = match kind {
+                    AnalyticsKind::Sessions => "Invalid date. Please send it like:\n2026-05-16",
+                    _ => "Invalid date range. Please send it like:\n2026-05-16 to 2026-05-16",
+                };
+                self.send_message(chat_id, error_message).await?;
                 return Ok(());
             }
         };
@@ -1197,9 +1196,22 @@ impl TelegramBot {
 
         if action.range == AnalyticsRange::Custom {
             set_pending_analytics_kind(self.database.pool(), chat_id, action.kind).await?;
-            self.send_message(
+            let message = match action.kind {
+                AnalyticsKind::Sessions => "Send custom date in WIB:\nYYYY-MM-DD\n\nExample:\n2026-05-16",
+                _ => {
+                    "Send custom date range in WIB:\nYYYY-MM-DD to YYYY-MM-DD\n\nExample:\n2026-05-16 to 2026-05-16"
+                }
+            };
+            self.send_message(chat_id, message).await?;
+            return Ok(());
+        }
+
+        if action.kind == AnalyticsKind::Sessions && action.range == AnalyticsRange::Month {
+            self.send_message_internal(
                 chat_id,
-                "Send custom date range in WIB:\nYYYY-MM-DD to YYYY-MM-DD\n\nExample:\n2026-05-16 to 2026-05-16",
+                "History Perjalanan only supports one date at a time.",
+                Some(analytics_range_keyboard(action.kind)),
+                None,
             )
             .await?;
             return Ok(());
@@ -1805,8 +1817,24 @@ fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
 }
 
 fn analytics_range_keyboard(kind: AnalyticsKind) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup {
-        inline_keyboard: vec![
+    let inline_keyboard = match kind {
+        AnalyticsKind::Sessions => vec![
+            vec![
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Today.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Today),
+                },
+                InlineKeyboardButton {
+                    text: AnalyticsRange::Yesterday.label().to_string(),
+                    callback_data: analytics_callback_data(kind, AnalyticsRange::Yesterday),
+                },
+            ],
+            vec![InlineKeyboardButton {
+                text: AnalyticsRange::Custom.label().to_string(),
+                callback_data: analytics_callback_data(kind, AnalyticsRange::Custom),
+            }],
+        ],
+        _ => vec![
             vec![
                 InlineKeyboardButton {
                     text: AnalyticsRange::Today.label().to_string(),
@@ -1828,7 +1856,9 @@ fn analytics_range_keyboard(kind: AnalyticsKind) -> InlineKeyboardMarkup {
                 },
             ],
         ],
-    }
+    };
+
+    InlineKeyboardMarkup { inline_keyboard }
 }
 
 fn subscription_payment_keyboard() -> InlineKeyboardMarkup {
@@ -2392,7 +2422,11 @@ fn resolve_preset_analytics_range(
     }
 }
 
-fn parse_custom_analytics_range(value: &str) -> Option<AnalyticsDateRange> {
+fn parse_custom_analytics_range(kind: AnalyticsKind, value: &str) -> Option<AnalyticsDateRange> {
+    if kind == AnalyticsKind::Sessions {
+        return parse_custom_analytics_single_date(value);
+    }
+
     let (start, end) = value.trim().split_once(" to ")?;
     let started_at = parse_wib_date_start(start.trim())?;
     let ended_at = parse_wib_date_end(end.trim())?;
@@ -2402,6 +2436,27 @@ fn parse_custom_analytics_range(value: &str) -> Option<AnalyticsDateRange> {
         started_at,
         ended_at,
     })
+}
+
+fn parse_custom_analytics_single_date(value: &str) -> Option<AnalyticsDateRange> {
+    let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
+    Some(analytics_single_day_range(date, "Custom date"))
+}
+
+fn analytics_single_day_range(date: NaiveDate, label: &str) -> AnalyticsDateRange {
+    let started_at = wib_datetime_to_utc(date.and_hms_opt(0, 0, 0).expect("valid start of day"));
+    let ended_at = wib_datetime_to_utc(
+        date.checked_add_signed(chrono::Duration::days(1))
+            .expect("valid next day")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid start of next day"),
+    );
+
+    AnalyticsDateRange {
+        label: label.to_string(),
+        started_at,
+        ended_at,
+    }
 }
 
 fn parse_wib_date_start(value: &str) -> Option<DateTime<Utc>> {
@@ -2453,6 +2508,18 @@ fn format_duration_compact_from_seconds(total_seconds: u64) -> String {
     }
 }
 
+fn format_duration_minutes_from_seconds(total_seconds: u64) -> String {
+    let total_minutes = total_seconds / 60;
+    let hours = total_minutes / 60;
+    let minutes = total_minutes % 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else {
+        format!("{minutes}m")
+    }
+}
+
 fn clipped_session_seconds(
     session: &AnalyticsSession,
     range_start: DateTime<Utc>,
@@ -2486,29 +2553,74 @@ fn format_driving_sessions_report(
     reference_time: DateTime<Utc>,
 ) -> String {
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
+    let report_date = range.started_at.with_timezone(&wib).format("%d %b %Y");
+    let effective_range_end = reference_time.min(range.ended_at);
+    let total_distance_km = sessions
+        .iter()
+        .map(|report| report.total_distance_km)
+        .sum::<f64>();
+    let total_seconds = sessions
+        .iter()
+        .map(|report| {
+            clipped_session_seconds(&report.session, range.started_at, effective_range_end)
+        })
+        .sum::<u64>();
+    let longest_ride = sessions
+        .iter()
+        .max_by_key(|report| {
+            clipped_session_seconds(&report.session, range.started_at, effective_range_end)
+        })
+        .map(|report| {
+            let start = report.clipped_start.with_timezone(&wib).format("%H:%M");
+            let end = report
+                .session
+                .resolved_at
+                .map(|_| {
+                    report
+                        .clipped_end
+                        .with_timezone(&wib)
+                        .format("%H:%M")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "ONGOING".to_string());
+            format!("{start} - {end}")
+        })
+        .unwrap_or_else(|| "-".to_string());
+
     let mut lines = vec![
-        "Driving Sessions".to_string(),
-        format_analytics_range_label(range),
+        format!("Driving Report - {report_date}"),
+        String::new(),
+        "Summary".to_string(),
+        format!("{} sessions recorded", sessions.len()),
+        format!("Total distance: {:.2} km", total_distance_km),
+        format!(
+            "Total driving time: {}",
+            format_duration_minutes_from_seconds(total_seconds)
+        ),
+        format!("Longest ride: {longest_ride}"),
+        String::new(),
+        "Sessions".to_string(),
         String::new(),
     ];
 
     if sessions.is_empty() {
-        lines.push("No driving sessions found in this range.".to_string());
+        lines.push("No driving sessions found on this date.".to_string());
         return lines.join("\n");
     }
 
-    for (index, report) in sessions
-        .iter()
-        .take(MAX_DRIVING_SESSION_REPORT_ITEMS)
-        .enumerate()
-    {
-        let start = report.session.created_at.with_timezone(&wib);
+    for (index, report) in sessions.iter().enumerate() {
+        let start = report.clipped_start.with_timezone(&wib);
         let end = report
             .session
             .resolved_at
-            .map(|value| value.with_timezone(&wib).format("%H:%M").to_string())
+            .map(|_| {
+                report
+                    .clipped_end
+                    .with_timezone(&wib)
+                    .format("%H:%M")
+                    .to_string()
+            })
             .unwrap_or_else(|| "ONGOING".to_string());
-        let effective_range_end = reference_time.min(range.ended_at);
         let duration_seconds =
             clipped_session_seconds(&report.session, range.started_at, effective_range_end);
         let route_link = report
@@ -2517,22 +2629,13 @@ fn format_driving_sessions_report(
             .unwrap_or("Route link is not available yet.");
 
         lines.push(format!(
-            "{}. {} -> {} ({}) - {}\n   Total KM: {:.2} km\n   Route: {}",
+            "{}. {} - {}\n   Duration: {} - Distance: {:.2} km\n   Route: {}",
             index + 1,
-            start.format("%d %b %H:%M"),
+            start.format("%H:%M"),
             end,
-            format_duration_compact_from_seconds(duration_seconds),
-            report.session.session_status,
+            format_duration_minutes_from_seconds(duration_seconds),
             report.total_distance_km,
             route_link,
-        ));
-    }
-
-    if sessions.len() > MAX_DRIVING_SESSION_REPORT_ITEMS {
-        lines.push(format!(
-            "Showing {} of {} sessions. Use a smaller custom range for more detail.",
-            MAX_DRIVING_SESSION_REPORT_ITEMS,
-            sessions.len()
         ));
     }
 
@@ -3812,7 +3915,9 @@ mod tests {
 
     #[test]
     fn parses_custom_analytics_date_range_as_full_wib_days() {
-        let range = parse_custom_analytics_range("2026-05-16 to 2026-05-17").unwrap();
+        let range =
+            parse_custom_analytics_range(AnalyticsKind::Metrics, "2026-05-16 to 2026-05-17")
+                .unwrap();
 
         assert_eq!(
             range.started_at,
@@ -3822,9 +3927,34 @@ mod tests {
             range.ended_at,
             Utc.with_ymd_and_hms(2026, 5, 17, 17, 0, 0).unwrap()
         );
-        assert!(parse_custom_analytics_range("2026-05-16 08:00").is_none());
-        assert!(parse_custom_analytics_range("2026-05-16 08:00 to 2026-05-16 18:30").is_none());
-        assert!(parse_custom_analytics_range("16-05-2026 to 17-05-2026").is_none());
+        assert!(parse_custom_analytics_range(AnalyticsKind::Metrics, "2026-05-16 08:00").is_none());
+        assert!(parse_custom_analytics_range(
+            AnalyticsKind::Metrics,
+            "2026-05-16 08:00 to 2026-05-16 18:30"
+        )
+        .is_none());
+        assert!(
+            parse_custom_analytics_range(AnalyticsKind::Metrics, "16-05-2026 to 17-05-2026")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn parses_custom_history_date_as_single_full_wib_day() {
+        let range = parse_custom_analytics_range(AnalyticsKind::Sessions, "2026-05-16").unwrap();
+
+        assert_eq!(
+            range.started_at,
+            Utc.with_ymd_and_hms(2026, 5, 15, 17, 0, 0).unwrap()
+        );
+        assert_eq!(
+            range.ended_at,
+            Utc.with_ymd_and_hms(2026, 5, 16, 17, 0, 0).unwrap()
+        );
+        assert!(
+            parse_custom_analytics_range(AnalyticsKind::Sessions, "2026-05-16 to 2026-05-17")
+                .is_none()
+        );
     }
 
     #[test]
@@ -3894,22 +4024,24 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
         );
 
-        assert!(text.contains("Driving Sessions"));
-        assert!(text.contains("30m 0s"));
+        assert!(text.contains("Driving Report - 16 May 2026"));
+        assert!(text.contains("2 sessions recorded"));
+        assert!(text.contains("Total distance: 3.09 km"));
+        assert!(text.contains("Total driving time: 1h 0m"));
+        assert!(text.contains("Longest ride: 09:00 - ONGOING"));
+        assert!(text.contains("Duration: 30m - Distance: 2.35 km"));
         assert!(text.contains("ONGOING"));
-        assert!(text.contains("confirmed_safe"));
-        assert!(text.contains("Total KM: 2.35 km"));
         assert!(text.contains("https://example.test/route?start_at=3&end_at=4"));
     }
 
     #[test]
-    fn limits_driving_sessions_report_length() {
+    fn driving_sessions_report_includes_all_single_day_sessions() {
         let range = AnalyticsDateRange {
-            label: "This month".to_string(),
-            started_at: Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 0).unwrap(),
-            ended_at: Utc.with_ymd_and_hms(2026, 5, 31, 23, 59, 0).unwrap(),
+            label: "Custom date".to_string(),
+            started_at: Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap(),
+            ended_at: Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap(),
         };
-        let sessions = (0..=MAX_DRIVING_SESSION_REPORT_ITEMS)
+        let sessions = (0..=10)
             .map(|index| {
                 let created_at = Utc
                     .with_ymd_and_hms(2026, 5, 16, index as u32, 0, 0)
@@ -3937,9 +4069,9 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
         );
 
-        assert!(text.contains("10. 16 May 16:00"));
-        assert!(!text.contains("11. 16 May 17:00"));
-        assert!(text.contains("Showing 10 of 11 sessions"));
+        assert!(text.contains("10. 16:00 - 16:30"));
+        assert!(text.contains("11. 17:00 - 17:30"));
+        assert!(!text.contains("Showing 10 of 11 sessions"));
     }
 
     #[test]
