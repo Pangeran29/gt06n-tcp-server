@@ -1036,6 +1036,21 @@ impl TelegramBot {
 
             self.answer_callback_query(&callback_query.id, "", false)
                 .await?;
+            if action.range != AnalyticsRange::Select {
+                if let Some(message_id) = message.message_id {
+                    if let Err(error) = self
+                        .clear_inline_keyboard(chat_id, i64::from(message_id))
+                        .await
+                    {
+                        warn!(
+                            error = %error,
+                            chat_id,
+                            message_id,
+                            "failed to clear analytics range keyboard"
+                        );
+                    }
+                }
+            }
             return self
                 .handle_analytics_action(chat_id, callback_query.from.id, action)
                 .await;
