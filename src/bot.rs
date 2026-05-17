@@ -1761,24 +1761,24 @@ fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
         inline_keyboard: vec![
             vec![
                 InlineKeyboardButton {
-                    text: "stream location".to_string(),
+                    text: "Live Tracking".to_string(),
                     callback_data: theft_alert_callback_data("stream_location", None),
                 },
                 InlineKeyboardButton {
-                    text: "health check".to_string(),
+                    text: "Motor Status".to_string(),
                     callback_data: theft_alert_callback_data("check_latest_status", None),
                 },
             ],
             vec![
                 InlineKeyboardButton {
-                    text: "driving session".to_string(),
+                    text: "History Perjalanan".to_string(),
                     callback_data: analytics_callback_data(
                         AnalyticsKind::Sessions,
                         AnalyticsRange::Select,
                     ),
                 },
                 InlineKeyboardButton {
-                    text: "metrics".to_string(),
+                    text: "Ride Stats".to_string(),
                     callback_data: analytics_callback_data(
                         AnalyticsKind::Metrics,
                         AnalyticsRange::Select,
