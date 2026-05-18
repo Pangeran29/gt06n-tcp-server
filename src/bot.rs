@@ -264,7 +264,8 @@ pub struct TelegramBot {
 }
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
-const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 900;
+const ENGINE_ON_ALERT_COOLDOWN_SECS: i64 = 10 * 60;
+const STALE_ENGINE_SESSION_TIMEOUT_SECS: i64 = ENGINE_ON_ALERT_COOLDOWN_SECS;
 const RIDING_TIME_MOVING_SPEED_KPH: i32 = 3;
 const RIDING_TIME_MAX_POINT_GAP_SECS: i64 = 5 * 60;
 const LIVE_TRACKING_BASE_URL: &str = "https://hearthbeats-client.vercel.app/live-tracking";
@@ -304,6 +305,10 @@ impl TelegramBot {
 
             if let Err(error) = self.process_heartbeat_notifications().await {
                 error!(error = %error, "heartbeat notification polling failed");
+            }
+
+            if let Err(error) = self.process_stale_engine_sessions().await {
+                error!(error = %error, "stale engine session cleanup failed");
             }
 
             sleep(Duration::from_millis(self.heartbeat_poll_interval_ms)).await;
@@ -430,6 +435,55 @@ impl TelegramBot {
                 self.database.pool(),
                 "last_notified_heartbeat_id",
                 heartbeat.id,
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn process_stale_engine_sessions(&self) -> Result<(), BotError> {
+        let sessions = fetch_all_active_engine_sessions(self.database.pool()).await?;
+        let mut session_groups =
+            std::collections::BTreeMap::<(String, i64), Vec<EngineSession>>::new();
+
+        for session in sessions {
+            session_groups
+                .entry((session.imei.clone(), session.chat_id))
+                .or_default()
+                .push(session);
+        }
+
+        let reference_time = Utc::now();
+        for ((imei, chat_id), sessions) in session_groups {
+            let Some(latest_heartbeat) =
+                fetch_latest_heartbeat_for_imei(self.database.pool(), &imei).await?
+            else {
+                continue;
+            };
+
+            if !should_finish_stale_engine_session(
+                reference_time,
+                latest_heartbeat.server_received_at,
+            ) {
+                continue;
+            }
+
+            info!(
+                imei = %imei,
+                chat_id,
+                latest_heartbeat_id = latest_heartbeat.id,
+                latest_heartbeat_at = %latest_heartbeat.server_received_at,
+                active_session_count = sessions.len(),
+                "finishing stale engine sessions after heartbeat timeout"
+            );
+
+            self.finish_active_engine_sessions(
+                chat_id,
+                &imei,
+                &sessions,
+                latest_heartbeat.server_received_at,
+                false,
             )
             .await?;
         }
@@ -716,7 +770,8 @@ impl TelegramBot {
         send_theft_engine_off_alert: bool,
     ) -> Result<i64, BotError> {
         if let Some(message_id) = session.ride_status_message_id {
-            resolve_engine_session(self.database.pool(), session.id, "finished").await?;
+            resolve_engine_session_at(self.database.pool(), session.id, "finished", ended_at)
+                .await?;
             return Ok(message_id);
         }
 
@@ -1382,7 +1437,19 @@ impl TelegramBot {
                     });
                 }
 
-                format_driving_sessions_report(&range, &session_reports, reference_time)
+                let full_day_route_end = range
+                    .ended_at
+                    .checked_sub_signed(chrono::Duration::seconds(1))
+                    .unwrap_or(range.ended_at);
+                let full_day_route_link =
+                    build_history_tracking_link(imei, range.started_at, full_day_route_end);
+
+                format_driving_sessions_report(
+                    &range,
+                    &session_reports,
+                    full_day_route_link.as_deref(),
+                    reference_time,
+                )
             }
             AnalyticsKind::Metrics => {
                 let sessions = fetch_analytics_sessions(
@@ -1904,7 +1971,7 @@ fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
                     callback_data: theft_alert_callback_data("stream_location", None),
                 },
                 InlineKeyboardButton {
-                    text: "Motor Status".to_string(),
+                    text: "Status terkini".to_string(),
                     callback_data: theft_alert_callback_data("check_latest_status", None),
                 },
             ],
@@ -2177,8 +2244,7 @@ pub fn format_engine_on_confirmation_message_with_duration(
     let _ = heartbeat;
     let _ = started_at;
 
-    "Security Alert: Motor Turned ON\nWe detected your motor just turned ON.\nWas this you?"
-        .to_string()
+    "🚨 Engine ON Terdeteksi\n\nMotor Anda baru saja dinyalakan.\nApakah ini Anda?".to_string()
 }
 
 pub fn format_ride_safe_message() -> &'static str {
@@ -2190,7 +2256,7 @@ pub fn format_session_finished_message() -> &'static str {
 }
 
 pub fn format_theft_warning_message() -> &'static str {
-    "THEFT SUSPECTED\nThis was NOT you.\n\nAct fast - the first few minutes are crucial.\nTap below to start live tracking."
+    "🚨 INDIKASI PENCURIAN\n\nMotor ini dinyalakan bukan oleh Anda. ⚠️ Bertindak cepat — beberapa menit pertama sangat penting dalam kasus pencurian.\n\nTap tombol di bawah untuk mulai live tracking."
 }
 
 pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
@@ -2206,26 +2272,16 @@ pub fn format_theft_engine_off_message(
     engine_off_at: DateTime<Utc>,
     current_time: DateTime<Utc>,
 ) -> String {
+    let _ = current_time;
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
     let engine_off_wib = wib.from_utc_datetime(&engine_off_at.naive_utc());
-    let duration = current_time
-        .signed_duration_since(engine_off_at)
-        .to_std()
-        .unwrap_or_default();
-    let total_seconds = duration.as_secs();
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
     let location_link = latest_location_link(latest_location)
         .unwrap_or_else(|| "Location is not available yet.".to_string());
 
     format!(
-        "URGENT THEFT ALERT\nYour motor has STOPPED / ENGINE OFF detected.\n\nLast Known Location:\n{}\n\nWarning: This may indicate the motor has been hidden or moved into an indoor area.\nGPS tracking can still continue in battery mode (as long as device power remains).\n\nEngine OFF since: {}\nDuration: {:02}:{:02}:{:02} (until now)\n\nRecommended: Check the location immediately or contact local authorities.",
+        "🚨 THEFT ALERT\n\nYour motorcycle engine was turned OFF during a suspected theft situation.\n\n📍 Last Known Location:\n{}\n\nGPS tracking is still active in battery mode while device power remains available.\n\nEngine OFF detected at {}.\n\n⚠️ Act immediately: check the live location, share tracking access, or contact local authorities if needed.",
         location_link,
         engine_off_wib.format("%d %b %Y %H:%M WIB"),
-        hours,
-        minutes,
-        seconds,
     )
 }
 
@@ -2235,7 +2291,7 @@ pub fn format_stream_location_message(live_tracking_link: Option<&str>) -> Strin
         .to_string();
 
     format!(
-        "Live Tracking Activated\nTrack your motor in real-time using this link:\n{}\n\nThis link is shareable - send it to someone you trust if you need help tracking.",
+        "📍 Live Tracking Ready\n\nTrack your motorcycle in real-time:\n{}\n\nYou can share this link with someone you trust to help monitor or track your motorcycle.",
         link
     )
 }
@@ -2287,36 +2343,23 @@ pub fn format_ride_summary_message(
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
     let started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
     let off_wib = wib.from_utc_datetime(&off_time.naive_utc());
-    let duration = off_time
-        .signed_duration_since(session.created_at)
-        .to_std()
-        .unwrap_or_default();
-    let total_seconds = duration.as_secs();
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
     let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
+    let riding_seconds = summary.map(|value| value.riding_seconds).unwrap_or(0);
     let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
     let history_link = build_history_tracking_link(&session.imei, session.created_at, off_time)
         .unwrap_or_else(|| "History link is not available yet.".to_string());
     let latest_map_link = latest_location_link(latest_location)
         .unwrap_or_else(|| "Latest map link is not available yet.".to_string());
-    let duration_compact = if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    };
+    let riding_time = format_duration_compact_from_seconds(riding_seconds);
 
     format!(
-        "Ride Summary ({})\n{} -> {} WIB ({})\n{:.2} km\nAvg Speed: {:.2} km/h\n\nHistory: [View Route]\n{}\n\nLast Location: [Open in Google Maps]\n{}",
+        "Ride Summary — {}\n\n🏍️ {:.2} km traveled\n⏱️ {} riding time\n⚡ Average speed: {:.2} km/h\n\n{} → {} WIB\n\n🗺️ View Route\n{}\n\n📍 Last Location\n{}",
         started_wib.format("%d %b %Y"),
+        total_distance_km,
+        riding_time,
+        average_speed_kph,
         started_wib.format("%H:%M"),
         off_wib.format("%H:%M"),
-        duration_compact,
-        total_distance_km,
-        average_speed_kph,
         history_link,
         latest_map_link,
     )
@@ -2381,28 +2424,25 @@ fn format_latest_motor_status_message_at(
     let battery_warning = heartbeat
         .filter(|value| value.voltage_level == 0)
         .map(|_| {
-            "\n\nWarning: GPS device battery is empty. New updates may only arrive after the motor turns on again."
+            "\n\n⚠️ GPS battery is empty. New updates may resume after the motorcycle is turned ON again."
         })
         .unwrap_or("");
     let session_started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
-    let session_ended = session
-        .resolved_at
-        .map(|value| {
-            let value = wib.from_utc_datetime(&value.naive_utc());
-            value.format("%H:%M:%S WIB").to_string()
-        })
-        .unwrap_or_else(|| "ONGOING".to_string());
-    let session_timing = if session_ended == "ONGOING" {
+    let session_timing = if let Some(resolved_at) = session.resolved_at {
+        let resolved_wib = wib.from_utc_datetime(&resolved_at.naive_utc());
+        format!(
+            "Last session ended at {} WIB.",
+            resolved_wib.format("%H:%M:%S")
+        )
+    } else {
         format!(
             "Session active since {}",
             session_started_wib.format("%H:%M:%S WIB"),
         )
-    } else {
-        format!("Session ended at {}", session_ended)
     };
 
     format!(
-        "{}\n\n{} - Updated {}\n\nEngine: {}\nGPS: {}\nPower: {}\n\n{}{}",
+        "📍 Motor Status\n\n{}\n\n{} • Updated {}\nEngine: {} • GPS: {} • Power: {}\n\n{}{}",
         map_link,
         movement_status,
         last_update,
@@ -2685,6 +2725,7 @@ fn total_clipped_session_seconds(
 fn format_driving_sessions_report(
     range: &AnalyticsDateRange,
     sessions: &[AnalyticsSessionReport],
+    full_day_route_link: Option<&str>,
     _reference_time: DateTime<Utc>,
 ) -> String {
     let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
@@ -2713,28 +2754,29 @@ fn format_driving_sessions_report(
                         .to_string()
                 })
                 .unwrap_or_else(|| "ONGOING".to_string());
-            format!("{start} - {end}")
+            format!("{start} → {end}")
         })
         .unwrap_or_else(|| "-".to_string());
+    let full_day_route_link = full_day_route_link.unwrap_or("Full day route is not available yet.");
 
     let mut lines = vec![
-        format!("Driving Report - {report_date}"),
+        format!("🛣️ Driving Report — {report_date}"),
         String::new(),
-        "Summary".to_string(),
-        format!("{} sessions recorded", sessions.len()),
-        format!("Total distance: {:.2} km", total_distance_km),
         format!(
-            "Total driving time: {}",
+            "{} sessions • {:.2} km traveled • {} riding time",
+            sessions.len(),
+            total_distance_km,
             format_duration_minutes_from_seconds(total_seconds)
         ),
         format!("Longest ride: {longest_ride}"),
-        String::new(),
-        "Sessions".to_string(),
         String::new(),
     ];
 
     if sessions.is_empty() {
         lines.push("No driving sessions found on this date.".to_string());
+        lines.push(String::new());
+        lines.push("📍 Full Day Route".to_string());
+        lines.push(full_day_route_link.to_string());
         return lines.join("\n");
     }
 
@@ -2751,21 +2793,20 @@ fn format_driving_sessions_report(
                     .to_string()
             })
             .unwrap_or_else(|| "ONGOING".to_string());
-        let route_link = report
-            .route_link
-            .as_deref()
-            .unwrap_or("Route link is not available yet.");
 
         lines.push(format!(
-            "{}. {} - {}\n   Riding time: {} - Distance: {:.2} km\n   Route: {}",
+            "{}. {} → {} • {} • {:.2} km",
             index + 1,
             start.format("%H:%M"),
             end,
             format_duration_minutes_from_seconds(report.riding_seconds),
             report.total_distance_km,
-            route_link,
         ));
     }
+
+    lines.push(String::new());
+    lines.push("📍 Full Day Route".to_string());
+    lines.push(full_day_route_link.to_string());
 
     lines.join("\n")
 }
@@ -2788,13 +2829,12 @@ fn format_metrics_report(range: &AnalyticsDateRange, summary: Option<&RideSummar
     let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
 
     format!(
-        "Ride Stats - {}\n{}\n\n🏍️ Total Distance\n{:.2} km\n\n⏱️ Total Riding Time\n{}\n\n⚡ Average Riding Speed\n{:.1} km/h\n\n{}",
+        "🏍️ Ride Stats — {}\n\n{} • {:.2} km traveled • {} riding time • {:.1} km/h avg speed\n\n⚠️ Regularly check your motorcycle condition for safety, including engine oil, tire pressure, and brake performance.",
         range.label,
         format_ride_stats_date_range(range),
         total_distance_km,
         format_duration_minutes_from_seconds(total_seconds),
         average_speed_kph,
-        format_ride_stats_summary_sentence(total_distance_km, total_seconds),
     )
 }
 
@@ -2813,26 +2853,16 @@ fn format_ride_stats_date_range(range: &AnalyticsDateRange) -> String {
 
     if started_at.year() == ended_at.year() {
         format!(
-            "{} - {}",
+            "{} → {}",
             started_at.format("%d %b"),
             ended_at.format("%d %b %Y")
         )
     } else {
         format!(
-            "{} - {}",
+            "{} → {}",
             started_at.format("%d %b %Y"),
             ended_at.format("%d %b %Y")
         )
-    }
-}
-
-fn format_ride_stats_summary_sentence(total_distance_km: f64, total_seconds: u64) -> &'static str {
-    if total_seconds == 0 {
-        "No ride activity was recorded in this period."
-    } else if total_distance_km >= 100.0 {
-        "Your motorcycle has been actively used throughout the month with consistent ride activity."
-    } else {
-        "Your motorcycle recorded ride activity during this period."
     }
 }
 
@@ -2895,6 +2925,16 @@ fn should_start_new_engine_on_session(
         .signed_duration_since(previous_on_heartbeat_time)
         .num_seconds()
         >= ENGINE_ON_ALERT_COOLDOWN_SECS
+}
+
+fn should_finish_stale_engine_session(
+    reference_time: DateTime<Utc>,
+    latest_heartbeat_time: DateTime<Utc>,
+) -> bool {
+    reference_time
+        .signed_duration_since(latest_heartbeat_time)
+        .num_seconds()
+        >= STALE_ENGINE_SESSION_TIMEOUT_SECS
 }
 
 fn option_f64(value: Option<f64>) -> String {
@@ -3654,6 +3694,36 @@ pub async fn fetch_active_engine_sessions(
         .collect())
 }
 
+pub async fn fetch_all_active_engine_sessions(
+    pool: &sqlx::PgPool,
+) -> Result<Vec<EngineSession>, sqlx::Error> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, imei, chat_id, trigger_heartbeat_id, prompt_message_id, ride_status_message_id, session_status, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE session_status IN ('pending_confirmation', 'confirmed_safe', 'reported_theft')
+        ORDER BY imei ASC, chat_id ASC, created_at ASC, id ASC
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| EngineSession {
+            id: row.get("id"),
+            imei: row.get("imei"),
+            chat_id: row.get("chat_id"),
+            trigger_heartbeat_id: row.get("trigger_heartbeat_id"),
+            prompt_message_id: row.get("prompt_message_id"),
+            ride_status_message_id: row.get("ride_status_message_id"),
+            session_status: row.get("session_status"),
+            created_at: row.get("created_at"),
+            resolved_at: row.get("resolved_at"),
+        })
+        .collect())
+}
+
 pub async fn upsert_notification_state(
     pool: &sqlx::PgPool,
     imei: &str,
@@ -4090,6 +4160,13 @@ mod tests {
     }
 
     #[test]
+    fn subscribed_start_menu_uses_status_terkini_label() {
+        let keyboard = subscribed_start_menu_keyboard();
+
+        assert_eq!(keyboard.inline_keyboard[0][1].text, "Status terkini");
+    }
+
+    #[test]
     fn resolves_analytics_preset_ranges_in_wib() {
         let reference_time = Utc.with_ymd_and_hms(2026, 5, 16, 8, 40, 9).unwrap();
 
@@ -4185,12 +4262,21 @@ mod tests {
 
         let text = format_metrics_report(&range, Some(&summary));
 
-        assert!(text.contains("Ride Stats - Custom range"));
-        assert!(text.contains("16 May 2026"));
-        assert!(text.contains("Total Distance\n42.00 km"));
-        assert!(text.contains("Total Riding Time\n2h 0m"));
-        assert!(text.contains("Average Riding Speed\n21.0 km/h"));
-        assert!(text.contains("Your motorcycle recorded ride activity during this period."));
+        assert_eq!(
+            text,
+            "🏍️ Ride Stats — Custom range\n\n16 May 2026 • 42.00 km traveled • 2h 0m riding time • 21.0 km/h avg speed\n\n⚠️ Regularly check your motorcycle condition for safety, including engine oil, tire pressure, and brake performance."
+        );
+    }
+
+    #[test]
+    fn formats_ride_stats_multi_day_date_range_with_arrow() {
+        let range = AnalyticsDateRange {
+            label: "Custom Range".to_string(),
+            started_at: Utc.with_ymd_and_hms(2026, 4, 30, 17, 0, 0).unwrap(),
+            ended_at: Utc.with_ymd_and_hms(2026, 5, 16, 17, 0, 0).unwrap(),
+        };
+
+        assert_eq!(format_ride_stats_date_range(&range), "01 May → 16 May 2026");
     }
 
     #[test]
@@ -4232,17 +4318,19 @@ mod tests {
         let text = format_driving_sessions_report(
             &range,
             &sessions,
+            Some("https://example.test/full-day-route"),
             Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
         );
 
-        assert!(text.contains("Driving Report - 16 May 2026"));
-        assert!(text.contains("2 sessions recorded"));
-        assert!(text.contains("Total distance: 3.09 km"));
-        assert!(text.contains("Total driving time: 45m"));
-        assert!(text.contains("Longest ride: 09:00 - ONGOING"));
-        assert!(text.contains("Riding time: 15m - Distance: 2.35 km"));
+        assert!(text.contains("🛣️ Driving Report — 16 May 2026"));
+        assert!(text.contains("2 sessions • 3.09 km traveled • 45m riding time"));
+        assert!(text.contains("Longest ride: 09:00 → ONGOING"));
+        assert!(text.contains("1. 07:30 → 08:00 • 15m • 2.35 km"));
+        assert!(text.contains("2. 09:00 → ONGOING • 30m • 0.74 km"));
         assert!(text.contains("ONGOING"));
-        assert!(text.contains("https://example.test/route?start_at=3&end_at=4"));
+        assert!(text.contains("📍 Full Day Route\nhttps://example.test/full-day-route"));
+        assert!(!text.contains("Route:"));
+        assert!(!text.contains("https://example.test/route?start_at=3&end_at=4"));
     }
 
     #[test]
@@ -4278,11 +4366,12 @@ mod tests {
         let text = format_driving_sessions_report(
             &range,
             &sessions,
+            Some("https://example.test/full-day-route"),
             Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap(),
         );
 
-        assert!(text.contains("10. 16:00 - 16:30"));
-        assert!(text.contains("11. 17:00 - 17:30"));
+        assert!(text.contains("10. 16:00 → 16:30"));
+        assert!(text.contains("11. 17:00 → 17:30"));
         assert!(!text.contains("Showing 10 of 11 sessions"));
     }
 
@@ -4362,11 +4451,34 @@ mod tests {
     }
 
     #[test]
+    fn formats_engine_on_confirmation_message() {
+        let heartbeat = StoredHeartbeat {
+            id: 1,
+            imei: "866221070478388".to_string(),
+            server_received_at: Utc.with_ymd_and_hms(2026, 4, 15, 9, 5, 0).unwrap(),
+            terminal_info_raw: 69,
+            terminal_info_bits: "01000101".to_string(),
+            gps_tracking_on: true,
+            acc_high: Some(true),
+            vibration_detected: true,
+            engine_status_guess: "on".to_string(),
+            voltage_level: 6,
+            gsm_signal_strength: 3,
+        };
+
+        assert_eq!(
+            format_engine_on_confirmation_message(&heartbeat),
+            "🚨 Engine ON Terdeteksi\n\nMotor Anda baru saja dinyalakan.\nApakah ini Anda?"
+        );
+    }
+
+    #[test]
     fn formats_theft_warning_message() {
         let text = format_theft_warning_message();
-        assert!(text.contains("THEFT SUSPECTED"));
-        assert!(text.contains("This was NOT you."));
-        assert!(text.contains("Tap below to start live tracking."));
+        assert_eq!(
+            text,
+            "🚨 INDIKASI PENCURIAN\n\nMotor ini dinyalakan bukan oleh Anda. ⚠️ Bertindak cepat — beberapa menit pertama sangat penting dalam kasus pencurian.\n\nTap tombol di bawah untuk mulai live tracking."
+        );
     }
 
     #[test]
@@ -4392,12 +4504,10 @@ mod tests {
         };
 
         let text = format_theft_engine_off_message(Some(&location), started, newest);
-        assert!(text.contains("URGENT THEFT ALERT"));
-        assert!(text.contains("Your motor has STOPPED / ENGINE OFF detected."));
-        assert!(text.contains("https://maps.google.com/?q=-6.216754,106.768455"));
-        assert!(text.contains("Engine OFF since: 17 Apr 2026 17:00 WIB"));
-        assert!(text.contains("Duration: 00:05:07"));
-        assert!(text.contains("Recommended: Check the location immediately"));
+        assert_eq!(
+            text,
+            "🚨 THEFT ALERT\n\nYour motorcycle engine was turned OFF during a suspected theft situation.\n\n📍 Last Known Location:\nhttps://maps.google.com/?q=-6.216754,106.768455\n\nGPS tracking is still active in battery mode while device power remains available.\n\nEngine OFF detected at 17 Apr 2026 17:00 WIB.\n\n⚠️ Act immediately: check the live location, share tracking access, or contact local authorities if needed."
+        );
     }
 
     #[test]
@@ -4414,9 +4524,9 @@ mod tests {
             resolved_at: Some(Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 0).unwrap()),
         };
         let summary = RideSummary {
-            total_distance_km: 3.25,
-            riding_seconds: 300,
-            average_speed_kph: 39.0,
+            total_distance_km: 0.69,
+            riding_seconds: 276,
+            average_speed_kph: 15.77,
         };
         let latest_location = StoredLocation {
             imei: "866221070478388".to_string(),
@@ -4435,14 +4545,10 @@ mod tests {
             Some(&summary),
             Some(&latest_location),
         );
-        assert!(text.contains("Ride Summary (17 Apr 2026)"));
-        assert!(text.contains("17:00 -> 17:05 WIB (5m 0s)"));
-        assert!(text.contains("3.25 km"));
-        assert!(text.contains("Avg Speed: 39.00 km/h"));
-        assert!(text.contains("History: [View Route]"));
-        assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z"));
-        assert!(text.contains("Last Location: [Open in Google Maps]"));
-        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
+        assert_eq!(
+            text,
+            "Ride Summary — 17 Apr 2026\n\n🏍️ 0.69 km traveled\n⏱️ 4m 36s riding time\n⚡ Average speed: 15.77 km/h\n\n17:00 → 17:05 WIB\n\n🗺️ View Route\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z\n\n📍 Last Location\nhttps://maps.google.com/?q=-6.204066,106.785514"
+        );
     }
 
     #[test]
@@ -4489,10 +4595,10 @@ mod tests {
         let text = format_stream_location_message(Some(
             "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z",
         ));
-        assert!(text.contains("Live Tracking Activated"));
-        assert!(text.contains("Track your motor in real-time using this link:"));
-        assert!(text.contains("https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z"));
-        assert!(text.contains("This link is shareable"));
+        assert_eq!(
+            text,
+            "📍 Live Tracking Ready\n\nTrack your motorcycle in real-time:\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z\n\nYou can share this link with someone you trust to help monitor or track your motorcycle."
+        );
     }
 
     #[test]
@@ -4576,7 +4682,7 @@ mod tests {
     #[test]
     fn keeps_existing_engine_on_session_within_gap_window() {
         let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
-        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 4, 59).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 9, 59).unwrap();
 
         assert!(!should_start_new_engine_on_session(
             heartbeat_time,
@@ -4587,7 +4693,7 @@ mod tests {
     #[test]
     fn starts_new_engine_on_session_at_exact_gap_threshold() {
         let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
-        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 15, 0).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 10, 0).unwrap();
 
         assert!(should_start_new_engine_on_session(
             heartbeat_time,
@@ -4598,11 +4704,25 @@ mod tests {
     #[test]
     fn starts_new_engine_on_session_after_gap_threshold() {
         let previous_on_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
-        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 15, 1).unwrap();
+        let heartbeat_time = Utc.with_ymd_and_hms(2026, 4, 19, 10, 10, 1).unwrap();
 
         assert!(should_start_new_engine_on_session(
             heartbeat_time,
             Some(previous_on_heartbeat)
+        ));
+    }
+
+    #[test]
+    fn detects_stale_engine_session_at_heartbeat_timeout() {
+        let latest_heartbeat = Utc.with_ymd_and_hms(2026, 4, 19, 10, 0, 0).unwrap();
+
+        assert!(!should_finish_stale_engine_session(
+            Utc.with_ymd_and_hms(2026, 4, 19, 10, 9, 59).unwrap(),
+            latest_heartbeat
+        ));
+        assert!(should_finish_stale_engine_session(
+            Utc.with_ymd_and_hms(2026, 4, 19, 10, 10, 0).unwrap(),
+            latest_heartbeat
         ));
     }
 
@@ -4649,12 +4769,10 @@ mod tests {
             Some(&location),
             Utc.with_ymd_and_hms(2026, 4, 17, 10, 5, 19).unwrap(),
         );
-        assert!(text.contains("https://maps.google.com/?q=-6.204066,106.785514"));
-        assert!(text.contains("STATIONARY - Updated 12s ago"));
-        assert!(text.contains("Engine: OFF"));
-        assert!(text.contains("GPS: OK"));
-        assert!(text.contains("Power: UNKNOWN"));
-        assert!(text.contains("Session ended at 17:05:07 WIB"));
+        assert_eq!(
+            text,
+            "📍 Motor Status\n\nhttps://maps.google.com/?q=-6.204066,106.785514\n\nSTATIONARY • Updated 12s ago\nEngine: OFF • GPS: OK • Power: UNKNOWN\n\nLast session ended at 17:05:07 WIB."
+        );
     }
 
     #[test]
@@ -4674,7 +4792,7 @@ mod tests {
 
         let text = format_latest_motor_status_initial_message(&session, None, None, requested_at);
         assert!(text.contains("Location is not available yet."));
-        assert!(text.contains("UNKNOWN - Updated unknown"));
+        assert!(text.contains("UNKNOWN • Updated unknown"));
         assert!(text.contains("Session active since 17:00:00 WIB"));
     }
 
@@ -4712,7 +4830,9 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
         );
         assert!(text.contains("Power: EMPTY"));
-        assert!(text.contains("Warning: GPS device battery is empty."));
+        assert!(text.contains(
+            "⚠️ GPS battery is empty. New updates may resume after the motorcycle is turned ON again."
+        ));
     }
 
     #[tokio::test]
