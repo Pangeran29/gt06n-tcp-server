@@ -1341,13 +1341,25 @@ impl TelegramBot {
         };
 
         if action.range == AnalyticsRange::Select {
-            self.send_message_internal(
-                chat_id,
-                &format!("Choose range for {}.", action.kind.label()),
-                Some(analytics_range_keyboard(action.kind)),
-                None,
-            )
-            .await?;
+            let text = format!("Choose range for {}.", action.kind.label());
+            if should_remember_analytics_message(action.kind) {
+                self.send_remembered_analytics_message(
+                    chat_id,
+                    action.kind,
+                    AnalyticsMessageSlot::Selector,
+                    &text,
+                    Some(analytics_range_keyboard(action.kind)),
+                )
+                .await?;
+            } else {
+                self.send_message_internal(
+                    chat_id,
+                    &text,
+                    Some(analytics_range_keyboard(action.kind)),
+                    None,
+                )
+                .await?;
+            }
             return Ok(());
         }
 
@@ -1359,16 +1371,28 @@ impl TelegramBot {
                     "Send custom date range in WIB:\nYYYY-MM-DD to YYYY-MM-DD\n\nExample:\n2026-05-16 to 2026-05-16"
                 }
             };
-            self.send_message(chat_id, message).await?;
+            if should_remember_analytics_message(action.kind) {
+                self.send_remembered_analytics_message(
+                    chat_id,
+                    action.kind,
+                    AnalyticsMessageSlot::Selector,
+                    message,
+                    None,
+                )
+                .await?;
+            } else {
+                self.send_message(chat_id, message).await?;
+            }
             return Ok(());
         }
 
         if action.kind == AnalyticsKind::Sessions && action.range == AnalyticsRange::Month {
-            self.send_message_internal(
+            self.send_remembered_analytics_message(
                 chat_id,
+                action.kind,
+                AnalyticsMessageSlot::Selector,
                 "History Perjalanan only supports one date at a time.",
                 Some(analytics_range_keyboard(action.kind)),
-                None,
             )
             .await?;
             return Ok(());
@@ -1519,7 +1543,20 @@ impl TelegramBot {
             }
         };
 
-        self.send_message(chat_id, &text).await?;
+        if should_remember_analytics_message(kind) {
+            self.delete_remembered_analytics_message(chat_id, kind, AnalyticsMessageSlot::Selector)
+                .await?;
+            self.send_remembered_analytics_message(
+                chat_id,
+                kind,
+                AnalyticsMessageSlot::Report,
+                &text,
+                None,
+            )
+            .await?;
+        } else {
+            self.send_message(chat_id, &text).await?;
+        }
 
         Ok(())
     }
@@ -1791,6 +1828,71 @@ impl TelegramBot {
             .await
     }
 
+    async fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<(), reqwest::Error> {
+        let request = DeleteMessageRequest {
+            chat_id,
+            message_id,
+        };
+
+        let response = self
+            .client
+            .post(format!("{}/deleteMessage", self.base_url))
+            .json(&request)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let _ = response.bytes().await?;
+        Ok(())
+    }
+
+    async fn delete_remembered_analytics_message(
+        &self,
+        chat_id: i64,
+        kind: AnalyticsKind,
+        slot: AnalyticsMessageSlot,
+    ) -> Result<(), BotError> {
+        let message_id =
+            get_last_analytics_message_id(self.database.pool(), chat_id, kind, slot).await?;
+
+        if let Some(message_id) = message_id {
+            if let Err(error) = self.delete_message(chat_id, message_id).await {
+                warn!(
+                    error = %error,
+                    chat_id,
+                    message_id,
+                    analytics_kind = kind.callback_value(),
+                    analytics_slot = slot.state_value(),
+                    "failed to delete previous analytics message; continuing"
+                );
+            }
+
+            clear_last_analytics_message_id(self.database.pool(), chat_id, kind, slot).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn send_remembered_analytics_message(
+        &self,
+        chat_id: i64,
+        kind: AnalyticsKind,
+        slot: AnalyticsMessageSlot,
+        text: &str,
+        reply_markup: Option<InlineKeyboardMarkup>,
+    ) -> Result<(), BotError> {
+        self.delete_remembered_analytics_message(chat_id, kind, slot)
+            .await?;
+
+        let message_id = self
+            .send_message_internal(chat_id, text, reply_markup, None)
+            .await?;
+        set_last_analytics_message_id(self.database.pool(), chat_id, kind, slot, message_id)
+            .await?;
+
+        Ok(())
+    }
+
     async fn edit_message_reply_markup(
         &self,
         chat_id: i64,
@@ -1909,6 +2011,12 @@ struct EditMessageReplyMarkupRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct DeleteMessageRequest {
+    chat_id: i64,
+    message_id: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct AnswerCallbackQueryRequest {
     callback_query_id: String,
     text: String,
@@ -1984,7 +2092,7 @@ fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
                     ),
                 },
                 InlineKeyboardButton {
-                    text: "Ride Stats".to_string(),
+                    text: "Aktivitas Kendaraan".to_string(),
                     callback_data: analytics_callback_data(
                         AnalyticsKind::Metrics,
                         AnalyticsRange::Select,
@@ -3351,6 +3459,68 @@ fn pending_analytics_state_key(chat_id: i64) -> String {
     format!("analytics_pending:{chat_id}")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnalyticsMessageSlot {
+    Selector,
+    Report,
+}
+
+impl AnalyticsMessageSlot {
+    fn state_value(self) -> &'static str {
+        match self {
+            Self::Selector => "selector",
+            Self::Report => "report",
+        }
+    }
+}
+
+fn should_remember_analytics_message(kind: AnalyticsKind) -> bool {
+    matches!(kind, AnalyticsKind::Sessions | AnalyticsKind::Metrics)
+}
+
+fn analytics_message_state_key(
+    chat_id: i64,
+    kind: AnalyticsKind,
+    slot: AnalyticsMessageSlot,
+) -> String {
+    format!(
+        "analytics_message:{chat_id}:{}:{}",
+        kind.callback_value(),
+        slot.state_value()
+    )
+}
+
+async fn set_last_analytics_message_id(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    kind: AnalyticsKind,
+    slot: AnalyticsMessageSlot,
+    message_id: i64,
+) -> Result<(), sqlx::Error> {
+    let key = analytics_message_state_key(chat_id, kind, slot);
+    set_state_i64(pool, &key, message_id).await
+}
+
+async fn get_last_analytics_message_id(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    kind: AnalyticsKind,
+    slot: AnalyticsMessageSlot,
+) -> Result<Option<i64>, sqlx::Error> {
+    let key = analytics_message_state_key(chat_id, kind, slot);
+    get_state_i64(pool, &key).await
+}
+
+async fn clear_last_analytics_message_id(
+    pool: &sqlx::PgPool,
+    chat_id: i64,
+    kind: AnalyticsKind,
+    slot: AnalyticsMessageSlot,
+) -> Result<(), sqlx::Error> {
+    let key = analytics_message_state_key(chat_id, kind, slot);
+    delete_state_key(pool, &key).await
+}
+
 async fn get_pending_analytics_kind(
     pool: &sqlx::PgPool,
     chat_id: i64,
@@ -4164,6 +4334,27 @@ mod tests {
         let keyboard = subscribed_start_menu_keyboard();
 
         assert_eq!(keyboard.inline_keyboard[0][1].text, "Status terkini");
+        assert_eq!(keyboard.inline_keyboard[1][1].text, "Aktivitas Kendaraan");
+    }
+
+    #[test]
+    fn builds_analytics_message_state_keys() {
+        assert_eq!(
+            analytics_message_state_key(
+                12345,
+                AnalyticsKind::Sessions,
+                AnalyticsMessageSlot::Selector
+            ),
+            "analytics_message:12345:sessions:selector"
+        );
+        assert_eq!(
+            analytics_message_state_key(
+                12345,
+                AnalyticsKind::Metrics,
+                AnalyticsMessageSlot::Report
+            ),
+            "analytics_message:12345:metrics:report"
+        );
     }
 
     #[test]
@@ -4871,6 +5062,60 @@ mod tests {
         clear_pending_analytics_kind(database.pool(), 12345).await?;
         assert_eq!(
             get_pending_analytics_kind(database.pool(), 12345).await?,
+            None
+        );
+
+        set_last_analytics_message_id(
+            database.pool(),
+            12345,
+            AnalyticsKind::Sessions,
+            AnalyticsMessageSlot::Selector,
+            9001,
+        )
+        .await?;
+        set_last_analytics_message_id(
+            database.pool(),
+            12345,
+            AnalyticsKind::Metrics,
+            AnalyticsMessageSlot::Report,
+            9002,
+        )
+        .await?;
+        assert_eq!(
+            get_last_analytics_message_id(
+                database.pool(),
+                12345,
+                AnalyticsKind::Sessions,
+                AnalyticsMessageSlot::Selector,
+            )
+            .await?,
+            Some(9001)
+        );
+        assert_eq!(
+            get_last_analytics_message_id(
+                database.pool(),
+                12345,
+                AnalyticsKind::Metrics,
+                AnalyticsMessageSlot::Report,
+            )
+            .await?,
+            Some(9002)
+        );
+        clear_last_analytics_message_id(
+            database.pool(),
+            12345,
+            AnalyticsKind::Sessions,
+            AnalyticsMessageSlot::Selector,
+        )
+        .await?;
+        assert_eq!(
+            get_last_analytics_message_id(
+                database.pool(),
+                12345,
+                AnalyticsKind::Sessions,
+                AnalyticsMessageSlot::Selector,
+            )
+            .await?,
             None
         );
 
