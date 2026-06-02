@@ -13,6 +13,7 @@ pub const SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS: i64 = 5;
 pub const SUBSCRIPTION_DAILY_FINE_IDR: i64 = 1_000;
 pub const SUBSCRIPTION_MAX_FINE_DAYS: i64 = 7;
 pub const SUBSCRIPTION_MAX_FINE_IDR: i64 = SUBSCRIPTION_DAILY_FINE_IDR * SUBSCRIPTION_MAX_FINE_DAYS;
+pub const CUSTOMER_REFERENCED_DEVICE_FEE_IDR: i64 = 10_000;
 
 #[derive(Debug, Error)]
 pub enum SubscriptionMaintenanceError {
@@ -31,6 +32,7 @@ pub enum SubscriptionMaintenanceError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubscriptionPaymentQuote {
     pub base_amount_idr: i64,
+    pub customer_reference_fee_idr: i64,
     pub fine_amount_idr: i64,
     pub total_amount_idr: i64,
     pub overdue_days: i64,
@@ -143,6 +145,22 @@ pub async fn build_subscription_payment_quote(
     base_amount_idr: i64,
     now: DateTime<Utc>,
 ) -> Result<SubscriptionPaymentQuote, sqlx::Error> {
+    let has_customer_referenced_device = sqlx::query(
+        r#"
+        SELECT d.referenced_by_customer_id IS NOT NULL AS has_customer_referenced_device
+        FROM telegram_users tu
+        LEFT JOIN devices d
+          ON d.imei = tu.bound_imei
+        WHERE tu.telegram_user_id = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(telegram_user_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|row| row.get::<bool, _>("has_customer_referenced_device"))
+    .unwrap_or(false);
+
     let current_period_end_at = sqlx::query(
         r#"
         SELECT current_period_end_at
@@ -162,11 +180,17 @@ pub async fn build_subscription_payment_quote(
         .map(|period_end| overdue_days_wib(period_end, now))
         .unwrap_or(0);
     let fine_amount_idr = fine_amount_for_overdue_days(overdue_days);
+    let customer_reference_fee_idr = if has_customer_referenced_device {
+        CUSTOMER_REFERENCED_DEVICE_FEE_IDR
+    } else {
+        0
+    };
 
     Ok(SubscriptionPaymentQuote {
         base_amount_idr,
+        customer_reference_fee_idr,
         fine_amount_idr,
-        total_amount_idr: base_amount_idr + fine_amount_idr,
+        total_amount_idr: base_amount_idr + customer_reference_fee_idr + fine_amount_idr,
         overdue_days,
         withdrawal_required: overdue_days > SUBSCRIPTION_MAX_FINE_DAYS,
     })

@@ -151,10 +151,11 @@ impl MidtransClient {
         &self,
         order_id: &str,
         created_at: DateTime<Utc>,
+        effective_base_amount_idr: i64,
         gross_amount_idr: i64,
         fine_amount_idr: i64,
     ) -> Result<MidtransCreatedPayment, MidtransError> {
-        let mut item_details = if self.price_idr >= MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR {
+        let mut item_details = if effective_base_amount_idr >= MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR {
             let mut details = vec![
                 MidtransItemDetail {
                     id: "internet_data".to_string(),
@@ -176,7 +177,7 @@ impl MidtransClient {
                 },
             ];
             let breakdown_total = 35_000;
-            let remainder = self.price_idr - breakdown_total;
+            let remainder = effective_base_amount_idr - breakdown_total;
             if remainder > 0 {
                 details.push(MidtransItemDetail {
                     id: "heartbeats_service".to_string(),
@@ -189,7 +190,7 @@ impl MidtransClient {
         } else {
             vec![MidtransItemDetail {
                 id: MIDTRANS_PLAN_CODE.to_string(),
-                price: self.price_idr,
+                price: effective_base_amount_idr,
                 quantity: 1,
                 name: "Akses Heartbeats 30 Hari".to_string(),
             }]
@@ -292,7 +293,7 @@ pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<U
 pub fn format_midtrans_payment_message_with_quote(
     payment_url: &str,
     expires_at: DateTime<Utc>,
-    base_amount_idr: i64,
+    effective_base_amount_idr: i64,
     fine_amount_idr: i64,
     total_amount_idr: i64,
 ) -> String {
@@ -315,7 +316,7 @@ pub fn format_midtrans_payment_message_with_quote(
 
     format!(
         "Heartbeats Monthly Access\n{} - 30 Days{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
-        format_idr(base_amount_idr),
+        format_idr(effective_base_amount_idr),
         fine_line,
         total_line,
         expires_at.format("%d %b %Y %H:%M WIB")

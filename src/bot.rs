@@ -1059,6 +1059,7 @@ impl TelegramBot {
                     .create_snap_transaction(
                         &order_id,
                         created_at,
+                        payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
                         payment_quote.total_amount_idr,
                         payment_quote.fine_amount_idr,
                     )
@@ -1070,7 +1071,7 @@ impl TelegramBot {
                 let payment_message = format_midtrans_payment_message_with_quote(
                     &created.payment_url,
                     created.expires_at,
-                    payment_quote.base_amount_idr,
+                    payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
                     payment_quote.fine_amount_idr,
                     payment_quote.total_amount_idr,
                 );
@@ -4205,11 +4206,12 @@ mod tests {
     use crate::config::Config;
     use crate::db::Database;
     use crate::midtrans::{
-        apply_midtrans_webhook, MidtransPaymentStatus, MidtransWebhookApplyOutcome,
-        MidtransWebhookNotification,
+        apply_midtrans_webhook, format_midtrans_payment_message_with_quote, MidtransPaymentStatus,
+        MidtransWebhookApplyOutcome, MidtransWebhookNotification,
     };
     use crate::subscription_maintenance::{
-        build_subscription_payment_quote, SUBSCRIPTION_MAX_FINE_IDR,
+        build_subscription_payment_quote, CUSTOMER_REFERENCED_DEVICE_FEE_IDR,
+        SUBSCRIPTION_MAX_FINE_IDR,
     };
 
     fn database_url() -> Option<String> {
@@ -4677,6 +4679,42 @@ mod tests {
         let text = format_theft_location_message(None);
         assert!(text.contains("Latest location"));
         assert!(text.contains("Lokasi terakhir belum tersedia"));
+    }
+
+    #[test]
+    fn formats_midtrans_payment_message_with_effective_service_price() {
+        let expires_at = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+        let message = format_midtrans_payment_message_with_quote(
+            "https://pay.example.test/order?a=1&b=2",
+            expires_at,
+            45_000,
+            0,
+            45_000,
+        );
+
+        assert!(message.contains("Rp 45.000 - 30 Days"));
+        assert!(!message.contains("Customer"));
+        assert!(!message.contains("add"));
+        assert!(!message.contains("Late sanction"));
+        assert!(!message.contains("Total:"));
+        assert!(message.contains("https://pay.example.test/order?a=1&amp;b=2"));
+    }
+
+    #[test]
+    fn formats_midtrans_payment_message_with_late_sanction_total() {
+        let expires_at = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+        let message = format_midtrans_payment_message_with_quote(
+            "https://pay.example.test/order",
+            expires_at,
+            45_000,
+            3_000,
+            48_000,
+        );
+
+        assert!(message.contains("Rp 45.000 - 30 Days"));
+        assert!(message.contains("Late sanction: Rp 3.000"));
+        assert!(message.contains("Total: Rp 48.000"));
+        assert!(!message.contains("Customer"));
     }
 
     #[test]
@@ -5423,10 +5461,162 @@ mod tests {
         .await?;
 
         assert_eq!(active_quote.total_amount_idr, base_amount_idr);
+        assert_eq!(active_quote.customer_reference_fee_idr, 0);
         assert_eq!(late_quote.fine_amount_idr, 3_000);
         assert_eq!(late_quote.total_amount_idr, 38_000);
         assert_eq!(very_late_quote.fine_amount_idr, SUBSCRIPTION_MAX_FINE_IDR);
         assert_eq!(very_late_quote.total_amount_idr, 42_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builds_subscription_payment_quote_with_customer_referenced_device_fee(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let normal_user_id = 8_885_000_004_i64;
+        let referenced_user_id = 8_885_000_005_i64;
+        let late_referenced_user_id = 8_885_000_006_i64;
+        let normal_imei = "999888777666564";
+        let referenced_imei = "999888777666565";
+        let late_referenced_imei = "999888777666566";
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+        let base_amount_idr = 35_000;
+
+        sqlx::query(
+            "DELETE FROM telegram_subscription_sanctions WHERE telegram_user_id BETWEEN $1 AND $2",
+        )
+        .bind(normal_user_id)
+        .bind(late_referenced_user_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(normal_user_id)
+            .bind(late_referenced_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id BETWEEN $1 AND $2")
+            .bind(normal_user_id)
+            .bind(late_referenced_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = ANY($1)")
+            .bind(vec![normal_imei, referenced_imei, late_referenced_imei])
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM customers WHERE id_card LIKE 'quote-test-%'")
+            .execute(database.pool())
+            .await?;
+
+        let customer_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO customers (
+                name, phone_number, address, imei, id_card, created_at, updated_at
+            )
+            VALUES ('Quote Test Customer', '081234567890', 'Jakarta', $1, 'quote-test-1', NOW(), NOW())
+            RETURNING id
+            "#,
+        )
+        .bind(referenced_imei)
+        .fetch_one(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr,
+                referenced_by_customer_id, created_at, updated_at
+            )
+            VALUES
+                ($1, NOW(), NOW(), 'test', NULL, NOW(), NOW()),
+                ($2, NOW(), NOW(), 'test', $4, NOW(), NOW()),
+                ($3, NOW(), NOW(), 'test', $4, NOW(), NOW())
+            "#,
+        )
+        .bind(normal_imei)
+        .bind(referenced_imei)
+        .bind(late_referenced_imei)
+        .bind(customer_id)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES
+                ($1, $1, $4, 'bound', NOW(), NOW()),
+                ($2, $2, $5, 'bound', NOW(), NOW()),
+                ($3, $3, $6, 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(normal_user_id)
+        .bind(referenced_user_id)
+        .bind(late_referenced_user_id)
+        .bind(normal_imei)
+        .bind(referenced_imei)
+        .bind(late_referenced_imei)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES ($1, $1, $2, 'active', $3, $4, NOW(), NOW())
+            "#,
+        )
+        .bind(late_referenced_user_id)
+        .bind(MIDTRANS_PLAN_CODE)
+        .bind(now - chrono::Duration::days(40))
+        .bind(Utc.with_ymd_and_hms(2026, 6, 30, 17, 0, 0).unwrap())
+        .execute(database.pool())
+        .await?;
+
+        let normal_quote =
+            build_subscription_payment_quote(database.pool(), normal_user_id, base_amount_idr, now)
+                .await?;
+        let referenced_quote = build_subscription_payment_quote(
+            database.pool(),
+            referenced_user_id,
+            base_amount_idr,
+            now,
+        )
+        .await?;
+        let late_referenced_quote = build_subscription_payment_quote(
+            database.pool(),
+            late_referenced_user_id,
+            base_amount_idr,
+            now,
+        )
+        .await?;
+
+        assert_eq!(normal_quote.customer_reference_fee_idr, 0);
+        assert_eq!(normal_quote.total_amount_idr, 35_000);
+        assert_eq!(
+            referenced_quote.customer_reference_fee_idr,
+            CUSTOMER_REFERENCED_DEVICE_FEE_IDR
+        );
+        assert_eq!(referenced_quote.total_amount_idr, 45_000);
+        assert_eq!(
+            late_referenced_quote.customer_reference_fee_idr,
+            CUSTOMER_REFERENCED_DEVICE_FEE_IDR
+        );
+        assert_eq!(late_referenced_quote.fine_amount_idr, 3_000);
+        assert_eq!(late_referenced_quote.total_amount_idr, 48_000);
 
         Ok(())
     }
