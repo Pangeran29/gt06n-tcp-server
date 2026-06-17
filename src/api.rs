@@ -4,9 +4,9 @@ use std::sync::Arc;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -36,6 +36,12 @@ pub enum ApiError {
     InvalidStartAt,
     #[error("invalid end_at query parameter")]
     InvalidEndAt,
+    #[error("invalid sort_order query parameter; expected asc or desc")]
+    InvalidSortOrder,
+    #[error("invalid sim_card_expiration_date; expected YYYY-MM-DD or null")]
+    InvalidSimCardExpirationDate,
+    #[error("device not found")]
+    DeviceNotFound,
     #[error("database query failed: {0}")]
     Query(#[from] sqlx::Error),
     #[error("telegram api request failed: {0}")]
@@ -53,8 +59,11 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::InvalidStartAt
             | Self::InvalidEndAt
+            | Self::InvalidSortOrder
+            | Self::InvalidSimCardExpirationDate
             | Self::InvalidMidtransSignature
             | Self::UnsupportedMidtransStatus => StatusCode::BAD_REQUEST,
+            Self::DeviceNotFound => StatusCode::NOT_FOUND,
             Self::MissingDatabase | Self::MissingMidtransServerKey => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -95,6 +104,34 @@ struct LocationsQuery {
     end_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubscriptionsQuery {
+    sort_order: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortOrder {
+    Asc,
+    Desc,
+}
+
+impl SortOrder {
+    fn parse(value: Option<&str>) -> Result<Self, ApiError> {
+        match value.unwrap_or("asc").to_ascii_lowercase().as_str() {
+            "asc" => Ok(Self::Asc),
+            "desc" => Ok(Self::Desc),
+            _ => Err(ApiError::InvalidSortOrder),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Asc => "asc",
+            Self::Desc => "desc",
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct LocationHistoryResponse {
     imei: String,
@@ -114,6 +151,31 @@ struct LocationPoint {
     satellite_count: i32,
 }
 
+#[derive(Debug, Serialize)]
+struct SubscriptionResponse {
+    telegram_user_id: i64,
+    chat_id: i64,
+    bound_imei: Option<String>,
+    status: String,
+    current_period_start_at: Option<String>,
+    current_period_end_at: Option<String>,
+    first_subscribed_at: Option<String>,
+    subscribed_days: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceSimCardResponse {
+    id: i64,
+    imei: String,
+    sim_card: Option<String>,
+    sim_card_expiration_date: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateSimCardExpirationRequest {
+    sim_card_expiration_date: Option<String>,
+}
+
 impl HttpApiServer {
     pub async fn from_config(config: &Config) -> Result<Self, ApiError> {
         let database = Database::connect(config)
@@ -128,6 +190,12 @@ impl HttpApiServer {
 
         let router = Router::new()
             .route("/api/devices/{imei}/locations", get(get_device_locations))
+            .route("/api/devices/sim-cards", get(get_device_sim_cards))
+            .route(
+                "/api/devices/{imei}/sim-card-expiration",
+                patch(update_device_sim_card_expiration),
+            )
+            .route("/api/subscriptions", get(get_subscriptions))
             .route("/api/midtrans/webhook", post(post_midtrans_webhook))
             .with_state(state);
 
@@ -159,6 +227,147 @@ struct MidtransWebhookResponse {
 struct TelegramSendMessageRequest {
     chat_id: i64,
     text: String,
+}
+
+async fn get_subscriptions(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SubscriptionsQuery>,
+) -> Result<Json<Vec<SubscriptionResponse>>, ApiError> {
+    let sort_order = SortOrder::parse(query.sort_order.as_deref())?;
+    let rows = sqlx::query(
+        r#"
+        SELECT ts.telegram_user_id,
+               ts.chat_id,
+               tu.bound_imei,
+               ts.status,
+               ts.current_period_start_at,
+               ts.current_period_end_at,
+               payments.first_subscribed_at
+        FROM telegram_subscriptions ts
+        JOIN telegram_users tu
+          ON tu.telegram_user_id = ts.telegram_user_id
+        LEFT JOIN (
+            SELECT telegram_user_id, plan_code, MIN(paid_at) AS first_subscribed_at
+            FROM telegram_payment_events
+            WHERE payment_status = 'paid'
+              AND paid_at IS NOT NULL
+            GROUP BY telegram_user_id, plan_code
+        ) payments
+          ON payments.telegram_user_id = ts.telegram_user_id
+         AND payments.plan_code = ts.plan_code
+        ORDER BY
+            CASE WHEN $1 = 'asc' THEN ts.current_period_end_at END ASC NULLS LAST,
+            CASE WHEN $1 = 'desc' THEN ts.current_period_end_at END DESC NULLS LAST,
+            ts.telegram_user_id ASC
+        "#,
+    )
+    .bind(sort_order.as_str())
+    .fetch_all(&state.pool)
+    .await?;
+
+    let now = Utc::now();
+    let subscriptions = rows
+        .into_iter()
+        .map(|row| {
+            let period_start =
+                row.get::<Option<DateTime<Utc>>, _>("current_period_start_at");
+            let period_end = row.get::<Option<DateTime<Utc>>, _>("current_period_end_at");
+            let first_subscribed_at =
+                row.get::<Option<DateTime<Utc>>, _>("first_subscribed_at");
+
+            SubscriptionResponse {
+                telegram_user_id: row.get("telegram_user_id"),
+                chat_id: row.get("chat_id"),
+                bound_imei: row.get("bound_imei"),
+                status: row.get("status"),
+                current_period_start_at: period_start.map(|value| value.to_rfc3339()),
+                current_period_end_at: period_end.map(|value| value.to_rfc3339()),
+                first_subscribed_at: first_subscribed_at.map(|value| value.to_rfc3339()),
+                subscribed_days: first_subscribed_at
+                    .map(|value| complete_subscribed_days(value, now)),
+            }
+        })
+        .collect();
+
+    Ok(Json(subscriptions))
+}
+
+async fn get_device_sim_cards(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DeviceSimCardResponse>>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT id, imei, sim_card, sim_card_expiration_date
+        FROM devices
+        ORDER BY sim_card_expiration_date ASC NULLS LAST, imei ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let devices = rows
+        .into_iter()
+        .map(|row| {
+            let expiration_date =
+                row.get::<Option<NaiveDate>, _>("sim_card_expiration_date");
+
+            DeviceSimCardResponse {
+                id: row.get("id"),
+                imei: row.get("imei"),
+                sim_card: row.get("sim_card"),
+                sim_card_expiration_date: expiration_date
+                    .map(|value| value.format("%Y-%m-%d").to_string()),
+            }
+        })
+        .collect();
+
+    Ok(Json(devices))
+}
+
+async fn update_device_sim_card_expiration(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+    Json(request): Json<UpdateSimCardExpirationRequest>,
+) -> Result<Json<DeviceSimCardResponse>, ApiError> {
+    let expiration_date = parse_optional_expiration_date(request.sim_card_expiration_date)?;
+    let row = sqlx::query(
+        r#"
+        UPDATE devices
+        SET sim_card_expiration_date = $2,
+            updated_at = NOW()
+        WHERE imei = $1
+        RETURNING id, imei, sim_card, sim_card_expiration_date
+        "#,
+    )
+    .bind(&imei)
+    .bind(expiration_date)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::DeviceNotFound)?;
+
+    let expiration_date = row.get::<Option<NaiveDate>, _>("sim_card_expiration_date");
+    Ok(Json(DeviceSimCardResponse {
+        id: row.get("id"),
+        imei: row.get("imei"),
+        sim_card: row.get("sim_card"),
+        sim_card_expiration_date: expiration_date
+            .map(|value| value.format("%Y-%m-%d").to_string()),
+    }))
+}
+
+fn parse_optional_expiration_date(value: Option<String>) -> Result<Option<NaiveDate>, ApiError> {
+    value
+        .map(|value| {
+            NaiveDate::parse_from_str(&value, "%Y-%m-%d")
+                .map_err(|_| ApiError::InvalidSimCardExpirationDate)
+        })
+        .transpose()
+}
+
+fn complete_subscribed_days(first_subscribed_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
+    now.signed_duration_since(first_subscribed_at)
+        .num_days()
+        .max(0)
 }
 
 async fn get_device_locations(
@@ -298,6 +507,64 @@ async fn send_telegram_message(
         .error_for_status()?;
     let _ = response.bytes().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::{complete_subscribed_days, parse_optional_expiration_date, ApiError, SortOrder};
+
+    #[test]
+    fn subscription_sort_order_defaults_to_ascending() {
+        assert_eq!(SortOrder::parse(None).unwrap(), SortOrder::Asc);
+        assert_eq!(SortOrder::parse(Some("asc")).unwrap(), SortOrder::Asc);
+        assert_eq!(SortOrder::parse(Some("DESC")).unwrap(), SortOrder::Desc);
+    }
+
+    #[test]
+    fn subscription_sort_order_rejects_unsupported_values() {
+        assert!(matches!(
+            SortOrder::parse(Some("newest")),
+            Err(ApiError::InvalidSortOrder)
+        ));
+    }
+
+    #[test]
+    fn subscribed_days_counts_only_complete_days() {
+        let first_subscribed_at = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 3, 11, 59, 59).unwrap();
+
+        assert_eq!(complete_subscribed_days(first_subscribed_at, now), 1);
+    }
+
+    #[test]
+    fn subscribed_days_does_not_return_negative_values() {
+        let first_subscribed_at = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+
+        assert_eq!(complete_subscribed_days(first_subscribed_at, now), 0);
+    }
+
+    #[test]
+    fn parses_or_clears_sim_card_expiration_date() {
+        assert_eq!(
+            parse_optional_expiration_date(Some("2026-08-31".to_string()))
+                .unwrap()
+                .unwrap()
+                .to_string(),
+            "2026-08-31"
+        );
+        assert_eq!(parse_optional_expiration_date(None).unwrap(), None);
+    }
+
+    #[test]
+    fn rejects_invalid_sim_card_expiration_date() {
+        assert!(matches!(
+            parse_optional_expiration_date(Some("31-08-2026".to_string())),
+            Err(ApiError::InvalidSimCardExpirationDate)
+        ));
+    }
 }
 
 async fn send_telegram_sticker(
