@@ -42,6 +42,7 @@ Business meaning:
 What it stores:
 
 - IMEI
+- pricing tier (`basic` or `ojol`)
 - SIM card number / label
 - SIM card expiration date
 - first seen / last seen
@@ -168,8 +169,8 @@ Why it exists:
 Business meaning:
 
 - this is the current paid-access state for a Telegram user
-- one row represents one subscription plan for one Telegram account
-- the first plan is still `monthly_stars` for compatibility with existing entitlement checks
+- one row represents the current subscription state for one Telegram account
+- current plan codes are `monthly_basic` and `monthly_ojol`
 
 What it stores:
 
@@ -190,10 +191,11 @@ Allowed status values:
 Why it exists:
 
 - gives the bot one fast place to check whether a Telegram user has paid access
+- keeps only the current subscription state, even if the user changes plan later
 - keeps entitlement state separate from raw payment events
 - can support one-time 30-day Midtrans Snap payments now and recurring subscriptions later
 
-The payment owner is the Telegram user, not the IMEI. Device-level or shared-device access can be added later without changing the payment ledger.
+The payment owner is still the Telegram user, but pricing tier selection now comes from the bound device record.
 
 ### `telegram_payment_events`
 

@@ -12,8 +12,8 @@ use crate::config::Config;
 use crate::db::Database;
 use crate::midtrans::{
     build_midtrans_order_id, create_pending_midtrans_payment,
-    format_midtrans_payment_message_with_quote, mark_midtrans_payment_created, MidtransClient,
-    MIDTRANS_PLAN_CODE,
+    format_midtrans_payment_message_with_quote, mark_midtrans_payment_created, parse_pricing_tier,
+    MidtransClient, MIDTRANS_BASIC_PLAN_CODE, MIDTRANS_OJOL_PLAN_CODE,
 };
 use crate::subscription_maintenance::build_subscription_payment_quote;
 
@@ -1033,6 +1033,15 @@ impl TelegramBot {
                     .midtrans
                     .as_ref()
                     .ok_or(BotError::MissingMidtransConfig)?;
+                let user = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id)
+                    .await?
+                    .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier("missing_user".to_string()))?;
+                let plan = resolve_subscription_plan_for_user(
+                    self.database.pool(),
+                    midtrans,
+                    &user,
+                )
+                .await?;
                 let payment_menu_message_id = i64::from(message.message_id.unwrap_or_default());
                 let created_at = Utc::now();
                 let order_id = build_midtrans_order_id(telegram_user_id, created_at);
@@ -1040,7 +1049,7 @@ impl TelegramBot {
                 let payment_quote = build_subscription_payment_quote(
                     self.database.pool(),
                     telegram_user_id,
-                    midtrans.price_idr(),
+                    plan,
                     created_at,
                 )
                 .await?;
@@ -1049,6 +1058,7 @@ impl TelegramBot {
                     self.database.pool(),
                     telegram_user_id,
                     chat_id,
+                    plan.plan_code,
                     &order_id,
                     payment_quote.total_amount_idr,
                     expires_at,
@@ -1057,6 +1067,7 @@ impl TelegramBot {
 
                 let created = midtrans
                     .create_snap_transaction(
+                        plan,
                         &order_id,
                         created_at,
                         payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
@@ -1069,6 +1080,7 @@ impl TelegramBot {
                 self.answer_callback_query(&callback_query.id, "", false)
                     .await?;
                 let payment_message = format_midtrans_payment_message_with_quote(
+                    plan,
                     &created.payment_url,
                     created.expires_at,
                     payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
@@ -3326,6 +3338,36 @@ async fn is_device_bound_to_another_user(
     Ok(row.is_some())
 }
 
+async fn resolve_subscription_plan_for_user(
+    pool: &sqlx::PgPool,
+    midtrans: &MidtransClient,
+    user: &TelegramUserRecord,
+) -> Result<crate::midtrans::SubscriptionPlan, BotError> {
+    let imei = user
+        .bound_imei
+        .as_deref()
+        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier("missing_bound_device".to_string()))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT pricing_tier
+        FROM devices
+        WHERE imei = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await?;
+
+    let pricing_tier = row
+        .and_then(|row| row.try_get::<String, _>("pricing_tier").ok())
+        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier(format!("missing_device_pricing_tier:{imei}")))?;
+    let tier = parse_pricing_tier(&pricing_tier)?;
+
+    Ok(midtrans.subscription_plan_for_tier(tier))
+}
+
 async fn fetch_notification_recipients_for_imei(
     pool: &sqlx::PgPool,
     imei: &str,
@@ -3337,7 +3379,7 @@ async fn fetch_notification_recipients_for_imei(
                    SELECT 1
                    FROM telegram_subscriptions ts
                    WHERE ts.telegram_user_id = tu.telegram_user_id
-                     AND ts.plan_code = $2
+                     AND ts.plan_code IN ($2, $3)
                      AND ts.status = 'active'
                      AND ts.current_period_end_at > NOW()
                ) AS has_active_subscription
@@ -3348,7 +3390,8 @@ async fn fetch_notification_recipients_for_imei(
         "#,
     )
     .bind(imei)
-    .bind(MIDTRANS_PLAN_CODE)
+    .bind(MIDTRANS_BASIC_PLAN_CODE)
+    .bind(MIDTRANS_OJOL_PLAN_CODE)
     .fetch_all(pool)
     .await?;
 
@@ -3371,14 +3414,15 @@ async fn has_active_subscription(
         SELECT 1
         FROM telegram_subscriptions
         WHERE telegram_user_id = $1
-          AND plan_code = $2
+          AND plan_code IN ($2, $3)
           AND status = 'active'
-          AND current_period_end_at > $3
+          AND current_period_end_at > $4
         LIMIT 1
         "#,
     )
     .bind(telegram_user_id)
-    .bind(MIDTRANS_PLAN_CODE)
+    .bind(MIDTRANS_BASIC_PLAN_CODE)
+    .bind(MIDTRANS_OJOL_PLAN_CODE)
     .bind(reference_time)
     .fetch_optional(pool)
     .await?;
@@ -4207,7 +4251,8 @@ mod tests {
     use crate::db::Database;
     use crate::midtrans::{
         apply_midtrans_webhook, format_midtrans_payment_message_with_quote, MidtransPaymentStatus,
-        MidtransWebhookApplyOutcome, MidtransWebhookNotification,
+        MidtransWebhookApplyOutcome, MidtransWebhookNotification, PricingTier, SubscriptionPlan,
+        MIDTRANS_BASIC_PLAN_CODE, MIDTRANS_OJOL_PLAN_CODE,
     };
     use crate::subscription_maintenance::{
         build_subscription_payment_quote, CUSTOMER_REFERENCED_DEVICE_FEE_IDR,
@@ -4216,6 +4261,22 @@ mod tests {
 
     fn database_url() -> Option<String> {
         env::var("GT06_TEST_DATABASE_URL").ok()
+    }
+
+    fn basic_plan(price_idr: i64) -> SubscriptionPlan {
+        SubscriptionPlan {
+            tier: PricingTier::Basic,
+            plan_code: MIDTRANS_BASIC_PLAN_CODE,
+            price_idr,
+        }
+    }
+
+    fn ojol_plan(price_idr: i64) -> SubscriptionPlan {
+        SubscriptionPlan {
+            tier: PricingTier::Ojol,
+            plan_code: MIDTRANS_OJOL_PLAN_CODE,
+            price_idr,
+        }
     }
 
     #[test]
@@ -4685,6 +4746,7 @@ mod tests {
     fn formats_midtrans_payment_message_with_effective_service_price() {
         let expires_at = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
         let message = format_midtrans_payment_message_with_quote(
+            basic_plan(35_000),
             "https://pay.example.test/order?a=1&b=2",
             expires_at,
             45_000,
@@ -4692,6 +4754,7 @@ mod tests {
             45_000,
         );
 
+        assert!(message.contains("Heartbeats Basic"));
         assert!(message.contains("Rp 45.000 - 30 Days"));
         assert!(!message.contains("Customer"));
         assert!(!message.contains("add"));
@@ -4704,6 +4767,7 @@ mod tests {
     fn formats_midtrans_payment_message_with_late_sanction_total() {
         let expires_at = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
         let message = format_midtrans_payment_message_with_quote(
+            ojol_plan(30_000),
             "https://pay.example.test/order",
             expires_at,
             45_000,
@@ -4711,6 +4775,7 @@ mod tests {
             48_000,
         );
 
+        assert!(message.contains("Heartbeats Ojol"));
         assert!(message.contains("Rp 45.000 - 30 Days"));
         assert!(message.contains("Late sanction: Rp 3.000"));
         assert!(message.contains("Total: Rp 48.000"));
@@ -5354,7 +5419,7 @@ mod tests {
         )
         .bind(active_user_id)
         .bind(expired_user_id)
-        .bind(MIDTRANS_PLAN_CODE)
+        .bind(MIDTRANS_BASIC_PLAN_CODE)
         .bind(reference_time - chrono::Duration::days(1))
         .bind(reference_time + chrono::Duration::days(1))
         .bind(reference_time - chrono::Duration::seconds(1))
@@ -5386,8 +5451,6 @@ mod tests {
         let late_user_id = 8_885_000_002_i64;
         let very_late_user_id = 8_885_000_003_i64;
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
-        let base_amount_idr = 35_000;
-
         sqlx::query(
             "DELETE FROM telegram_subscription_sanctions WHERE telegram_user_id BETWEEN $1 AND $2",
         )
@@ -5438,7 +5501,7 @@ mod tests {
         .bind(active_user_id)
         .bind(late_user_id)
         .bind(very_late_user_id)
-        .bind(MIDTRANS_PLAN_CODE)
+        .bind(MIDTRANS_BASIC_PLAN_CODE)
         .bind(now - chrono::Duration::days(40))
         .bind(now + chrono::Duration::days(1))
         .bind(Utc.with_ymd_and_hms(2026, 6, 30, 17, 0, 0).unwrap())
@@ -5446,21 +5509,29 @@ mod tests {
         .execute(database.pool())
         .await?;
 
-        let active_quote =
-            build_subscription_payment_quote(database.pool(), active_user_id, base_amount_idr, now)
-                .await?;
-        let late_quote =
-            build_subscription_payment_quote(database.pool(), late_user_id, base_amount_idr, now)
-                .await?;
+        let active_quote = build_subscription_payment_quote(
+            database.pool(),
+            active_user_id,
+            basic_plan(35_000),
+            now,
+        )
+        .await?;
+        let late_quote = build_subscription_payment_quote(
+            database.pool(),
+            late_user_id,
+            basic_plan(35_000),
+            now,
+        )
+        .await?;
         let very_late_quote = build_subscription_payment_quote(
             database.pool(),
             very_late_user_id,
-            base_amount_idr,
+            basic_plan(35_000),
             now,
         )
         .await?;
 
-        assert_eq!(active_quote.total_amount_idr, base_amount_idr);
+        assert_eq!(active_quote.total_amount_idr, 35_000);
         assert_eq!(active_quote.customer_reference_fee_idr, 0);
         assert_eq!(late_quote.fine_amount_idr, 3_000);
         assert_eq!(late_quote.total_amount_idr, 38_000);
@@ -5491,8 +5562,6 @@ mod tests {
         let referenced_imei = "999888777666565";
         let late_referenced_imei = "999888777666566";
         let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
-        let base_amount_idr = 35_000;
-
         sqlx::query(
             "DELETE FROM telegram_subscription_sanctions WHERE telegram_user_id BETWEEN $1 AND $2",
         )
@@ -5580,26 +5649,30 @@ mod tests {
             "#,
         )
         .bind(late_referenced_user_id)
-        .bind(MIDTRANS_PLAN_CODE)
+        .bind(MIDTRANS_BASIC_PLAN_CODE)
         .bind(now - chrono::Duration::days(40))
         .bind(Utc.with_ymd_and_hms(2026, 6, 30, 17, 0, 0).unwrap())
         .execute(database.pool())
         .await?;
 
-        let normal_quote =
-            build_subscription_payment_quote(database.pool(), normal_user_id, base_amount_idr, now)
-                .await?;
+        let normal_quote = build_subscription_payment_quote(
+            database.pool(),
+            normal_user_id,
+            basic_plan(35_000),
+            now,
+        )
+        .await?;
         let referenced_quote = build_subscription_payment_quote(
             database.pool(),
             referenced_user_id,
-            base_amount_idr,
+            basic_plan(35_000),
             now,
         )
         .await?;
         let late_referenced_quote = build_subscription_payment_quote(
             database.pool(),
             late_referenced_user_id,
-            base_amount_idr,
+            basic_plan(35_000),
             now,
         )
         .await?;
@@ -5617,6 +5690,162 @@ mod tests {
         );
         assert_eq!(late_referenced_quote.fine_amount_idr, 3_000);
         assert_eq!(late_referenced_quote.total_amount_idr, 48_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn builds_subscription_payment_quote_for_ojol_tier(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let telegram_user_id = 8_885_000_010_i64;
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = '999888777666567'")
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr, pricing_tier, created_at, updated_at
+            )
+            VALUES ('999888777666567', NOW(), NOW(), '127.0.0.1:5000', 'ojol', NOW(), NOW())
+            "#
+        )
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $1, '999888777666567', 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(telegram_user_id)
+        .execute(database.pool())
+        .await?;
+
+        let quote =
+            build_subscription_payment_quote(database.pool(), telegram_user_id, ojol_plan(30_000), now)
+                .await?;
+
+        assert_eq!(quote.base_amount_idr, 30_000);
+        assert_eq!(quote.fine_amount_idr, 0);
+        assert_eq!(quote.total_amount_idr, 30_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn applies_overdue_sanction_even_when_next_payment_plan_changes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let telegram_user_id = 8_885_000_020_i64;
+        let chat_id = 8_885_000_021_i64;
+        let imei = "999888777666568";
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+
+        sqlx::query("DELETE FROM telegram_subscription_sanctions WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_payment_events WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr, pricing_tier, created_at, updated_at
+            )
+            VALUES ($1, NOW(), NOW(), '127.0.0.1:5000', 'ojol', NOW(), NOW())
+            "#,
+        )
+        .bind(imei)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(imei)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES ($1, $2, 'monthly_basic', 'active', $3, $4, NOW(), NOW())
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(now - chrono::Duration::days(40))
+        .bind(Utc.with_ymd_and_hms(2026, 6, 30, 17, 0, 0).unwrap())
+        .execute(database.pool())
+        .await?;
+
+        let quote =
+            build_subscription_payment_quote(database.pool(), telegram_user_id, ojol_plan(30_000), now)
+                .await?;
+
+        assert_eq!(quote.base_amount_idr, 30_000);
+        assert_eq!(quote.fine_amount_idr, 3_000);
+        assert_eq!(quote.total_amount_idr, 33_000);
 
         Ok(())
     }
@@ -5690,7 +5919,7 @@ mod tests {
         .bind(first_user_id + 2)
         .bind(first_user_id + 3)
         .bind(last_user_id)
-        .bind(MIDTRANS_PLAN_CODE)
+        .bind(MIDTRANS_BASIC_PLAN_CODE)
         .execute(database.pool())
         .await?;
 
@@ -6011,6 +6240,20 @@ mod tests {
             .bind(telegram_user_id)
             .execute(database.pool())
             .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = '999888777666555'")
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr, pricing_tier, created_at, updated_at
+            )
+            VALUES ('999888777666555', NOW(), NOW(), '127.0.0.1:5000', 'basic', NOW(), NOW())
+            "#,
+        )
+        .execute(database.pool())
+        .await?;
 
         sqlx::query(
             r#"
@@ -6031,6 +6274,7 @@ mod tests {
             database.pool(),
             telegram_user_id,
             chat_id,
+            MIDTRANS_BASIC_PLAN_CODE,
             &first_order_id,
             2_000,
             first_paid_at + chrono::Duration::hours(24),
@@ -6058,9 +6302,11 @@ mod tests {
         let MidtransWebhookApplyOutcome::Paid(first_subscription) = first_subscription else {
             panic!("paid webhook should activate subscription");
         };
+        let first_subscription_id = first_subscription.id;
         let first_end = first_subscription
             .current_period_end_at
             .expect("first payment should set period end");
+        assert_eq!(first_subscription.plan_code, MIDTRANS_BASIC_PLAN_CODE);
         assert_eq!(
             first_end.signed_duration_since(first_paid_at).num_days(),
             30
@@ -6076,11 +6322,15 @@ mod tests {
         assert_eq!(duplicate_subscription, MidtransWebhookApplyOutcome::Ignored);
 
         let second_paid_at = first_paid_at + chrono::Duration::days(1);
+        sqlx::query("UPDATE devices SET pricing_tier = 'ojol', updated_at = NOW() WHERE imei = '999888777666555'")
+            .execute(database.pool())
+            .await?;
         let second_order_id = build_midtrans_order_id(telegram_user_id, second_paid_at);
         create_pending_midtrans_payment(
             database.pool(),
             telegram_user_id,
             chat_id,
+            MIDTRANS_OJOL_PLAN_CODE,
             &second_order_id,
             2_000,
             second_paid_at + chrono::Duration::hours(24),
@@ -6108,6 +6358,8 @@ mod tests {
         let MidtransWebhookApplyOutcome::Paid(second_subscription) = second_subscription else {
             panic!("second payment should extend subscription");
         };
+        assert_eq!(second_subscription.id, first_subscription_id);
+        assert_eq!(second_subscription.plan_code, MIDTRANS_OJOL_PLAN_CODE);
         let second_end = second_subscription
             .current_period_end_at
             .expect("second payment should set period end");
@@ -6117,12 +6369,29 @@ mod tests {
             30
         );
 
+        let subscription_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telegram_subscriptions WHERE telegram_user_id = $1",
+        )
+        .bind(telegram_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(subscription_rows, 1);
+
+        let current_plan_code: String = sqlx::query_scalar(
+            "SELECT plan_code FROM telegram_subscriptions WHERE telegram_user_id = $1",
+        )
+        .bind(telegram_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(current_plan_code, MIDTRANS_OJOL_PLAN_CODE);
+
         let expired_at = first_paid_at + chrono::Duration::hours(2);
         let expired_order_id = build_midtrans_order_id(telegram_user_id, expired_at);
         create_pending_midtrans_payment(
             database.pool(),
             telegram_user_id,
             chat_id,
+            MIDTRANS_BASIC_PLAN_CODE,
             &expired_order_id,
             2_000,
             expired_at + chrono::Duration::hours(24),
@@ -6210,6 +6479,7 @@ mod tests {
             database.pool(),
             telegram_user_id,
             chat_id,
+            MIDTRANS_BASIC_PLAN_CODE,
             &order_id,
             2_000,
             paid_at + chrono::Duration::hours(24),

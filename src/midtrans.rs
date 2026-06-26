@@ -10,7 +10,8 @@ use thiserror::Error;
 use crate::config::Config;
 use crate::subscription_maintenance::resolve_subscription_sanction;
 
-pub const MIDTRANS_PLAN_CODE: &str = "monthly_stars";
+pub const MIDTRANS_BASIC_PLAN_CODE: &str = "monthly_basic";
+pub const MIDTRANS_OJOL_PLAN_CODE: &str = "monthly_ojol";
 pub const MIDTRANS_PAYMENT_PROVIDER: &str = "midtrans";
 pub const MIDTRANS_PAYMENT_KIND: &str = "snap_subscription";
 pub const MIDTRANS_CURRENCY: &str = "IDR";
@@ -21,6 +22,8 @@ const MIDTRANS_BREAKDOWN_BASE_TOTAL_IDR: i64 = 45_000;
 pub enum MidtransError {
     #[error("midtrans server key is not configured")]
     MissingServerKey,
+    #[error("midtrans pricing tier is invalid: {0}")]
+    InvalidPricingTier(String),
     #[error("midtrans request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("midtrans json parsing failed: {0}")]
@@ -36,8 +39,22 @@ pub struct MidtransClient {
     client: Client,
     server_key: String,
     snap_base_url: String,
-    price_idr: i64,
+    basic_price_idr: i64,
+    ojol_price_idr: i64,
     expiry_hours: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PricingTier {
+    Basic,
+    Ojol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubscriptionPlan {
+    pub tier: PricingTier,
+    pub plan_code: &'static str,
+    pub price_idr: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +72,7 @@ pub struct MidtransSubscriptionRecord {
     pub id: i64,
     pub telegram_user_id: i64,
     pub chat_id: i64,
+    pub plan_code: String,
     pub current_period_end_at: Option<DateTime<Utc>>,
 }
 
@@ -134,13 +152,25 @@ impl MidtransClient {
             } else {
                 "https://app.sandbox.midtrans.com".to_string()
             },
-            price_idr: config.midtrans_plan_price_idr,
+            basic_price_idr: config.midtrans_basic_plan_price_idr,
+            ojol_price_idr: config.midtrans_ojol_plan_price_idr,
             expiry_hours: config.midtrans_payment_expiry_hours,
         })
     }
 
-    pub fn price_idr(&self) -> i64 {
-        self.price_idr
+    pub fn subscription_plan_for_tier(&self, tier: PricingTier) -> SubscriptionPlan {
+        match tier {
+            PricingTier::Basic => SubscriptionPlan {
+                tier,
+                plan_code: MIDTRANS_BASIC_PLAN_CODE,
+                price_idr: self.basic_price_idr,
+            },
+            PricingTier::Ojol => SubscriptionPlan {
+                tier,
+                plan_code: MIDTRANS_OJOL_PLAN_CODE,
+                price_idr: self.ojol_price_idr,
+            },
+        }
     }
 
     pub fn expiry_hours(&self) -> i64 {
@@ -149,6 +179,7 @@ impl MidtransClient {
 
     pub async fn create_snap_transaction(
         &self,
+        plan: SubscriptionPlan,
         order_id: &str,
         created_at: DateTime<Utc>,
         effective_base_amount_idr: i64,
@@ -189,10 +220,10 @@ impl MidtransClient {
             details
         } else {
             vec![MidtransItemDetail {
-                id: MIDTRANS_PLAN_CODE.to_string(),
+                id: plan.plan_code.to_string(),
                 price: effective_base_amount_idr,
                 quantity: 1,
-                name: "Akses Heartbeats 30 Hari".to_string(),
+                name: format!("Akses {} 30 Hari", plan.tier.label()),
             }]
         };
         if fine_amount_idr > 0 {
@@ -249,6 +280,34 @@ impl MidtransClient {
     }
 }
 
+impl PricingTier {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "basic" => Self::Basic,
+            "ojol" => Self::Ojol,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            Self::Ojol => "ojol",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Basic => "Heartbeats Basic",
+            Self::Ojol => "Heartbeats Ojol",
+        }
+    }
+}
+
+pub fn parse_pricing_tier(value: &str) -> Result<PricingTier, MidtransError> {
+    PricingTier::parse(value).ok_or_else(|| MidtransError::InvalidPricingTier(value.to_string()))
+}
+
 pub fn build_midtrans_order_id(telegram_user_id: i64, created_at: DateTime<Utc>) -> String {
     format!("hb-{telegram_user_id}-{}", created_at.timestamp_millis())
 }
@@ -291,6 +350,7 @@ pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<U
 }
 
 pub fn format_midtrans_payment_message_with_quote(
+    plan: SubscriptionPlan,
     payment_url: &str,
     expires_at: DateTime<Utc>,
     effective_base_amount_idr: i64,
@@ -315,7 +375,8 @@ pub fn format_midtrans_payment_message_with_quote(
     };
 
     format!(
-        "Heartbeats Monthly Access\n{} - 30 Days{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
+        "{}\n{} - 30 Days{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
+        plan.tier.label(),
         format_idr(effective_base_amount_idr),
         fine_line,
         total_line,
@@ -344,6 +405,7 @@ pub async fn create_pending_midtrans_payment(
     pool: &sqlx::PgPool,
     telegram_user_id: i64,
     chat_id: i64,
+    plan_code: &str,
     order_id: &str,
     gross_amount_idr: i64,
     expires_at: DateTime<Utc>,
@@ -363,7 +425,7 @@ pub async fn create_pending_midtrans_payment(
     .bind(chat_id)
     .bind(MIDTRANS_PAYMENT_PROVIDER)
     .bind(MIDTRANS_PAYMENT_KIND)
-    .bind(MIDTRANS_PLAN_CODE)
+    .bind(plan_code)
     .bind(MIDTRANS_CURRENCY)
     .bind(gross_amount_idr)
     .bind(MIDTRANS_PERIOD_DAYS)
@@ -414,7 +476,7 @@ pub async fn apply_midtrans_webhook(
     let payment_row = sqlx::query(
         r#"
         SELECT id, telegram_user_id, chat_id, subscription_id, payment_status,
-               gross_amount_idr, period_days
+               gross_amount_idr, period_days, plan_code
         FROM telegram_payment_events
         WHERE provider_order_id = $1
         FOR UPDATE
@@ -434,6 +496,7 @@ pub async fn apply_midtrans_webhook(
     let current_status: String = payment_row.get("payment_status");
     let gross_amount_idr: i64 = payment_row.get("gross_amount_idr");
     let period_days: i32 = payment_row.get("period_days");
+    let plan_code: String = payment_row.get("plan_code");
 
     if current_status == "paid" {
         tx.commit().await?;
@@ -506,15 +569,13 @@ pub async fn apply_midtrans_webhook(
 
     let _existing_subscription = sqlx::query(
         r#"
-        SELECT id, current_period_end_at
+        SELECT id, current_period_end_at, plan_code
         FROM telegram_subscriptions
         WHERE telegram_user_id = $1
-          AND plan_code = $2
         FOR UPDATE
         "#,
     )
     .bind(telegram_user_id)
-    .bind(MIDTRANS_PLAN_CODE)
     .fetch_optional(&mut *tx)
     .await?;
 
@@ -528,8 +589,9 @@ pub async fn apply_midtrans_webhook(
             current_period_start_at, current_period_end_at, created_at, updated_at
         )
         VALUES ($1, $2, $3, 'active', $4, $5, NOW(), NOW())
-        ON CONFLICT (telegram_user_id, plan_code) DO UPDATE
+        ON CONFLICT (telegram_user_id) DO UPDATE
         SET chat_id = EXCLUDED.chat_id,
+            plan_code = EXCLUDED.plan_code,
             status = EXCLUDED.status,
             current_period_start_at = EXCLUDED.current_period_start_at,
             current_period_end_at = EXCLUDED.current_period_end_at,
@@ -539,7 +601,7 @@ pub async fn apply_midtrans_webhook(
     )
     .bind(telegram_user_id)
     .bind(chat_id)
-    .bind(MIDTRANS_PLAN_CODE)
+    .bind(&plan_code)
     .bind(base_time)
     .bind(period_end)
     .fetch_one(&mut *tx)
@@ -549,6 +611,7 @@ pub async fn apply_midtrans_webhook(
         id: subscription_row.get("id"),
         telegram_user_id: subscription_row.get("telegram_user_id"),
         chat_id: subscription_row.get("chat_id"),
+        plan_code: plan_code.clone(),
         current_period_end_at: subscription_row.get("current_period_end_at"),
     };
 

@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::db::{Database, DatabaseError};
-use crate::midtrans::MIDTRANS_PLAN_CODE;
+use crate::midtrans::{SubscriptionPlan, MIDTRANS_BASIC_PLAN_CODE, MIDTRANS_OJOL_PLAN_CODE};
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 pub const SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS: i64 = 5;
@@ -142,7 +142,7 @@ pub async fn run_subscription_maintenance(
 pub async fn build_subscription_payment_quote(
     pool: &sqlx::PgPool,
     telegram_user_id: i64,
-    base_amount_idr: i64,
+    plan: SubscriptionPlan,
     now: DateTime<Utc>,
 ) -> Result<SubscriptionPaymentQuote, sqlx::Error> {
     let has_customer_referenced_device = sqlx::query(
@@ -166,12 +166,10 @@ pub async fn build_subscription_payment_quote(
         SELECT current_period_end_at
         FROM telegram_subscriptions
         WHERE telegram_user_id = $1
-          AND plan_code = $2
         LIMIT 1
         "#,
     )
     .bind(telegram_user_id)
-    .bind(MIDTRANS_PLAN_CODE)
     .fetch_optional(pool)
     .await?
     .and_then(|row| row.get::<Option<DateTime<Utc>>, _>("current_period_end_at"));
@@ -187,10 +185,10 @@ pub async fn build_subscription_payment_quote(
     };
 
     Ok(SubscriptionPaymentQuote {
-        base_amount_idr,
+        base_amount_idr: plan.price_idr,
         customer_reference_fee_idr,
         fine_amount_idr,
-        total_amount_idr: base_amount_idr + customer_reference_fee_idr + fine_amount_idr,
+        total_amount_idr: plan.price_idr + customer_reference_fee_idr + fine_amount_idr,
         overdue_days,
         withdrawal_required: overdue_days > SUBSCRIPTION_MAX_FINE_DAYS,
     })
@@ -303,13 +301,14 @@ async fn fetch_subscription_maintenance_records(
         FROM telegram_subscriptions ts
         LEFT JOIN telegram_subscription_sanctions tss
           ON tss.subscription_id = ts.id
-        WHERE ts.plan_code = $1
+        WHERE ts.plan_code IN ($1, $2)
           AND ts.current_period_end_at IS NOT NULL
           AND ts.status IN ('active', 'past_due')
         ORDER BY ts.current_period_end_at ASC, ts.id ASC
         "#,
     )
-    .bind(MIDTRANS_PLAN_CODE)
+    .bind(MIDTRANS_BASIC_PLAN_CODE)
+    .bind(MIDTRANS_OJOL_PLAN_CODE)
     .fetch_all(pool)
     .await?;
 

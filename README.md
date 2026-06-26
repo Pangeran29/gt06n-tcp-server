@@ -37,6 +37,8 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_ADMIN_CHAT_ID=
 TELEGRAM_POLL_TIMEOUT_SECS=30
 TELEGRAM_HEARTBEAT_POLL_INTERVAL_MS=3000
+MIDTRANS_BASIC_PLAN_PRICE_IDR=35000
+MIDTRANS_OJOL_PLAN_PRICE_IDR=30000
 ```
 
 Notes:
@@ -46,6 +48,7 @@ Notes:
 - the PostgreSQL database itself must already exist before the service starts
 - if `TELEGRAM_BOT_TOKEN` is set, you can run the Telegram bot service
 - if `TELEGRAM_ADMIN_CHAT_ID` is empty, the bot can be bound from Telegram with `/bind_me`
+- `devices.pricing_tier` defaults to `basic`; operators can manually set `ojol` in PostgreSQL for eligible devices
 
 ### 2. Run the TCP Server
 
@@ -181,6 +184,11 @@ The bot stores its own operational state in PostgreSQL so it can continue safely
 - last processed Telegram update id
 - last notified heartbeat id
 - bound admin chat id
+
+Current subscription pricing tiers:
+
+- `basic`: Rp 35.000 / 30 days
+- `ojol`: Rp 30.000 / 30 days
 
 Important note:
 

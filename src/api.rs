@@ -156,6 +156,8 @@ struct SubscriptionResponse {
     telegram_user_id: i64,
     chat_id: i64,
     bound_imei: Option<String>,
+    pricing_tier: String,
+    plan_code: String,
     status: String,
     current_period_start_at: Option<String>,
     current_period_end_at: Option<String>,
@@ -239,6 +241,8 @@ async fn get_subscriptions(
         SELECT ts.telegram_user_id,
                ts.chat_id,
                tu.bound_imei,
+               COALESCE(d.pricing_tier, 'basic') AS pricing_tier,
+               ts.plan_code,
                ts.status,
                ts.current_period_start_at,
                ts.current_period_end_at,
@@ -246,15 +250,16 @@ async fn get_subscriptions(
         FROM telegram_subscriptions ts
         JOIN telegram_users tu
           ON tu.telegram_user_id = ts.telegram_user_id
+        LEFT JOIN devices d
+          ON d.imei = tu.bound_imei
         LEFT JOIN (
-            SELECT telegram_user_id, plan_code, MIN(paid_at) AS first_subscribed_at
+            SELECT telegram_user_id, MIN(paid_at) AS first_subscribed_at
             FROM telegram_payment_events
             WHERE payment_status = 'paid'
               AND paid_at IS NOT NULL
-            GROUP BY telegram_user_id, plan_code
+            GROUP BY telegram_user_id
         ) payments
           ON payments.telegram_user_id = ts.telegram_user_id
-         AND payments.plan_code = ts.plan_code
         ORDER BY
             CASE WHEN $1 = 'asc' THEN ts.current_period_end_at END ASC NULLS LAST,
             CASE WHEN $1 = 'desc' THEN ts.current_period_end_at END DESC NULLS LAST,
@@ -279,6 +284,8 @@ async fn get_subscriptions(
                 telegram_user_id: row.get("telegram_user_id"),
                 chat_id: row.get("chat_id"),
                 bound_imei: row.get("bound_imei"),
+                pricing_tier: row.get("pricing_tier"),
+                plan_code: row.get("plan_code"),
                 status: row.get("status"),
                 current_period_start_at: period_start.map(|value| value.to_rfc3339()),
                 current_period_end_at: period_end.map(|value| value.to_rfc3339()),

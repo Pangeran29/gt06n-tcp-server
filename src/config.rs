@@ -21,7 +21,8 @@ pub struct Config {
     pub midtrans_merchant_id: Option<String>,
     pub midtrans_is_production: bool,
     pub midtrans_payment_expiry_hours: i64,
-    pub midtrans_plan_price_idr: i64,
+    pub midtrans_basic_plan_price_idr: i64,
+    pub midtrans_ojol_plan_price_idr: i64,
 }
 
 impl Default for Config {
@@ -47,7 +48,8 @@ impl Default for Config {
             midtrans_merchant_id: None,
             midtrans_is_production: false,
             midtrans_payment_expiry_hours: 24,
-            midtrans_plan_price_idr: 2_000,
+            midtrans_basic_plan_price_idr: 35_000,
+            midtrans_ojol_plan_price_idr: 30_000,
         }
     }
 }
@@ -171,9 +173,15 @@ impl Config {
             }
         }
 
-        if let Some(price_idr) = vars.get("MIDTRANS_PLAN_PRICE_IDR") {
+        if let Some(price_idr) = vars.get("MIDTRANS_BASIC_PLAN_PRICE_IDR") {
             if let Ok(parsed) = price_idr.parse() {
-                config.midtrans_plan_price_idr = parsed;
+                config.midtrans_basic_plan_price_idr = parsed;
+            }
+        }
+
+        if let Some(price_idr) = vars.get("MIDTRANS_OJOL_PLAN_PRICE_IDR") {
+            if let Ok(parsed) = price_idr.parse() {
+                config.midtrans_ojol_plan_price_idr = parsed;
             }
         }
 
@@ -213,7 +221,8 @@ mod tests {
             ("MIDTRANS_MERCHANT_ID", "merchant-id"),
             ("MIDTRANS_IS_PRODUCTION", "true"),
             ("MIDTRANS_PAYMENT_EXPIRY_HOURS", "12"),
-            ("MIDTRANS_PLAN_PRICE_IDR", "75000"),
+            ("MIDTRANS_BASIC_PLAN_PRICE_IDR", "75000"),
+            ("MIDTRANS_OJOL_PLAN_PRICE_IDR", "55000"),
         ]);
 
         assert_eq!(config.bind_addr, "127.0.0.1:6000".parse().unwrap());
@@ -235,6 +244,7 @@ mod tests {
         assert_eq!(config.midtrans_merchant_id.as_deref(), Some("merchant-id"));
         assert!(config.midtrans_is_production);
         assert_eq!(config.midtrans_payment_expiry_hours, 12);
-        assert_eq!(config.midtrans_plan_price_idr, 75_000);
+        assert_eq!(config.midtrans_basic_plan_price_idr, 75_000);
+        assert_eq!(config.midtrans_ojol_plan_price_idr, 55_000);
     }
 }

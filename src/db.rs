@@ -629,9 +629,10 @@ mod tests {
                 telegram_user_id, chat_id, plan_code, status,
                 current_period_start_at, current_period_end_at, created_at, updated_at
             )
-            VALUES ($1, $2, 'monthly_stars', 'active', $3, $4, NOW(), NOW())
-            ON CONFLICT (telegram_user_id, plan_code) DO UPDATE
+            VALUES ($1, $2, 'monthly_basic', 'active', $3, $4, NOW(), NOW())
+            ON CONFLICT (telegram_user_id) DO UPDATE
             SET chat_id = EXCLUDED.chat_id,
+                plan_code = EXCLUDED.plan_code,
                 status = EXCLUDED.status,
                 current_period_start_at = EXCLUDED.current_period_start_at,
                 current_period_end_at = EXCLUDED.current_period_end_at,
@@ -664,7 +665,7 @@ mod tests {
             )
             VALUES (
                 $1, $2, $3, 'midtrans', 'snap_subscription',
-                'paid', 'monthly_stars', 'IDR', 2000, 30,
+                'paid', 'monthly_basic', 'IDR', 2000, 30,
                 $4, $5, 'qris', $6, $7::jsonb, NOW(), NOW()
             )
             "#,
@@ -715,6 +716,95 @@ mod tests {
                 .num_days(),
             30
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_deduplicates_subscription_rows_per_user(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database should be configured");
+
+        let duplicate_user_id = 9_990_000_011_i64;
+        let chat_id = 9_990_000_012_i64;
+
+        let unique_exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.table_constraints
+                WHERE table_name = 'telegram_subscriptions'
+                  AND constraint_name = 'telegram_subscriptions_telegram_user_unique'
+            )
+            "#,
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert!(unique_exists);
+
+        sqlx::query("DELETE FROM telegram_payment_events WHERE telegram_user_id = $1")
+            .bind(duplicate_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id = $1")
+            .bind(duplicate_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id = $1")
+            .bind(duplicate_user_id)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $2, NULL, 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(duplicate_user_id)
+        .bind(chat_id)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscriptions (
+                telegram_user_id, chat_id, plan_code, status,
+                current_period_start_at, current_period_end_at, created_at, updated_at
+            )
+            VALUES ($1, $2, 'monthly_basic', 'active', NOW(), NOW() + INTERVAL '30 days', NOW(), NOW())
+            ON CONFLICT (telegram_user_id) DO UPDATE
+            SET plan_code = EXCLUDED.plan_code,
+                status = EXCLUDED.status,
+                current_period_start_at = EXCLUDED.current_period_start_at,
+                current_period_end_at = EXCLUDED.current_period_end_at,
+                updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(duplicate_user_id)
+        .bind(chat_id)
+        .execute(database.pool())
+        .await?;
+
+        let subscription_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM telegram_subscriptions WHERE telegram_user_id = $1",
+        )
+        .bind(duplicate_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(subscription_rows, 1);
 
         Ok(())
     }
