@@ -49,6 +49,7 @@ Notes:
 - if `TELEGRAM_BOT_TOKEN` is set, you can run the Telegram bot service
 - if `TELEGRAM_ADMIN_CHAT_ID` is empty, the bot can be bound from Telegram with `/bind_me`
 - `devices.pricing_tier` defaults to `basic`; operators can manually set `ojol` in PostgreSQL for eligible devices
+- `devices.shipment_fee_idr` is optional and, when set, is charged only on the first successful paid payment for that device
 
 ### 2. Run the TCP Server
 

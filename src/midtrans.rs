@@ -183,6 +183,7 @@ impl MidtransClient {
         order_id: &str,
         created_at: DateTime<Utc>,
         effective_base_amount_idr: i64,
+        shipment_fee_idr: i64,
         gross_amount_idr: i64,
         fine_amount_idr: i64,
     ) -> Result<MidtransCreatedPayment, MidtransError> {
@@ -232,6 +233,14 @@ impl MidtransClient {
                 price: fine_amount_idr,
                 quantity: 1,
                 name: "Denda keterlambatan".to_string(),
+            });
+        }
+        if shipment_fee_idr > 0 {
+            item_details.push(MidtransItemDetail {
+                id: "device_shipment_fee".to_string(),
+                price: shipment_fee_idr,
+                quantity: 1,
+                name: "Biaya pengiriman perangkat".to_string(),
             });
         }
 
@@ -354,6 +363,7 @@ pub fn format_midtrans_payment_message_with_quote(
     payment_url: &str,
     expires_at: DateTime<Utc>,
     effective_base_amount_idr: i64,
+    shipment_fee_idr: i64,
     fine_amount_idr: i64,
     total_amount_idr: i64,
 ) -> String {
@@ -363,21 +373,27 @@ pub fn format_midtrans_payment_message_with_quote(
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;");
+    let shipment_line = if shipment_fee_idr > 0 {
+        format!("\nShipment fee: {}", format_idr(shipment_fee_idr))
+    } else {
+        String::new()
+    };
     let fine_line = if fine_amount_idr > 0 {
         format!("\nLate sanction: {}", format_idr(fine_amount_idr))
     } else {
         String::new()
     };
-    let total_line = if fine_amount_idr > 0 {
+    let total_line = if shipment_fee_idr > 0 || fine_amount_idr > 0 {
         format!("\nTotal: {}", format_idr(total_amount_idr))
     } else {
         String::new()
     };
 
     format!(
-        "{}\n{} - 30 Days{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
+        "{}\n{} - 30 Days{}{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
         plan.tier.label(),
         format_idr(effective_base_amount_idr),
+        shipment_line,
         fine_line,
         total_line,
         expires_at.format("%d %b %Y %H:%M WIB")
@@ -405,6 +421,8 @@ pub async fn create_pending_midtrans_payment(
     pool: &sqlx::PgPool,
     telegram_user_id: i64,
     chat_id: i64,
+    device_id: i64,
+    imei: &str,
     plan_code: &str,
     order_id: &str,
     gross_amount_idr: i64,
@@ -413,16 +431,18 @@ pub async fn create_pending_midtrans_payment(
     let row = sqlx::query(
         r#"
         INSERT INTO telegram_payment_events (
-            telegram_user_id, chat_id, subscription_id, payment_provider, payment_kind,
+            telegram_user_id, chat_id, device_id, imei, subscription_id, payment_provider, payment_kind,
             payment_status, plan_code, currency, gross_amount_idr, period_days,
             provider_order_id, expires_at, created_at, updated_at
         )
-        VALUES ($1, $2, NULL, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, NOW(), NOW())
+        VALUES ($1, $2, $3, $4, NULL, $5, $6, 'pending', $7, $8, $9, $10, $11, $12, NOW(), NOW())
         RETURNING id
         "#,
     )
     .bind(telegram_user_id)
     .bind(chat_id)
+    .bind(device_id)
+    .bind(imei)
     .bind(MIDTRANS_PAYMENT_PROVIDER)
     .bind(MIDTRANS_PAYMENT_KIND)
     .bind(plan_code)

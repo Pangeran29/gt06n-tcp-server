@@ -33,6 +33,7 @@ pub enum SubscriptionMaintenanceError {
 pub struct SubscriptionPaymentQuote {
     pub base_amount_idr: i64,
     pub customer_reference_fee_idr: i64,
+    pub shipment_fee_idr: i64,
     pub fine_amount_idr: i64,
     pub total_amount_idr: i64,
     pub overdue_days: i64,
@@ -145,9 +146,11 @@ pub async fn build_subscription_payment_quote(
     plan: SubscriptionPlan,
     now: DateTime<Utc>,
 ) -> Result<SubscriptionPaymentQuote, sqlx::Error> {
-    let has_customer_referenced_device = sqlx::query(
+    let device_row = sqlx::query(
         r#"
-        SELECT d.referenced_by_customer_id IS NOT NULL AS has_customer_referenced_device
+        SELECT d.id,
+               d.referenced_by_customer_id IS NOT NULL AS has_customer_referenced_device,
+               d.shipment_fee_idr
         FROM telegram_users tu
         LEFT JOIN devices d
           ON d.imei = tu.bound_imei
@@ -157,9 +160,38 @@ pub async fn build_subscription_payment_quote(
     )
     .bind(telegram_user_id)
     .fetch_optional(pool)
-    .await?
-    .map(|row| row.get::<bool, _>("has_customer_referenced_device"))
-    .unwrap_or(false);
+    .await?;
+
+    let has_customer_referenced_device = device_row
+        .as_ref()
+        .map(|row| row.get::<bool, _>("has_customer_referenced_device"))
+        .unwrap_or(false);
+    let shipment_fee_idr = device_row
+        .as_ref()
+        .and_then(|row| row.get::<Option<i64>, _>("shipment_fee_idr"))
+        .unwrap_or(0);
+    let prior_paid_payment_exists = if let Some(row) = device_row.as_ref() {
+        let device_id = row.get::<Option<i64>, _>("id");
+        if let Some(device_id) = device_id {
+            sqlx::query_scalar::<_, bool>(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM telegram_payment_events
+                    WHERE device_id = $1
+                      AND payment_status = 'paid'
+                )
+                "#,
+            )
+            .bind(device_id)
+            .fetch_one(pool)
+            .await?
+        } else {
+            false
+        }
+    } else {
+        false
+    };
 
     let current_period_end_at = sqlx::query(
         r#"
@@ -183,12 +215,21 @@ pub async fn build_subscription_payment_quote(
     } else {
         0
     };
+    let shipment_fee_idr = if prior_paid_payment_exists {
+        0
+    } else {
+        shipment_fee_idr
+    };
 
     Ok(SubscriptionPaymentQuote {
         base_amount_idr: plan.price_idr,
         customer_reference_fee_idr,
+        shipment_fee_idr,
         fine_amount_idr,
-        total_amount_idr: plan.price_idr + customer_reference_fee_idr + fine_amount_idr,
+        total_amount_idr: plan.price_idr
+            + customer_reference_fee_idr
+            + shipment_fee_idr
+            + fine_amount_idr,
         overdue_days,
         withdrawal_required: overdue_days > SUBSCRIPTION_MAX_FINE_DAYS,
     })

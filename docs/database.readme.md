@@ -43,6 +43,7 @@ What it stores:
 
 - IMEI
 - pricing tier (`basic` or `ojol`)
+- optional one-time shipment fee in rupiah (`shipment_fee_idr`)
 - SIM card number / label
 - SIM card expiration date
 - first seen / last seen
@@ -208,6 +209,8 @@ What it stores:
 
 - Telegram user id
 - chat id snapshot
+- device reference
+- IMEI snapshot at payment creation time
 - optional subscription reference
 - payment provider and payment kind
 - payment status
@@ -233,6 +236,8 @@ Allowed payment status values:
 Why it exists:
 
 - preserves payment history independently of the current subscription state
+- lets the first successful device payment consume the one-time shipment fee
+- keeps payment audit stable even if the Telegram user later rebinds to another device
 - provides idempotency via unique `provider_order_id`
 - leaves room for refunds, failed attempts, and future recurring subscription renewals
 

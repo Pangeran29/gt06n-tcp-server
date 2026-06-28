@@ -1036,6 +1036,7 @@ impl TelegramBot {
                 let user = fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id)
                     .await?
                     .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier("missing_user".to_string()))?;
+                let bound_device = resolve_bound_device_for_user(self.database.pool(), &user).await?;
                 let plan = resolve_subscription_plan_for_user(
                     self.database.pool(),
                     midtrans,
@@ -1058,6 +1059,8 @@ impl TelegramBot {
                     self.database.pool(),
                     telegram_user_id,
                     chat_id,
+                    bound_device.id,
+                    &bound_device.imei,
                     plan.plan_code,
                     &order_id,
                     payment_quote.total_amount_idr,
@@ -1071,6 +1074,7 @@ impl TelegramBot {
                         &order_id,
                         created_at,
                         payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
+                        payment_quote.shipment_fee_idr,
                         payment_quote.total_amount_idr,
                         payment_quote.fine_amount_idr,
                     )
@@ -1084,6 +1088,7 @@ impl TelegramBot {
                     &created.payment_url,
                     created.expires_at,
                     payment_quote.base_amount_idr + payment_quote.customer_reference_fee_idr,
+                    payment_quote.shipment_fee_idr,
                     payment_quote.fine_amount_idr,
                     payment_quote.total_amount_idr,
                 );
@@ -2284,6 +2289,12 @@ struct NotificationRecipient {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundDeviceRecord {
+    id: i64,
+    imei: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct TelegramUserRecord {
     telegram_user_id: i64,
     chat_id: i64,
@@ -3343,10 +3354,7 @@ async fn resolve_subscription_plan_for_user(
     midtrans: &MidtransClient,
     user: &TelegramUserRecord,
 ) -> Result<crate::midtrans::SubscriptionPlan, BotError> {
-    let imei = user
-        .bound_imei
-        .as_deref()
-        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier("missing_bound_device".to_string()))?;
+    let bound_device = resolve_bound_device_for_user(pool, user).await?;
 
     let row = sqlx::query(
         r#"
@@ -3356,16 +3364,47 @@ async fn resolve_subscription_plan_for_user(
         LIMIT 1
         "#,
     )
-    .bind(imei)
+    .bind(&bound_device.imei)
     .fetch_optional(pool)
     .await?;
 
     let pricing_tier = row
         .and_then(|row| row.try_get::<String, _>("pricing_tier").ok())
-        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier(format!("missing_device_pricing_tier:{imei}")))?;
+        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier(format!("missing_device_pricing_tier:{}", bound_device.imei)))?;
     let tier = parse_pricing_tier(&pricing_tier)?;
 
     Ok(midtrans.subscription_plan_for_tier(tier))
+}
+
+async fn resolve_bound_device_for_user(
+    pool: &sqlx::PgPool,
+    user: &TelegramUserRecord,
+) -> Result<BoundDeviceRecord, BotError> {
+    let imei = user
+        .bound_imei
+        .as_deref()
+        .ok_or_else(|| crate::midtrans::MidtransError::InvalidPricingTier("missing_bound_device".to_string()))?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT id, imei
+        FROM devices
+        WHERE imei = $1
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await?;
+
+    let row = row.ok_or_else(|| {
+        crate::midtrans::MidtransError::InvalidPricingTier(format!("missing_bound_device_record:{imei}"))
+    })?;
+
+    Ok(BoundDeviceRecord {
+        id: row.get("id"),
+        imei: row.get("imei"),
+    })
 }
 
 async fn fetch_notification_recipients_for_imei(
@@ -4279,6 +4318,16 @@ mod tests {
         }
     }
 
+    async fn fetch_device_id(
+        pool: &sqlx::PgPool,
+        imei: &str,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM devices WHERE imei = $1")
+            .bind(imei)
+            .fetch_one(pool)
+            .await
+    }
+
     #[test]
     fn parses_commands() {
         assert_eq!(BotCommand::parse("/start"), Some(BotCommand::Start));
@@ -4751,6 +4800,7 @@ mod tests {
             expires_at,
             45_000,
             0,
+            0,
             45_000,
         );
 
@@ -4771,6 +4821,7 @@ mod tests {
             "https://pay.example.test/order",
             expires_at,
             45_000,
+            0,
             3_000,
             48_000,
         );
@@ -4780,6 +4831,23 @@ mod tests {
         assert!(message.contains("Late sanction: Rp 3.000"));
         assert!(message.contains("Total: Rp 48.000"));
         assert!(!message.contains("Customer"));
+    }
+
+    #[test]
+    fn formats_midtrans_payment_message_with_shipment_fee_total() {
+        let expires_at = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+        let message = format_midtrans_payment_message_with_quote(
+            basic_plan(35_000),
+            "https://pay.example.test/order",
+            expires_at,
+            35_000,
+            15_000,
+            0,
+            50_000,
+        );
+
+        assert!(message.contains("Shipment fee: Rp 15.000"));
+        assert!(message.contains("Total: Rp 50.000"));
     }
 
     #[test]
@@ -5758,6 +5826,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adds_shipment_fee_only_on_first_device_payment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let telegram_user_id = 8_885_000_030_i64;
+        let imei = "999888777666569";
+        let now = Utc.with_ymd_and_hms(2026, 7, 4, 1, 0, 0).unwrap();
+
+        sqlx::query("DELETE FROM telegram_payment_events WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_subscriptions WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM telegram_users WHERE telegram_user_id = $1")
+            .bind(telegram_user_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr, pricing_tier, shipment_fee_idr, created_at, updated_at
+            )
+            VALUES ($1, NOW(), NOW(), '127.0.0.1:5000', 'basic', 15000, NOW(), NOW())
+            "#,
+        )
+        .bind(imei)
+        .execute(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_users (
+                telegram_user_id, chat_id, bound_imei, registration_status, created_at, updated_at
+            )
+            VALUES ($1, $1, $2, 'bound', NOW(), NOW())
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(imei)
+        .execute(database.pool())
+        .await?;
+
+        let first_quote =
+            build_subscription_payment_quote(database.pool(), telegram_user_id, basic_plan(35_000), now)
+                .await?;
+        assert_eq!(first_quote.shipment_fee_idr, 15_000);
+        assert_eq!(first_quote.total_amount_idr, 50_000);
+
+        let device_id = fetch_device_id(database.pool(), imei).await?;
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_payment_events (
+                telegram_user_id, chat_id, device_id, imei, subscription_id, payment_provider, payment_kind,
+                payment_status, plan_code, currency, gross_amount_idr, period_days,
+                provider_order_id, provider_transaction_id, payment_type, paid_at,
+                raw_webhook_notification, created_at, updated_at
+            )
+            VALUES (
+                $1, $1, $2, $3, NULL, 'midtrans', 'snap_subscription',
+                'paid', 'monthly_basic', 'IDR', 50000, 30,
+                $4, $5, 'qris', $6, $7::jsonb, NOW(), NOW()
+            )
+            "#,
+        )
+        .bind(telegram_user_id)
+        .bind(device_id)
+        .bind(imei)
+        .bind("shipment-paid-order")
+        .bind("shipment-paid-transaction")
+        .bind(now)
+        .bind(r#"{"transaction_status":"settlement","gross_amount":"50000.00"}"#)
+        .execute(database.pool())
+        .await?;
+
+        let second_quote =
+            build_subscription_payment_quote(database.pool(), telegram_user_id, basic_plan(35_000), now)
+                .await?;
+        assert_eq!(second_quote.shipment_fee_idr, 0);
+        assert_eq!(second_quote.total_amount_idr, 35_000);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn applies_overdue_sanction_even_when_next_payment_plan_changes(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(database_url) = database_url() else {
@@ -6270,10 +6439,13 @@ mod tests {
 
         let first_paid_at = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
         let first_order_id = build_midtrans_order_id(telegram_user_id, first_paid_at);
+        let device_id = fetch_device_id(database.pool(), "999888777666555").await?;
         create_pending_midtrans_payment(
             database.pool(),
             telegram_user_id,
             chat_id,
+            device_id,
+            "999888777666555",
             MIDTRANS_BASIC_PLAN_CODE,
             &first_order_id,
             2_000,
@@ -6330,6 +6502,8 @@ mod tests {
             database.pool(),
             telegram_user_id,
             chat_id,
+            device_id,
+            "999888777666555",
             MIDTRANS_OJOL_PLAN_CODE,
             &second_order_id,
             2_000,
@@ -6391,6 +6565,8 @@ mod tests {
             database.pool(),
             telegram_user_id,
             chat_id,
+            device_id,
+            "999888777666555",
             MIDTRANS_BASIC_PLAN_CODE,
             &expired_order_id,
             2_000,
@@ -6459,6 +6635,20 @@ mod tests {
             .bind(telegram_user_id)
             .execute(database.pool())
             .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = '999888777666556'")
+            .execute(database.pool())
+            .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO devices (
+                imei, first_seen_at, last_seen_at, latest_peer_addr, pricing_tier, created_at, updated_at
+            )
+            VALUES ('999888777666556', NOW(), NOW(), '127.0.0.1:5000', 'basic', NOW(), NOW())
+            "#,
+        )
+        .execute(database.pool())
+        .await?;
 
         sqlx::query(
             r#"
@@ -6475,10 +6665,13 @@ mod tests {
 
         let paid_at = Utc.with_ymd_and_hms(2026, 4, 25, 10, 0, 0).unwrap();
         let order_id = build_midtrans_order_id(telegram_user_id, paid_at);
+        let device_id = fetch_device_id(database.pool(), "999888777666556").await?;
         create_pending_midtrans_payment(
             database.pool(),
             telegram_user_id,
             chat_id,
+            device_id,
+            "999888777666556",
             MIDTRANS_BASIC_PLAN_CODE,
             &order_id,
             2_000,
@@ -6513,6 +6706,14 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(payment_status, "paid");
+        let stored_payment_device: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT device_id, imei FROM telegram_payment_events WHERE provider_order_id = $1",
+        )
+        .bind(&notification.order_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(stored_payment_device.0, Some(device_id));
+        assert_eq!(stored_payment_device.1.as_deref(), Some("999888777666556"));
 
         Ok(())
     }
