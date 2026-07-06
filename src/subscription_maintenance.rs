@@ -7,6 +7,7 @@ use tracing::warn;
 use crate::config::Config;
 use crate::db::{Database, DatabaseError};
 use crate::midtrans::{SubscriptionPlan, MIDTRANS_BASIC_PLAN_CODE, MIDTRANS_OJOL_PLAN_CODE};
+use crate::telegram_messages as messages;
 
 const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 pub const SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS: i64 = 5;
@@ -276,31 +277,15 @@ pub fn resolve_subscription_maintenance_action(
 }
 
 pub fn format_pre_expiry_subscription_reminder_message() -> &'static str {
-    "Your Heartbeats subscription will end soon.\n\nPlease renew before it expires.\nLate renewal is subject to a Rp 1.000/day sanction."
+    messages::MSG_47_SUBSCRIPTION_PRE_EXPIRY_REMINDER
 }
 
 pub fn format_overdue_subscription_reminder_message(fine_amount_idr: i64) -> String {
-    format!(
-        "Your Heartbeats subscription has expired.\n\nSanction: {}\nPlease renew to continue full access.",
-        format_idr(fine_amount_idr)
-    )
+    messages::msg_48_subscription_overdue_reminder(fine_amount_idr)
 }
 
 pub fn format_idr(amount: i64) -> String {
-    let digits = amount.abs().to_string();
-    let mut formatted = String::new();
-    for (index, character) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push('.');
-        }
-        formatted.push(character);
-    }
-    let formatted = formatted.chars().rev().collect::<String>();
-    if amount < 0 {
-        format!("-Rp {formatted}")
-    } else {
-        format!("Rp {formatted}")
-    }
+    messages::format_idr(amount)
 }
 
 pub fn fine_amount_for_overdue_days(overdue_days: i64) -> i64 {
@@ -609,7 +594,7 @@ mod tests {
 
     #[test]
     fn formats_subscription_reminders() {
-        assert!(format_pre_expiry_subscription_reminder_message().contains("Rp 1.000/day"));
-        assert!(format_overdue_subscription_reminder_message(3_000).contains("Sanction: Rp 3.000"));
+        assert!(format_pre_expiry_subscription_reminder_message().contains("Rp 1.000 per hari"));
+        assert!(format_overdue_subscription_reminder_message(3_000).contains("Denda saat ini: Rp 3.000"));
     }
 }

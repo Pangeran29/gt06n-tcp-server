@@ -1,6 +1,6 @@
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use chrono::{DateTime, FixedOffset, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::config::Config;
 use crate::subscription_maintenance::resolve_subscription_sanction;
+use crate::telegram_messages as messages;
 
 pub const MIDTRANS_BASIC_PLAN_CODE: &str = "monthly_basic";
 pub const MIDTRANS_OJOL_PLAN_CODE: &str = "monthly_ojol";
@@ -307,8 +308,8 @@ impl PricingTier {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Basic => "Heartbeats Basic",
-            Self::Ojol => "Heartbeats Ojol",
+            Self::Basic => messages::MSG_43_PLAN_LABEL_BASIC,
+            Self::Ojol => messages::MSG_44_PLAN_LABEL_OJOL,
         }
     }
 }
@@ -345,19 +346,6 @@ pub fn map_midtrans_status(transaction_status: &str) -> Option<MidtransPaymentSt
     })
 }
 
-pub fn format_midtrans_payment_message(payment_url: &str, expires_at: DateTime<Utc>) -> String {
-    let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid WIB offset");
-    let expires_at = wib.from_utc_datetime(&expires_at.naive_utc());
-    let escaped_payment_url = payment_url
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        "🔒 Heartbeats Monthly Access\nRp 35.000 — 30 Days\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\n⏳ Payment link expires: {}",
-        expires_at.format("%d %b %Y %H:%M WIB")
-    )
-}
-
 pub fn format_midtrans_payment_message_with_quote(
     plan: SubscriptionPlan,
     payment_url: &str,
@@ -367,54 +355,15 @@ pub fn format_midtrans_payment_message_with_quote(
     fine_amount_idr: i64,
     total_amount_idr: i64,
 ) -> String {
-    let wib = FixedOffset::east_opt(7 * 60 * 60).expect("valid WIB offset");
-    let expires_at = wib.from_utc_datetime(&expires_at.naive_utc());
-    let escaped_payment_url = payment_url
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    let shipment_line = if shipment_fee_idr > 0 {
-        format!("\nShipment fee: {}", format_idr(shipment_fee_idr))
-    } else {
-        String::new()
-    };
-    let fine_line = if fine_amount_idr > 0 {
-        format!("\nLate sanction: {}", format_idr(fine_amount_idr))
-    } else {
-        String::new()
-    };
-    let total_line = if shipment_fee_idr > 0 || fine_amount_idr > 0 {
-        format!("\nTotal: {}", format_idr(total_amount_idr))
-    } else {
-        String::new()
-    };
-
-    format!(
-        "{}\n{} - 30 Days{}{}{}\n\nTo activate your subscription, complete your payment using the link below:\n<tg-spoiler>{escaped_payment_url}</tg-spoiler>\n\nPayment link expires: {}",
+    messages::msg_49_payment_link_with_quote(
         plan.tier.label(),
-        format_idr(effective_base_amount_idr),
-        shipment_line,
-        fine_line,
-        total_line,
-        expires_at.format("%d %b %Y %H:%M WIB")
+        payment_url,
+        expires_at,
+        effective_base_amount_idr,
+        shipment_fee_idr,
+        fine_amount_idr,
+        total_amount_idr,
     )
-}
-
-fn format_idr(amount: i64) -> String {
-    let digits = amount.abs().to_string();
-    let mut formatted = String::new();
-    for (index, character) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            formatted.push('.');
-        }
-        formatted.push(character);
-    }
-    let formatted = formatted.chars().rev().collect::<String>();
-    if amount < 0 {
-        format!("-Rp {formatted}")
-    } else {
-        format!("Rp {formatted}")
-    }
 }
 
 pub async fn create_pending_midtrans_payment(

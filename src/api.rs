@@ -13,13 +13,13 @@ use sqlx::Row;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::bot::format_payment_success_message;
 use crate::config::Config;
 use crate::db::{Database, DatabaseError};
 use crate::midtrans::{
     apply_midtrans_webhook, map_midtrans_status, verify_midtrans_signature,
     MidtransWebhookApplyOutcome, MidtransWebhookNotification,
 };
+use crate::telegram_messages::{self, msg_46_payment_success};
 
 const PAYMENT_SUCCESS_STICKER_BYTES: &[u8] =
     include_bytes!("../asset/AnimatedSticker - payment success.tgs");
@@ -473,10 +473,10 @@ async fn post_midtrans_webhook(
                     token,
                     subscription.chat_id,
                     PAYMENT_SUCCESS_STICKER_BYTES,
-                    "AnimatedSticker - payment success.tgs",
+                    telegram_messages::STICKER_5_PAYMENT_SUCCESS_FILE_NAME,
                 )
                 .await?;
-                let text = format_payment_success_message(subscription.current_period_end_at);
+                let text = msg_46_payment_success(subscription.current_period_end_at);
                 send_telegram_message(&state.http_client, token, subscription.chat_id, &text)
                     .await?;
             }

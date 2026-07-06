@@ -1,29 +1,103 @@
-# GT06 / Concox TCP Server
+# GT06N TCP Server
 
-## Overview Project
+Rust backend for GT06 / Concox GPS trackers, Telegram bot operations, and Heartbeats subscription payments.
 
-This project is a Rust tracking backend for `GT06` / `Concox` GPS trackers.
+## Services
 
-Today the repo contains two Rust services:
+This repo ships four runtime components:
 
-- the TCP server that receives raw tracker packets, decodes them, and stores the data
-- the Telegram bot that reads stored heartbeat data from PostgreSQL and sends notifications to one admin chat
-- the HTTP API that serves device location data from PostgreSQL for map and stream features
+- `gt06n-tcp-server`: receives tracker packets and stores decoded data
+- `telegram_bot`: handles Telegram registration, tracking features, and payment link creation
+- `http_api`: serves operator/device APIs and Midtrans webhook
+- `subscription_maintenance`: daily reminder and sanction job
 
-The backend is already suitable as the ingestion and first notification layer for a tracking system. It is not yet a complete product with public APIs, dashboards, authentication, or business workflows.
+## Main Flows
 
-The TCP server currently supports these protocol packets:
+### Tracker ingestion
+
+1. Device connects to the TCP server.
+2. The server parses GT06 / Concox frames.
+3. Latest device state is updated in `devices`.
+4. History is appended to `device_locations` and `device_heartbeats`.
+
+Supported packet families:
 
 - login (`0x01`)
 - heartbeat (`0x13`)
 - classic location (`0x12`)
-- Concox extended location (`0x22`)
+- extended location (`0x22`)
 
-## How To Run It
+### Telegram onboarding
 
-### 1. Configure `.env`
+1. User sends `/start`.
+2. If not bound yet, bot asks for IMEI.
+3. Bot validates the IMEI and checks that the device exists.
+4. Bot stores the binding in `telegram_users`.
+5. Bound users land on the start menu.
 
-Create a `.env` file in the project root:
+### Subscription and payment
+
+1. Payment starts from the Telegram bot.
+2. Bot resolves the bound device from `telegram_users.bound_imei`.
+3. Plan price is resolved from `devices.pricing_tier`.
+4. Quote may include:
+   - monthly plan price
+   - late sanction
+   - customer-referenced-device fee
+   - one-time `devices.shipment_fee_idr`
+5. Bot creates a pending `telegram_payment_events` row.
+6. Bot creates a Midtrans Snap transaction and sends the link to Telegram.
+7. Midtrans calls `POST /api/midtrans/webhook`.
+8. Paid webhook updates the single current row in `telegram_subscriptions`.
+
+Pricing behavior:
+
+- `basic` = Rp 35.000 / 30 days
+- `ojol` = Rp 30.000 / 30 days
+- pricing tier is owned by `devices.pricing_tier`
+- `devices.shipment_fee_idr` is charged only on the first successful paid payment for that device
+
+### Reminder and sanction
+
+`subscription_maintenance` runs daily and applies these rules:
+
+- reminder at 5 days before subscription end
+- overdue sanction at Rp 1.000 per day
+- sanction caps at day 7
+- subscription status moves to `past_due` after expiry
+
+## HTTP API
+
+Current routes:
+
+- `GET /api/devices/{imei}/locations`
+- `GET /api/devices/sim-cards`
+- `PATCH /api/devices/{imei}/sim-card-expiration`
+- `GET /api/subscriptions`
+- `POST /api/midtrans/webhook`
+
+## Telegram Bot Features
+
+Current user-facing features:
+
+- device binding via `/start`
+- live tracking link
+- latest health check
+- ride session summary
+- ride metrics
+- payment link creation
+- inactive-subscription prompts
+
+Core commands:
+
+- `/start`
+- `/help`
+- `/paysupport`
+- `/terms`
+
+## Configuration
+
+Example `.env`:
 
 ```env
 GT06_BIND_ADDR=0.0.0.0:5000
@@ -37,188 +111,57 @@ TELEGRAM_BOT_TOKEN=
 TELEGRAM_ADMIN_CHAT_ID=
 TELEGRAM_POLL_TIMEOUT_SECS=30
 TELEGRAM_HEARTBEAT_POLL_INTERVAL_MS=3000
+MIDTRANS_SERVER_KEY=
+MIDTRANS_CLIENT_KEY=
+MIDTRANS_MERCHANT_ID=
+MIDTRANS_IS_PRODUCTION=false
+MIDTRANS_PAYMENT_EXPIRY_HOURS=24
 MIDTRANS_BASIC_PLAN_PRICE_IDR=35000
 MIDTRANS_OJOL_PLAN_PRICE_IDR=30000
 ```
-
+202.155.157.221
 Notes:
 
-- if `DATABASE_URL` is not set, the TCP server still runs, but without PostgreSQL persistence
-- if `DATABASE_URL` is set, the app connects to PostgreSQL and runs migrations automatically at startup
-- the PostgreSQL database itself must already exist before the service starts
-- if `TELEGRAM_BOT_TOKEN` is set, you can run the Telegram bot service
-- if `TELEGRAM_ADMIN_CHAT_ID` is empty, the bot can be bound from Telegram with `/bind_me`
-- `devices.pricing_tier` defaults to `basic`; operators can manually set `ojol` in PostgreSQL for eligible devices
-- `devices.shipment_fee_idr` is optional and, when set, is charged only on the first successful paid payment for that device
+- database migrations run automatically when a database-backed binary starts
+- `devices.pricing_tier` defaults to `basic`
+- `ojol` assignment is operational and done by updating the device row
+- existing pending payment links keep the amount stored when they were created
 
-### 2. Run the TCP Server
+## Local Run
 
-```powershell
+TCP server:
+
+```bash
 cargo run
 ```
 
-For release mode:
+Telegram bot:
 
-```powershell
-cargo run --release
-```
-
-### 3. Run the Telegram Bot
-
-```powershell
+```bash
 cargo run --bin telegram_bot
 ```
 
-For release mode:
+HTTP API:
 
-```powershell
-cargo run --release --bin telegram_bot
-```
-
-The bot uses long polling and reads heartbeat data from PostgreSQL. It does not receive data directly from the TCP socket layer.
-
-### 4. Run the HTTP API
-
-```powershell
+```bash
 cargo run --bin http_api
 ```
 
-For release mode:
-
-```powershell
-cargo run --release --bin http_api
-```
-
-The API exposes:
-
-- `GET /api/devices/:imei/locations?start_at=2026-04-19T10:00:00Z`
-
-### 5. Check that the TCP server is listening
-
-Windows PowerShell:
-
-```powershell
-Test-NetConnection -ComputerName 127.0.0.1 -Port 5000
-```
-
-Linux / VPS:
+Subscription maintenance:
 
 ```bash
-ss -ltn | grep 5000
+cargo run --bin subscription_maintenance
 ```
 
-### 6. Run tests
+Tests:
 
-```powershell
+```bash
 cargo test
 ```
 
-## What This Has
+## Docs
 
-### TCP Ingestion
-
-- async TCP server using `tokio`
-- GT06 `0x7878` frame parsing
-- CRC validation
-- login ACK support
-- heartbeat ACK support
-- support for real Concox login packet variants with extra trailing bytes
-
-### Decoded Tracking Data
-
-For location packets:
-
-- GPS timestamp
-- latitude
-- longitude
-- speed
-- course
-- course status
-- satellite count
-- GPS info length
-- extra packet bytes for extended Concox location packets
-
-For heartbeat packets:
-
-- raw `terminal_info`
-- `terminal_info_bits`
-- validated `gps_tracking_on`
-- validated `acc_high`
-- validated `vibration_detected`
-- neutral guess fields for remaining heartbeat bits
-- voltage level
-- GSM signal strength
-- alarm/language field
-- best-effort `engine_status_guess`
-
-### PostgreSQL Storage
-
-When PostgreSQL is enabled, the server stores data into:
-
-- `devices`
-- `device_locations`
-- `device_heartbeats`
-
-The schema stores both:
-
-- normalized query-friendly fields
-- raw protocol evidence such as `terminal_info`, `terminal_info_bits`, `extra_data_hex`, and protocol number
-
-This is intentional so future parser improvements do not make old data useless.
-
-### Telegram Integration
-
-The repo also includes a separate Telegram bot service that:
-
-- uses Telegram Bot API long polling
-- reads new heartbeat rows from PostgreSQL
-- sends one notification per new heartbeat row
-- supports an initial command surface:
-  - `/start`
-  - `/help`
-  - `/bind_me`
-  - `/last_heartbeat`
-  - `/latest_location`
-
-The bot stores its own operational state in PostgreSQL so it can continue safely after restart. That state currently includes:
-
-- last processed Telegram update id
-- last notified heartbeat id
-- bound admin chat id
-
-Current subscription pricing tiers:
-
-- `basic`: Rp 35.000 / 30 days
-- `ojol`: Rp 30.000 / 30 days
-
-Important note:
-
-- `engine_status_guess` is still heuristic and should not yet be treated as a fully validated ignition signal
-- heartbeat bits now mix validated names and neutral `bit_*_guess` placeholders until the remaining bits are confirmed on the real device
-
-More detail:
-
-- database design: [database.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/database.README.md)
-- deployment process: [deployment.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/deployment.README.md)
-- telegram bot: [telegram.README.md](/d:/jonathan/gps-tracker/tcp-server/docs/telegram.README.md)
-
-## What Need To Be Implemented
-
-The main remaining work is:
-
-- validate `engine_status_guess` against real ignition on/off tests
-- decode packet `0x26`
-- support more Concox alarm and status packet variants
-- build a read API for latest device state and history
-- add dashboard / map UI
-- expand Telegram commands beyond heartbeat-first operations
-- add delivery rules such as status-change-only notifications and richer filtering
-- support production deployment for the Telegram bot with its own `systemd` service
-- evaluate Telegram Stars / payment flows later if the product direction needs them
-- add retention and archival strategy for long-running GPS history
-- improve production hardening, especially running the service under a dedicated Linux user instead of `/root`
-
-
-- all menu access start from command /start
-- imporve flow when the session is not confirmed (not select between yes or no when engine on open a new session to). right now it only send detail of motor off, instead just send like default session end for "Yes" option. bot resolves session as finished and sends a ride summary
-- integrate onboard, /start -> check status first, /start -> give avaiable option
+- [docs/bot.README.md](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/docs/bot.README.md)
+- [docs/database.readme.md](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/docs/database.readme.md)
+- [docs/deployment.README.md](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/docs/deployment.README.md)
+- [docs/telegram-messages.README.md](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/docs/telegram-messages.README.md)

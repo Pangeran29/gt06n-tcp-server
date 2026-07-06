@@ -1,30 +1,21 @@
-# Deployment README
+# Deployment
 
-## Overview
+This project is designed to run on a Linux VPS with `systemd`.
 
-This backend is intended to run on a Linux VPS with `systemd`.
+## Processes
 
-Production runs four processes:
+Production uses four processes:
 
-| Component | Binary | systemd unit | Purpose |
-| --- | --- | --- | --- |
-| TCP server | `gt06n-tcp-server` | `gt06n.service` | Receives GT06 GPS tracker packets |
-| Telegram bot | `telegram_bot` | `gt06n-telegram-bot.service` | Handles Telegram commands, alerts, and payments |
-| HTTP API | `http_api` | `gt06n-http-api.service` | Serves location history and Midtrans webhook |
-| Subscription maintenance | `subscription_maintenance` | `gt06n-subscription-maintenance.timer` | Runs daily reminders, sanctions, and withdrawal flags |
+| Component | Binary | Unit |
+| --- | --- | --- |
+| TCP server | `gt06n-tcp-server` | `gt06n.service` |
+| Telegram bot | `telegram_bot` | `gt06n-telegram-bot.service` |
+| HTTP API | `http_api` | `gt06n-http-api.service` |
+| Subscription maintenance | `subscription_maintenance` | `gt06n-subscription-maintenance.service` + timer |
 
-All services use:
-
-```bash
-WorkingDirectory=/root/gt06n-tcp-server
-EnvironmentFile=/root/gt06n-tcp-server/.env
-```
-
-Database migrations run automatically when a database-backed binary starts.
+All services read the same project `.env`.
 
 ## Normal Deploy
-
-Use this when code changes are pushed and the systemd unit files did not change.
 
 ```bash
 cd /root/gt06n-tcp-server
@@ -36,13 +27,15 @@ sudo systemctl restart gt06n-telegram-bot.service
 sudo systemctl restart gt06n-http-api.service
 ```
 
-Optional: run subscription maintenance immediately after deploy instead of waiting for the daily timer.
+If you want the reminder/sanction job to run immediately after deploy:
 
 ```bash
 sudo systemctl start gt06n-subscription-maintenance.service
 ```
 
-Check status:
+## Checks After Deploy
+
+Service status:
 
 ```bash
 sudo systemctl status gt06n.service
@@ -51,7 +44,7 @@ sudo systemctl status gt06n-http-api.service
 sudo systemctl status gt06n-subscription-maintenance.timer
 ```
 
-Tail logs:
+Logs:
 
 ```bash
 sudo journalctl -u gt06n.service -f
@@ -60,58 +53,29 @@ sudo journalctl -u gt06n-http-api.service -f
 sudo journalctl -u gt06n-subscription-maintenance.service -f
 ```
 
-## First-Time Service Setup
+## First-Time Setup
 
-Create or update these systemd files:
+Create these unit files:
 
-```bash
-/etc/systemd/system/gt06n.service
-/etc/systemd/system/gt06n-telegram-bot.service
-/etc/systemd/system/gt06n-http-api.service
-/etc/systemd/system/gt06n-subscription-maintenance.service
-/etc/systemd/system/gt06n-subscription-maintenance.timer
-```
+- `/etc/systemd/system/gt06n.service`
+- `/etc/systemd/system/gt06n-telegram-bot.service`
+- `/etc/systemd/system/gt06n-http-api.service`
+- `/etc/systemd/system/gt06n-subscription-maintenance.service`
+- `/etc/systemd/system/gt06n-subscription-maintenance.timer`
 
-After creating or editing systemd unit files:
+Then:
 
 ```bash
 sudo systemctl daemon-reload
-
 sudo systemctl enable --now gt06n.service
 sudo systemctl enable --now gt06n-telegram-bot.service
 sudo systemctl enable --now gt06n-http-api.service
 sudo systemctl enable --now gt06n-subscription-maintenance.timer
 ```
 
-Run the subscription maintenance job once manually to verify it works:
+## Unit File Examples
 
-```bash
-sudo systemctl start gt06n-subscription-maintenance.service
-sudo systemctl status gt06n-subscription-maintenance.service
-sudo journalctl -u gt06n-subscription-maintenance.service -n 100
-```
-
-`gt06n-subscription-maintenance.service` is a `Type=oneshot` service. After a successful run, it is normal for status to show:
-
-```text
-Active: inactive (dead)
-```
-
-The success signal is:
-
-```text
-Deactivated successfully.
-```
-
-## systemd Unit Files
-
-### TCP Server
-
-Path:
-
-```bash
-/etc/systemd/system/gt06n.service
-```
+### `gt06n.service`
 
 ```ini
 [Unit]
@@ -130,13 +94,7 @@ EnvironmentFile=/root/gt06n-tcp-server/.env
 WantedBy=multi-user.target
 ```
 
-### Telegram Bot
-
-Path:
-
-```bash
-/etc/systemd/system/gt06n-telegram-bot.service
-```
+### `gt06n-telegram-bot.service`
 
 ```ini
 [Unit]
@@ -155,13 +113,7 @@ EnvironmentFile=/root/gt06n-tcp-server/.env
 WantedBy=multi-user.target
 ```
 
-### HTTP API
-
-Path:
-
-```bash
-/etc/systemd/system/gt06n-http-api.service
-```
+### `gt06n-http-api.service`
 
 ```ini
 [Unit]
@@ -180,13 +132,7 @@ EnvironmentFile=/root/gt06n-tcp-server/.env
 WantedBy=multi-user.target
 ```
 
-### Subscription Maintenance
-
-Path:
-
-```bash
-/etc/systemd/system/gt06n-subscription-maintenance.service
-```
+### `gt06n-subscription-maintenance.service`
 
 ```ini
 [Unit]
@@ -200,11 +146,7 @@ ExecStart=/root/gt06n-tcp-server/target/release/subscription_maintenance
 EnvironmentFile=/root/gt06n-tcp-server/.env
 ```
 
-Path:
-
-```bash
-/etc/systemd/system/gt06n-subscription-maintenance.timer
-```
+### `gt06n-subscription-maintenance.timer`
 
 ```ini
 [Unit]
@@ -219,92 +161,20 @@ Unit=gt06n-subscription-maintenance.service
 WantedBy=timers.target
 ```
 
-The application calculates reminder and sanction days using WIB internally. If your VPS timezone is UTC and you want the timer to run at 08:00 WIB, use:
+If the VPS timezone is UTC and you want the job to run at 08:00 WIB, set:
 
 ```ini
 OnCalendar=*-*-* 01:00:00
 ```
 
-## Useful Commands
-
-Restart services:
-
-```bash
-sudo systemctl restart gt06n.service
-sudo systemctl restart gt06n-telegram-bot.service
-sudo systemctl restart gt06n-http-api.service
-```
-
-Run subscription maintenance now:
-
-```bash
-sudo systemctl start gt06n-subscription-maintenance.service
-```
-
-Check timers:
-
-```bash
-sudo systemctl status gt06n-subscription-maintenance.timer
-sudo systemctl list-timers gt06n-subscription-maintenance.timer
-```
-
-Enable services on boot:
-
-```bash
-sudo systemctl enable gt06n.service
-sudo systemctl enable gt06n-telegram-bot.service
-sudo systemctl enable gt06n-http-api.service
-sudo systemctl enable --now gt06n-subscription-maintenance.timer
-```
-
-Stop services:
-
-```bash
-sudo systemctl stop gt06n.service
-sudo systemctl stop gt06n-telegram-bot.service
-sudo systemctl stop gt06n-http-api.service
-sudo systemctl stop gt06n-subscription-maintenance.timer
-```
-
 ## Subscription Maintenance Notes
 
-The maintenance job needs these `.env` values:
+- this binary is `Type=oneshot`
+- after success, `inactive (dead)` is normal
+- success should show `Deactivated successfully.`
 
-- `DATABASE_URL`
-- `TELEGRAM_BOT_TOKEN`
+## Operational Notes
 
-It runs once per timer event and then exits.
-
-It performs:
-
-- D-5 subscription expiry reminder
-- daily late-payment reminders for overdue days 1-7
-- Rp 1.000/day sanction calculation, capped at Rp 7.000
-- withdrawal-required flag after day 7
-
-No admin Telegram alert is sent for withdrawal-required users in the current version. The team handles device withdrawal manually.
-
-## Troubleshooting
-
-If a binary was updated but service behavior did not change:
-
-```bash
-cargo build --release
-sudo systemctl restart gt06n-telegram-bot.service
-```
-
-If a systemd unit file was edited:
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart gt06n.service
-sudo systemctl restart gt06n-telegram-bot.service
-sudo systemctl restart gt06n-http-api.service
-sudo systemctl restart gt06n-subscription-maintenance.timer
-```
-
-If subscription maintenance shows `inactive (dead)` after a manual run, that is expected for a successful one-shot service. Check logs for errors:
-
-```bash
-sudo journalctl -u gt06n-subscription-maintenance.service -n 100
-```
+- database migrations run automatically when a database-backed binary starts
+- after payment-related schema changes, restart both `telegram_bot` and `http_api`
+- after reminder/sanction changes, restart `subscription_maintenance` or run it once manually

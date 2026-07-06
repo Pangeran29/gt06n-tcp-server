@@ -16,6 +16,7 @@ use crate::midtrans::{
     MidtransClient, MIDTRANS_BASIC_PLAN_CODE, MIDTRANS_OJOL_PLAN_CODE,
 };
 use crate::subscription_maintenance::build_subscription_payment_quote;
+use crate::telegram_messages as messages;
 
 #[derive(Debug, Error)]
 pub enum BotError {
@@ -213,11 +214,11 @@ impl AnalyticsRange {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Select => "Select range",
-            Self::Today => "Today",
-            Self::Yesterday => "Yesterday",
-            Self::Month => "This month",
-            Self::Custom => "Custom",
+            Self::Select => messages::BTN_10_RANGE_SELECT,
+            Self::Today => messages::BTN_11_RANGE_TODAY,
+            Self::Yesterday => messages::BTN_12_RANGE_YESTERDAY,
+            Self::Month => messages::BTN_13_RANGE_THIS_MONTH,
+            Self::Custom => messages::BTN_14_RANGE_CUSTOM,
         }
     }
 }
@@ -842,47 +843,32 @@ impl TelegramBot {
 
         let imei = text.trim();
         if !is_valid_imei(imei) {
-            self.send_message(
-                chat_id,
-                "IMEI must be exactly 15 numeric digits. Please send a valid IMEI.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_1_BIND_INVALID_IMEI)
+                .await?;
             return Ok(());
         }
 
         if user.bound_imei.is_some() {
-            self.send_message(
-                chat_id,
-                "Your Telegram account is already bound to a device.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_2_BIND_ALREADY_BOUND)
+                .await?;
             return Ok(());
         }
 
         if !device_exists(self.database.pool(), imei).await? {
-            self.send_message(
-                chat_id,
-                "That IMEI is not registered in the system yet. Please check the IMEI and try again.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_3_BIND_DEVICE_NOT_FOUND)
+                .await?;
             return Ok(());
         }
 
         if is_device_bound_to_another_user(self.database.pool(), imei, telegram_user_id).await? {
-            self.send_message(
-                chat_id,
-                "That device is already bound to another Telegram user.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_4_BIND_DEVICE_ALREADY_TAKEN)
+                .await?;
             return Ok(());
         }
 
         bind_telegram_user_to_imei(self.database.pool(), telegram_user_id, chat_id, imei).await?;
-        self.send_message(
-            chat_id,
-            &format!("Success. This Telegram account is now bound to IMEI {imei}."),
-        )
-        .await?;
+        self.send_message(chat_id, &messages::msg_5_bind_success(imei))
+            .await?;
         if let Err(error) = self.send_bind_success_sticker(chat_id).await {
             warn!(error = %error, "failed to send bind-success sticker");
         }
@@ -901,11 +887,8 @@ impl TelegramBot {
     ) -> Result<(), BotError> {
         let Some(imei) = user.bound_imei.as_deref() else {
             clear_pending_analytics_kind(self.database.pool(), chat_id).await?;
-            self.send_message(
-                chat_id,
-                "This Telegram account is not bound yet. Use /start first.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_6_NOT_BOUND_USE_START)
+                .await?;
             return Ok(());
         };
 
@@ -919,8 +902,8 @@ impl TelegramBot {
             Some(range) if range.started_at < range.ended_at => range,
             _ => {
                 let error_message = match kind {
-                    AnalyticsKind::Sessions => "Invalid date. Please send it like:\n2026-05-16",
-                    _ => "Invalid date range. Please send it like:\n2026-05-16 to 2026-05-16",
+                    AnalyticsKind::Sessions => messages::MSG_7_ANALYTICS_INVALID_DATE,
+                    _ => messages::MSG_8_ANALYTICS_INVALID_RANGE,
                 };
                 self.send_message(chat_id, error_message).await?;
                 return Ok(());
@@ -976,26 +959,24 @@ impl TelegramBot {
                     .await?;
                     self.send_message(
                         chat_id,
-                        "Welcome. Please send your device IMEI to bind this Telegram account.",
+                        messages::MSG_9_START_BIND_PROMPT,
                     )
                     .await?;
                 }
             },
             BotCommand::Help => {
-                self.send_message(chat_id, HELP_TEXT).await?;
+                self.send_message(chat_id, messages::MSG_10_HELP).await?;
             }
             BotCommand::PaySupport => {
-                self.send_message(chat_id, PAY_SUPPORT_TEXT).await?;
+                self.send_message(chat_id, messages::MSG_11_PAY_SUPPORT)
+                    .await?;
             }
             BotCommand::Terms => {
-                self.send_message(chat_id, TERMS_TEXT).await?;
+                self.send_message(chat_id, messages::MSG_12_TERMS).await?;
             }
             BotCommand::Unknown(command) => {
-                self.send_message(
-                    chat_id,
-                    &format!("Unknown command: {command}. Use /help to see available commands."),
-                )
-                .await?;
+                self.send_message(chat_id, &messages::msg_13_unknown_command(&command))
+                    .await?;
             }
         }
 
@@ -1010,7 +991,7 @@ impl TelegramBot {
         let Some(message) = callback_query.message else {
             self.answer_callback_query(
                 &callback_query.id,
-                "Please open the bot chat and try again.",
+                messages::TOAST_1_OPEN_BOT_CHAT,
                 false,
             )
             .await?;
@@ -1113,7 +1094,7 @@ impl TelegramBot {
     async fn send_subscription_required_menu(&self, chat_id: i64) -> Result<(), BotError> {
         self.send_message_internal(
             chat_id,
-            &format_subscription_menu_message(),
+            messages::MSG_15_SUBSCRIPTION_MENU,
             Some(subscription_payment_keyboard()),
             None,
         )
@@ -1133,7 +1114,11 @@ impl TelegramBot {
             return Ok(true);
         }
 
-        self.answer_callback_query(callback_query_id, "Subscription required.", false)
+        self.answer_callback_query(
+            callback_query_id,
+            messages::TOAST_2_SUBSCRIPTION_REQUIRED,
+            false,
+        )
             .await?;
 
         if let Some(message_id) = message_id {
@@ -1170,7 +1155,7 @@ impl TelegramBot {
         if !is_bound {
             self.answer_callback_query(
                 callback_query_id,
-                "Please bind your device with /start first.",
+                messages::TOAST_3_BIND_FIRST,
                 false,
             )
             .await?;
@@ -1275,7 +1260,7 @@ impl TelegramBot {
         else {
             self.answer_callback_query(
                 &callback_query.id,
-                "Session not found or already inactive.",
+                messages::TOAST_4_SESSION_NOT_FOUND,
                 false,
             )
             .await?;
@@ -1285,7 +1270,7 @@ impl TelegramBot {
         if session.chat_id != chat_id || session.prompt_message_id != prompt_message_id {
             self.answer_callback_query(
                 &callback_query.id,
-                "This session does not match the selected message.",
+                messages::TOAST_5_SESSION_MISMATCH,
                 false,
             )
             .await?;
@@ -1293,7 +1278,11 @@ impl TelegramBot {
         }
 
         if session.session_status != "pending_confirmation" {
-            self.answer_callback_query(&callback_query.id, "This session already ended.", false)
+            self.answer_callback_query(
+                &callback_query.id,
+                messages::TOAST_6_SESSION_ALREADY_ENDED,
+                false,
+            )
                 .await?;
             return Ok(());
         }
@@ -1341,25 +1330,19 @@ impl TelegramBot {
         let Some(user) =
             fetch_telegram_user_by_user_id(self.database.pool(), telegram_user_id).await?
         else {
-            self.send_message(
-                chat_id,
-                "This Telegram account is not bound yet. Use /start first.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_6_NOT_BOUND_USE_START)
+                .await?;
             return Ok(());
         };
 
         let Some(imei) = user.bound_imei.as_deref() else {
-            self.send_message(
-                chat_id,
-                "This Telegram account is not bound yet. Use /start first.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_6_NOT_BOUND_USE_START)
+                .await?;
             return Ok(());
         };
 
         if action.range == AnalyticsRange::Select {
-            let text = format!("Choose range for {}.", action.kind.label());
+            let text = messages::msg_36_choose_range_for(action.kind.label());
             if should_remember_analytics_message(action.kind) {
                 self.send_remembered_analytics_message(
                     chat_id,
@@ -1384,10 +1367,8 @@ impl TelegramBot {
         if action.range == AnalyticsRange::Custom {
             set_pending_analytics_kind(self.database.pool(), chat_id, action.kind).await?;
             let message = match action.kind {
-                AnalyticsKind::Sessions => "Send custom date in WIB:\nYYYY-MM-DD\n\nExample:\n2026-05-16",
-                _ => {
-                    "Send custom date range in WIB:\nYYYY-MM-DD to YYYY-MM-DD\n\nExample:\n2026-05-16 to 2026-05-16"
-                }
+                AnalyticsKind::Sessions => messages::MSG_37_ANALYTICS_CUSTOM_DATE_PROMPT,
+                _ => messages::MSG_38_ANALYTICS_CUSTOM_RANGE_PROMPT,
             };
             if should_remember_analytics_message(action.kind) {
                 self.send_remembered_analytics_message(
@@ -1409,7 +1390,7 @@ impl TelegramBot {
                 chat_id,
                 action.kind,
                 AnalyticsMessageSlot::Selector,
-                "History Perjalanan only supports one date at a time.",
+                messages::MSG_39_ANALYTICS_SESSIONS_MONTH_UNSUPPORTED,
                 Some(analytics_range_keyboard(action.kind)),
             )
             .await?;
@@ -1616,11 +1597,8 @@ impl TelegramBot {
         } else if let Some(bound_imei) = bound_imei {
             bound_imei
         } else {
-            self.send_message(
-                chat_id,
-                "This Telegram account is not bound yet. Use /start first.",
-            )
-            .await?;
+            self.send_message(chat_id, messages::MSG_6_NOT_BOUND_USE_START)
+                .await?;
             return Ok(());
         };
 
@@ -1729,7 +1707,7 @@ impl TelegramBot {
 
     async fn send_engine_on_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(ENGINE_ON_STICKER_BYTES.to_vec())
-            .file_name("AnimatedSticker.tgs")
+            .file_name(messages::STICKER_1_ENGINE_ON_FILE_NAME)
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()
@@ -1750,7 +1728,7 @@ impl TelegramBot {
 
     async fn send_bind_success_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(BIND_SUCCESS_STICKER_BYTES.to_vec())
-            .file_name("AnimatedSticker - hi.tgs")
+            .file_name(messages::STICKER_2_BIND_SUCCESS_FILE_NAME)
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()
@@ -1771,7 +1749,7 @@ impl TelegramBot {
 
     async fn send_not_subscribed_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(NOT_SUBSCRIBED_STICKER_BYTES.to_vec())
-            .file_name("AnimatedSticker - no.tgs")
+            .file_name(messages::STICKER_3_NOT_SUBSCRIBED_FILE_NAME)
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()
@@ -1792,7 +1770,7 @@ impl TelegramBot {
 
     async fn send_theft_warning_sticker(&self, chat_id: i64) -> Result<(), reqwest::Error> {
         let sticker_part = multipart::Part::bytes(THEFT_WARNING_STICKER_BYTES.to_vec())
-            .file_name("AnimatedSticker - not my motor.tgs")
+            .file_name(messages::STICKER_4_THEFT_WARNING_FILE_NAME)
             .mime_str("application/x-tgsticker")?;
 
         let form = multipart::Form::new()
@@ -1960,9 +1938,9 @@ impl TelegramBot {
     }
 }
 
-pub const HELP_TEXT: &str = "Track your motor real time, get info when your motor on/off, get historical riding data\n\n/start - Get the welcome message along with all feature of this bot\n/help - Get this message\n/paysupport - Get payment support contact\n/terms - Read Heartbeats subscription terms";
-pub const PAY_SUPPORT_TEXT: &str = "For any questions, contact @jojojows";
-pub const TERMS_TEXT: &str = "Heartbeats is an online vehicle monitoring service. We provide affordable GPS tracking with advanced features through a monthly subscription. We manage the GPS platform, server infrastructure, internet data usage, and the Heartbeats application.\n\nMonthly subscription includes:\n- Real-time motorcycle tracking\n- Instant engine ON/OFF notifications\n- Ride analytics (distance, speed, riding time, and route map visualization)\n- More features coming soon\n\nSubscription Payment Policy:\nYour subscription must be renewed within 7 days after your 30-day access period ends.\nIf payment is overdue, a penalty fee of Rp 1.000 per day will be applied until payment is completed.\n\nGPS Device Policy:\nThe GPS device is provided as a loan unit.\nIf you stop using Heartbeats, you must return the device.\nTo arrange a return, please contact us via /paysupport.\n\nDevice Security Notice:\nHeartbeats can track the GPS device location in real-time.\nDo not attempt to steal, tamper with, or keep the device without permission.";
+pub const HELP_TEXT: &str = messages::MSG_10_HELP;
+pub const PAY_SUPPORT_TEXT: &str = messages::MSG_11_PAY_SUPPORT;
+pub const TERMS_TEXT: &str = messages::MSG_12_TERMS;
 
 #[derive(Debug, Deserialize)]
 struct TelegramResponse<T> {
@@ -2056,11 +2034,11 @@ fn engine_session_confirmation_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![
             InlineKeyboardButton {
-                text: "Yes, it's me".to_string(),
+                text: messages::BTN_1_ENGINE_CONFIRM_YES.to_string(),
                 callback_data: "engine_session:yes".to_string(),
             },
             InlineKeyboardButton {
-                text: "No, not me".to_string(),
+                text: messages::BTN_2_ENGINE_CONFIRM_NO.to_string(),
                 callback_data: "engine_session:no".to_string(),
             },
         ]],
@@ -2072,16 +2050,16 @@ fn theft_alert_keyboard(session_id: Option<i64>) -> InlineKeyboardMarkup {
         inline_keyboard: vec![
             vec![
                 InlineKeyboardButton {
-                    text: "stream location".to_string(),
+                    text: messages::BTN_3_THEFT_STREAM_LOCATION.to_string(),
                     callback_data: theft_alert_callback_data("stream_location", session_id),
                 },
                 InlineKeyboardButton {
-                    text: "health check".to_string(),
+                    text: messages::BTN_4_THEFT_HEALTH_CHECK.to_string(),
                     callback_data: theft_alert_callback_data("check_latest_status", session_id),
                 },
             ],
             vec![InlineKeyboardButton {
-                text: "contact support".to_string(),
+                text: messages::BTN_5_THEFT_CONTACT_SUPPORT.to_string(),
                 callback_data: theft_alert_callback_data("contact_support", session_id),
             }],
         ],
@@ -2093,24 +2071,24 @@ fn subscribed_start_menu_keyboard() -> InlineKeyboardMarkup {
         inline_keyboard: vec![
             vec![
                 InlineKeyboardButton {
-                    text: "Live Tracking".to_string(),
+                    text: messages::BTN_6_MENU_LIVE_TRACKING.to_string(),
                     callback_data: theft_alert_callback_data("stream_location", None),
                 },
                 InlineKeyboardButton {
-                    text: "Status terkini".to_string(),
+                    text: messages::BTN_7_MENU_STATUS_TERKINI.to_string(),
                     callback_data: theft_alert_callback_data("check_latest_status", None),
                 },
             ],
             vec![
                 InlineKeyboardButton {
-                    text: "History Perjalanan".to_string(),
+                    text: messages::BTN_8_MENU_HISTORY_PERJALANAN.to_string(),
                     callback_data: analytics_callback_data(
                         AnalyticsKind::Sessions,
                         AnalyticsRange::Select,
                     ),
                 },
                 InlineKeyboardButton {
-                    text: "Aktivitas Kendaraan".to_string(),
+                    text: messages::BTN_9_MENU_AKTIVITAS_KENDARAAN.to_string(),
                     callback_data: analytics_callback_data(
                         AnalyticsKind::Metrics,
                         AnalyticsRange::Select,
@@ -2169,7 +2147,7 @@ fn analytics_range_keyboard(kind: AnalyticsKind) -> InlineKeyboardMarkup {
 fn subscription_payment_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![InlineKeyboardButton {
-            text: "Subscribe".to_string(),
+            text: messages::BTN_15_SUBSCRIBE.to_string(),
             callback_data: "payment:subscribe".to_string(),
         }]],
     }
@@ -2313,37 +2291,11 @@ impl StoredHeartbeat {
 }
 
 pub fn format_heartbeat_notification(heartbeat: &StoredHeartbeat) -> String {
-    format!(
-        "Heartbeat update\nIMEI: {}\nServer time: {}\nEngine status: {} (heuristic)\nTerminal info: {} ({})\nVoltage level: {}\nGSM signal: {}\nGPS tracking: {}\nACC high: {}\nVibration detected: {}",
-        heartbeat.imei,
-        heartbeat.server_received_at.format("%Y-%m-%d %H:%M:%S UTC"),
-        heartbeat.engine_status_guess,
-        heartbeat.terminal_info_raw,
-        heartbeat.terminal_info_bits,
-        heartbeat.voltage_level,
-        heartbeat.gsm_signal_strength,
-        heartbeat.gps_tracking_on,
-        option_bool(heartbeat.acc_high),
-        heartbeat.vibration_detected
-    )
+    messages::msg_17_heartbeat_notification(heartbeat)
 }
 
 pub fn format_engine_status_notification(heartbeat: &StoredHeartbeat, status: &str) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS)
-        .expect("valid WIB offset")
-        .from_utc_datetime(&heartbeat.server_received_at.naive_utc());
-
-    match status {
-        "on" => format!(
-            "Motor Dinyalakan\nKalau ini bukan kamu, segera cek lokasi motor.\n{}",
-            wib.format("%d %b %Y - %H:%M WIB")
-        ),
-        "off" => format!(
-            "Motor Dimatikan\nAktivitas terdeteksi pada motor kamu.\n{}",
-            wib.format("%d %b %Y - %H:%M WIB")
-        ),
-        _ => format_heartbeat_notification(heartbeat),
-    }
+    messages::msg_16_engine_status_notification(heartbeat, status)
 }
 
 pub fn format_inactive_subscription_engine_status_message(
@@ -2351,18 +2303,7 @@ pub fn format_inactive_subscription_engine_status_message(
     status: &str,
 ) -> String {
     let _ = heartbeat;
-
-    match status {
-        "on" => format!(
-            "Motor Dinyalakan\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
-        ),
-        "off" => format!(
-            "Motor Dimatikan\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
-        ),
-        _ => format!(
-            "Motor activity detected.\n\nRenew your subscription to receive live tracking, motor status, ride history, and theft alerts."
-        ),
-    }
+    messages::msg_18_inactive_subscription_engine_status_message(status)
 }
 
 pub fn format_engine_on_confirmation_message(heartbeat: &StoredHeartbeat) -> String {
@@ -2375,27 +2316,26 @@ pub fn format_engine_on_confirmation_message_with_duration(
 ) -> String {
     let _ = heartbeat;
     let _ = started_at;
-
-    "🚨 Engine ON Terdeteksi\n\nMotor Anda baru saja dinyalakan.\nApakah ini Anda?".to_string()
+    messages::msg_22_engine_on_confirmation()
 }
 
 pub fn format_ride_safe_message() -> &'static str {
-    "Ride safe - we'll keep tracking in the background for your safety."
+    messages::MSG_23_RIDE_SAFE
 }
 
 pub fn format_session_finished_message() -> &'static str {
-    "Ride session ended."
+    messages::MSG_24_SESSION_FINISHED
 }
 
 pub fn format_theft_warning_message() -> &'static str {
-    "🚨 INDIKASI PENCURIAN\n\nMotor ini dinyalakan bukan oleh Anda. ⚠️ Bertindak cepat — beberapa menit pertama sangat penting dalam kasus pencurian.\n\nTap tombol di bawah untuk mulai live tracking."
+    messages::MSG_25_THEFT_WARNING
 }
 
 pub fn format_theft_location_message(location: Option<&StoredLocation>) -> String {
     if let Some(location) = location {
         format_latest_location_message(location)
     } else {
-        "Latest location\nLokasi terakhir belum tersedia.".to_string()
+        messages::MSG_26_THEFT_LOCATION_MISSING.to_string()
     }
 }
 
@@ -2405,27 +2345,11 @@ pub fn format_theft_engine_off_message(
     current_time: DateTime<Utc>,
 ) -> String {
     let _ = current_time;
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let engine_off_wib = wib.from_utc_datetime(&engine_off_at.naive_utc());
-    let location_link = latest_location_link(latest_location)
-        .unwrap_or_else(|| "Location is not available yet.".to_string());
-
-    format!(
-        "🚨 THEFT ALERT\n\nYour motorcycle engine was turned OFF during a suspected theft situation.\n\n📍 Last Known Location:\n{}\n\nGPS tracking is still active in battery mode while device power remains available.\n\nEngine OFF detected at {}.\n\n⚠️ Act immediately: check the live location, share tracking access, or contact local authorities if needed.",
-        location_link,
-        engine_off_wib.format("%d %b %Y %H:%M WIB"),
-    )
+    messages::msg_27_theft_engine_off_message(latest_location, engine_off_at)
 }
 
 pub fn format_stream_location_message(live_tracking_link: Option<&str>) -> String {
-    let link = live_tracking_link
-        .unwrap_or("Live tracking link is not available yet.")
-        .to_string();
-
-    format!(
-        "📍 Live Tracking Ready\n\nTrack your motorcycle in real-time:\n{}\n\nYou can share this link with someone you trust to help monitor or track your motorcycle.",
-        link
-    )
+    messages::msg_28_stream_location_message(live_tracking_link)
 }
 
 fn build_live_tracking_link(imei: &str, start_at: DateTime<Utc>) -> Option<String> {
@@ -2450,7 +2374,7 @@ pub fn format_latest_motor_status_message(
     heartbeat: Option<&StoredHeartbeat>,
     location: Option<&StoredLocation>,
 ) -> String {
-    format_latest_motor_status_message_at(session, heartbeat, location, Utc::now())
+    messages::msg_33_latest_motor_status_message(session, heartbeat, location, Utc::now())
 }
 
 pub fn format_latest_motor_status_initial_message(
@@ -2459,11 +2383,11 @@ pub fn format_latest_motor_status_initial_message(
     location: Option<&StoredLocation>,
     requested_at: DateTime<Utc>,
 ) -> String {
-    format_latest_motor_status_message_at(session, heartbeat, location, requested_at)
+    messages::msg_33_latest_motor_status_message(session, heartbeat, location, requested_at)
 }
 
 pub fn format_contact_support_message() -> &'static str {
-    "1. Hubungi Call Center 110\n'Halo Polisi, saya ingin melaporkan pencurian motor yang baru saja terjadi. Posisi pelaku sedang terpantau di GPS saya. Mohon bantuan untuk pengejaran.'\n\n2. Datangi SPKT Polsek/Polres\nLangsung ke bagian SPKT (Sentra Pelayanan Kepolisian Terpadu). Tunjukkan aplikasi GPS yang sedang live kepada petugas. Polisi akan langsung berkoordinasi dengan tim Buser/Resmob untuk bergerak ke titik tersebut.\n\n3. Bawa Bukti Kepemilikan\nSiapkan STNK/BPKB (asli atau foto) dan KTP. Polisi butuh ini untuk memastikan itu benar motor Anda sebelum mereka melakukan penindakan atau penangkapan.\n\n4. Minta Pendampingan Unit Lapangan\nSetelah melapor, minta izin untuk mendampingi petugas (di mobil patroli) atau memberikan akses akun GPS Anda kepada petugas agar mereka bisa mengejar target secara akurat.\n\nPENTING: Jangan mendatangi lokasi GPS sendirian. Biarkan polisi yang melakukan tindakan penggerebekan demi keselamatan Anda."
+    messages::MSG_29_CONTACT_SUPPORT
 }
 
 pub fn format_ride_summary_message(
@@ -2472,29 +2396,7 @@ pub fn format_ride_summary_message(
     summary: Option<&RideSummary>,
     latest_location: Option<&StoredLocation>,
 ) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
-    let off_wib = wib.from_utc_datetime(&off_time.naive_utc());
-    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
-    let riding_seconds = summary.map(|value| value.riding_seconds).unwrap_or(0);
-    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
-    let history_link = build_history_tracking_link(&session.imei, session.created_at, off_time)
-        .unwrap_or_else(|| "History link is not available yet.".to_string());
-    let latest_map_link = latest_location_link(latest_location)
-        .unwrap_or_else(|| "Latest map link is not available yet.".to_string());
-    let riding_time = format_duration_compact_from_seconds(riding_seconds);
-
-    format!(
-        "Ride Summary — {}\n\n🏍️ {:.2} km traveled\n⏱️ {} riding time\n⚡ Average speed: {:.2} km/h\n\n{} → {} WIB\n\n🗺️ View Route\n{}\n\n📍 Last Location\n{}",
-        started_wib.format("%d %b %Y"),
-        total_distance_km,
-        riding_time,
-        average_speed_kph,
-        started_wib.format("%H:%M"),
-        off_wib.format("%H:%M"),
-        history_link,
-        latest_map_link,
-    )
+    messages::msg_30_ride_summary_message(session, off_time, summary, latest_location)
 }
 
 fn build_history_tracking_link(
@@ -2525,65 +2427,7 @@ fn format_latest_motor_status_message_at(
     location: Option<&StoredLocation>,
     reference_time: DateTime<Utc>,
 ) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let map_link = latest_location_link(location)
-        .unwrap_or_else(|| "Location is not available yet.".to_string());
-    let engine_status = heartbeat
-        .map(|value| match value.engine_status_guess.as_str() {
-            "on" => "ON",
-            "off" => "OFF",
-            _ => "UNKNOWN",
-        })
-        .unwrap_or("UNKNOWN");
-    let movement_status = match location.and_then(|value| value.speed_kph) {
-        Some(speed) if speed > 0 => format!("MOVING at {speed} km/h"),
-        Some(_) => "STATIONARY".to_string(),
-        None => "UNKNOWN".to_string(),
-    };
-    let signal_status = heartbeat
-        .map(|value| connection_status_label(value.gsm_signal_strength))
-        .unwrap_or("Unknown");
-    let battery_level = heartbeat
-        .map(|value| gps_battery_label(value.voltage_level).to_string())
-        .unwrap_or_else(|| "Unknown".to_string());
-    let last_update = heartbeat
-        .map(|value| value.server_received_at)
-        .into_iter()
-        .chain(location.and_then(|value| value.last_seen_at))
-        .max()
-        .map(|value| format_relative_time_compact(reference_time, value))
-        .unwrap_or_else(|| "unknown".to_string());
-    let battery_warning = heartbeat
-        .filter(|value| value.voltage_level == 0)
-        .map(|_| {
-            "\n\n⚠️ GPS battery is empty. New updates may resume after the motorcycle is turned ON again."
-        })
-        .unwrap_or("");
-    let session_started_wib = wib.from_utc_datetime(&session.created_at.naive_utc());
-    let session_timing = if let Some(resolved_at) = session.resolved_at {
-        let resolved_wib = wib.from_utc_datetime(&resolved_at.naive_utc());
-        format!(
-            "Last session ended at {} WIB.",
-            resolved_wib.format("%H:%M:%S")
-        )
-    } else {
-        format!(
-            "Session active since {}",
-            session_started_wib.format("%H:%M:%S WIB"),
-        )
-    };
-
-    format!(
-        "📍 Motor Status\n\n{}\n\n{} • Updated {}\nEngine: {} • GPS: {} • Power: {}\n\n{}{}",
-        map_link,
-        movement_status,
-        last_update,
-        engine_status,
-        signal_status.to_uppercase(),
-        battery_level.to_uppercase(),
-        session_timing,
-        battery_warning,
-    )
+    messages::msg_33_latest_motor_status_message(session, heartbeat, location, reference_time)
 }
 
 fn format_relative_time_compact(
@@ -2627,66 +2471,47 @@ pub fn format_ride_session_status_message(
     let seconds = total_seconds % 60;
 
     format!(
-        "Current Session\nYou started riding at {}.\nIt has been {:02}:{:02}:{:02} on the road so far.\nGPS tracking is currently {} and your connection quality is {}.",
+        "Sesi Saat Ini\nKamu mulai berkendara pada {}.\nTotal waktu di jalan sejauh ini {:02}:{:02}:{:02}.\nGPS tracking saat ini {} dan kualitas koneksi kamu {}.",
         start.format("%d %b %Y - %H:%M WIB"),
         hours,
         minutes,
         seconds,
-        if heartbeat.gps_tracking_on { "on" } else { "off" },
+        if heartbeat.gps_tracking_on { "aktif" } else { "mati" },
         connection_status_label(heartbeat.gsm_signal_strength),
     )
 }
 
 fn connection_status_label(gsm_signal_strength: i32) -> &'static str {
     match gsm_signal_strength.clamp(1, 4) {
-        1 => "Poor",
-        2 => "Fair",
-        3 => "OK",
-        4 => "Excellent",
-        _ => "Unknown",
+        1 => "Lemah",
+        2 => "Cukup",
+        3 => "Baik",
+        4 => "Sangat Baik",
+        _ => "Tidak diketahui",
     }
 }
 
 fn gps_battery_label(voltage_level: i32) -> &'static str {
     match voltage_level {
-        0 => "Empty",
-        1 => "Very Low",
-        2 => "Low",
-        3 => "Medium",
-        4 => "Full",
-        _ => "Unknown",
+        0 => "Habis",
+        1 => "Sangat Rendah",
+        2 => "Rendah",
+        3 => "Sedang",
+        4 => "Penuh",
+        _ => "Tidak diketahui",
     }
 }
 
 pub fn format_latest_location_message(location: &StoredLocation) -> String {
-    let gps_timestamp = location
-        .gps_timestamp
-        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let last_seen_at = location
-        .last_seen_at
-        .map(|value| value.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    format!(
-        "Latest location\nIMEI: {}\nGPS time: {}\nServer last seen: {}\nLatitude: {}\nLongitude: {}\nSpeed: {} km/h\nCourse: {} deg\nSatellites: {}",
-        location.imei,
-        gps_timestamp,
-        last_seen_at,
-        option_f64(location.latitude),
-        option_f64(location.longitude),
-        option_i32(location.speed_kph),
-        option_i32(location.course),
-        option_i32(location.satellite_count)
-    )
+    messages::msg_34_latest_location_message(location)
 }
 
 fn format_start_status_message() -> String {
-    "Welcome to @tryheartbeatsbot\n\nClick /help for more information.".to_string()
+    messages::MSG_14_START_STATUS.to_string()
 }
 
 fn format_subscription_menu_message() -> String {
-    "Get full access to Heartbeats and monitor your motorcycle in real-time, anytime.".to_string()
+    messages::MSG_15_SUBSCRIPTION_MENU.to_string()
 }
 
 fn resolve_preset_analytics_range(
@@ -2700,7 +2525,7 @@ fn resolve_preset_analytics_range(
 
     match range {
         AnalyticsRange::Today => Some(AnalyticsDateRange {
-            label: "Today".to_string(),
+            label: "Hari ini".to_string(),
             started_at: today_start,
             ended_at: reference_time,
         }),
@@ -2710,7 +2535,7 @@ fn resolve_preset_analytics_range(
             let ended_at = today_start;
 
             Some(AnalyticsDateRange {
-                label: "Yesterday".to_string(),
+                label: "Kemarin".to_string(),
                 started_at,
                 ended_at,
             })
@@ -2718,7 +2543,7 @@ fn resolve_preset_analytics_range(
         AnalyticsRange::Month => {
             let month_start_date = NaiveDate::from_ymd_opt(today.year(), today.month(), 1)?;
             Some(AnalyticsDateRange {
-                label: "This month".to_string(),
+                label: "Bulan ini".to_string(),
                 started_at: wib_datetime_to_utc(month_start_date.and_hms_opt(0, 0, 0)?),
                 ended_at: reference_time,
             })
@@ -2737,7 +2562,7 @@ fn parse_custom_analytics_range(kind: AnalyticsKind, value: &str) -> Option<Anal
     let ended_at = parse_wib_date_end(end.trim())?;
 
     Some(AnalyticsDateRange {
-        label: "Custom range".to_string(),
+        label: "Rentang custom".to_string(),
         started_at,
         ended_at,
     })
@@ -2745,7 +2570,7 @@ fn parse_custom_analytics_range(kind: AnalyticsKind, value: &str) -> Option<Anal
 
 fn parse_custom_analytics_single_date(value: &str) -> Option<AnalyticsDateRange> {
     let date = NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()?;
-    Some(analytics_single_day_range(date, "Custom date"))
+    Some(analytics_single_day_range(date, "Tanggal custom"))
 }
 
 fn analytics_single_day_range(date: NaiveDate, label: &str) -> AnalyticsDateRange {
@@ -2860,114 +2685,16 @@ fn format_driving_sessions_report(
     full_day_route_link: Option<&str>,
     _reference_time: DateTime<Utc>,
 ) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let report_date = range.started_at.with_timezone(&wib).format("%d %b %Y");
-    let total_distance_km = sessions
-        .iter()
-        .map(|report| report.total_distance_km)
-        .sum::<f64>();
-    let total_seconds = sessions
-        .iter()
-        .map(|report| report.riding_seconds)
-        .sum::<u64>();
-    let longest_ride = sessions
-        .iter()
-        .max_by_key(|report| report.riding_seconds)
-        .map(|report| {
-            let start = report.clipped_start.with_timezone(&wib).format("%H:%M");
-            let end = report
-                .session
-                .resolved_at
-                .map(|_| {
-                    report
-                        .clipped_end
-                        .with_timezone(&wib)
-                        .format("%H:%M")
-                        .to_string()
-                })
-                .unwrap_or_else(|| "ONGOING".to_string());
-            format!("{start} → {end}")
-        })
-        .unwrap_or_else(|| "-".to_string());
-    let full_day_route_link = full_day_route_link.unwrap_or("Full day route is not available yet.");
-
-    let mut lines = vec![
-        format!("🛣️ Driving Report — {report_date}"),
-        String::new(),
-        format!(
-            "{} sessions • {:.2} km traveled • {} riding time",
-            sessions.len(),
-            total_distance_km,
-            format_duration_minutes_from_seconds(total_seconds)
-        ),
-        format!("Longest ride: {longest_ride}"),
-        String::new(),
-    ];
-
-    if sessions.is_empty() {
-        lines.push("No driving sessions found on this date.".to_string());
-        lines.push(String::new());
-        lines.push("📍 Full Day Route".to_string());
-        lines.push(full_day_route_link.to_string());
-        return lines.join("\n");
-    }
-
-    for (index, report) in sessions.iter().enumerate() {
-        let start = report.clipped_start.with_timezone(&wib);
-        let end = report
-            .session
-            .resolved_at
-            .map(|_| {
-                report
-                    .clipped_end
-                    .with_timezone(&wib)
-                    .format("%H:%M")
-                    .to_string()
-            })
-            .unwrap_or_else(|| "ONGOING".to_string());
-
-        lines.push(format!(
-            "{}. {} → {} • {} • {:.2} km",
-            index + 1,
-            start.format("%H:%M"),
-            end,
-            format_duration_minutes_from_seconds(report.riding_seconds),
-            report.total_distance_km,
-        ));
-    }
-
-    lines.push(String::new());
-    lines.push("📍 Full Day Route".to_string());
-    lines.push(full_day_route_link.to_string());
-
-    lines.join("\n")
+    let _ = _reference_time;
+    messages::msg_40_driving_sessions_report(range, sessions, full_day_route_link)
 }
 
 fn format_total_km_report(range: &AnalyticsDateRange, summary: Option<&RideSummary>) -> String {
-    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
-    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
-
-    format!(
-        "Total KM\n{}\n\nTotal distance: {:.2} km\nAverage speed: {:.2} km/h",
-        format_analytics_range_label(range),
-        total_distance_km,
-        average_speed_kph
-    )
+    messages::msg_41_total_km_report(range, summary)
 }
 
 fn format_metrics_report(range: &AnalyticsDateRange, summary: Option<&RideSummary>) -> String {
-    let total_distance_km = summary.map(|value| value.total_distance_km).unwrap_or(0.0);
-    let total_seconds = summary.map(|value| value.riding_seconds).unwrap_or(0);
-    let average_speed_kph = summary.map(|value| value.average_speed_kph).unwrap_or(0.0);
-
-    format!(
-        "🏍️ Ride Stats — {}\n\n{} • {:.2} km traveled • {} riding time • {:.1} km/h avg speed\n\n⚠️ Regularly check your motorcycle condition for safety, including engine oil, tire pressure, and brake performance.",
-        range.label,
-        format_ride_stats_date_range(range),
-        total_distance_km,
-        format_duration_minutes_from_seconds(total_seconds),
-        average_speed_kph,
-    )
+    messages::msg_42_metrics_report(range, summary)
 }
 
 fn format_ride_stats_date_range(range: &AnalyticsDateRange) -> String {
@@ -2999,11 +2726,7 @@ fn format_ride_stats_date_range(range: &AnalyticsDateRange) -> String {
 }
 
 fn format_total_driving_time_report(range: &AnalyticsDateRange, total_seconds: u64) -> String {
-    format!(
-        "Total Driving Time\n{}\n\nTotal driving time: {}",
-        format_analytics_range_label(range),
-        format_duration_compact_from_seconds(total_seconds)
-    )
+    messages::msg_45_total_driving_time_report(range, total_seconds)
 }
 
 fn build_status_session(
@@ -3031,18 +2754,7 @@ fn build_status_session(
 }
 
 pub fn format_payment_success_message(current_period_end_at: Option<DateTime<Utc>>) -> String {
-    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("valid WIB offset");
-    let active_until = current_period_end_at
-        .map(|value| {
-            wib.from_utc_datetime(&value.naive_utc())
-                .format("%d %b %Y %H:%M WIB")
-                .to_string()
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    format!(
-        "Payment Successful\n\nYour Heartbeats access is now active until {active_until}.\n\nYou're all set to start tracking and monitoring your motorcycle.\nType /start to begin or /help to see available features."
-    )
+    messages::msg_46_payment_success(current_period_end_at)
 }
 
 fn should_start_new_engine_on_session(
@@ -3072,19 +2784,19 @@ fn should_finish_stale_engine_session(
 fn option_f64(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.6}"))
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "tidak diketahui".to_string())
 }
 
 fn option_i32(value: Option<i32>) -> String {
     value
         .map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "tidak diketahui".to_string())
 }
 
 fn option_bool(value: Option<bool>) -> String {
     value
         .map(|v| v.to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+        .unwrap_or_else(|| "tidak diketahui".to_string())
 }
 
 fn haversine_distance_km(
@@ -4553,7 +4265,7 @@ mod tests {
     #[test]
     fn formats_combined_metrics_report() {
         let range = AnalyticsDateRange {
-            label: "Custom range".to_string(),
+            label: "Rentang custom".to_string(),
             started_at: Utc.with_ymd_and_hms(2026, 5, 16, 1, 0, 0).unwrap(),
             ended_at: Utc.with_ymd_and_hms(2026, 5, 16, 3, 0, 0).unwrap(),
         };
@@ -4567,7 +4279,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "🏍️ Ride Stats — Custom range\n\n16 May 2026 • 42.00 km traveled • 2h 0m riding time • 21.0 km/h avg speed\n\n⚠️ Regularly check your motorcycle condition for safety, including engine oil, tire pressure, and brake performance."
+            "🏍️ Statistik Perjalanan — Rentang custom\n\n16 May 2026 • 42.00 km ditempuh • 2h 0m waktu berkendara • 21.0 km/jam kecepatan rata-rata\n\n⚠️ Jangan lupa rutin cek kondisi motor demi keamanan, termasuk oli mesin, tekanan ban, dan rem."
         );
     }
 
@@ -4585,7 +4297,7 @@ mod tests {
     #[test]
     fn formats_driving_sessions_report_with_active_session() {
         let range = AnalyticsDateRange {
-            label: "Today".to_string(),
+            label: "Hari ini".to_string(),
             started_at: Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap(),
             ended_at: Utc.with_ymd_and_hms(2026, 5, 16, 3, 0, 0).unwrap(),
         };
@@ -4625,13 +4337,13 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 5, 16, 2, 30, 0).unwrap(),
         );
 
-        assert!(text.contains("🛣️ Driving Report — 16 May 2026"));
-        assert!(text.contains("2 sessions • 3.09 km traveled • 45m riding time"));
-        assert!(text.contains("Longest ride: 09:00 → ONGOING"));
+        assert!(text.contains("🛣️ Laporan Perjalanan — 16 May 2026"));
+        assert!(text.contains("2 sesi • 3.09 km ditempuh • 45m waktu berkendara"));
+        assert!(text.contains("Perjalanan terpanjang: 09:00 → MASIH BERJALAN"));
         assert!(text.contains("1. 07:30 → 08:00 • 15m • 2.35 km"));
-        assert!(text.contains("2. 09:00 → ONGOING • 30m • 0.74 km"));
-        assert!(text.contains("ONGOING"));
-        assert!(text.contains("📍 Full Day Route\nhttps://example.test/full-day-route"));
+        assert!(text.contains("2. 09:00 → MASIH BERJALAN • 30m • 0.74 km"));
+        assert!(text.contains("MASIH BERJALAN"));
+        assert!(text.contains("📍 Rute Seharian\nhttps://example.test/full-day-route"));
         assert!(!text.contains("Route:"));
         assert!(!text.contains("https://example.test/route?start_at=3&end_at=4"));
     }
@@ -4639,7 +4351,7 @@ mod tests {
     #[test]
     fn driving_sessions_report_includes_all_single_day_sessions() {
         let range = AnalyticsDateRange {
-            label: "Custom date".to_string(),
+            label: "Tanggal custom".to_string(),
             started_at: Utc.with_ymd_and_hms(2026, 5, 16, 0, 0, 0).unwrap(),
             ended_at: Utc.with_ymd_and_hms(2026, 5, 17, 0, 0, 0).unwrap(),
         };
@@ -4697,7 +4409,7 @@ mod tests {
         let text = format_heartbeat_notification(&heartbeat);
         assert!(text.contains("866221070478388"));
         assert!(text.contains("01000101"));
-        assert!(text.contains("heuristic"));
+        assert!(text.contains("perkiraan"));
     }
 
     #[test]
@@ -4743,14 +4455,14 @@ mod tests {
 
         let on_text = format_inactive_subscription_engine_status_message(&heartbeat, "on");
         assert!(on_text.contains("Motor Dinyalakan"));
-        assert!(on_text.contains("Renew your subscription"));
+        assert!(on_text.contains("Perpanjang langganan"));
         assert!(on_text.contains("live tracking"));
         assert!(!on_text.contains("15 Apr 2026"));
         assert!(!on_text.contains("Activity was detected"));
 
         let off_text = format_inactive_subscription_engine_status_message(&heartbeat, "off");
         assert!(off_text.contains("Motor Dimatikan"));
-        assert!(off_text.contains("Renew your subscription"));
+        assert!(off_text.contains("Perpanjang langganan"));
     }
 
     #[test]
@@ -4780,14 +4492,14 @@ mod tests {
         let text = format_theft_warning_message();
         assert_eq!(
             text,
-            "🚨 INDIKASI PENCURIAN\n\nMotor ini dinyalakan bukan oleh Anda. ⚠️ Bertindak cepat — beberapa menit pertama sangat penting dalam kasus pencurian.\n\nTap tombol di bawah untuk mulai live tracking."
+            "🚨 INDIKASI PENCURIAN\n\nMotor ini dinyalakan bukan oleh Anda. ⚠️ Gerak cepat ya, beberapa menit pertama itu penting banget kalau kejadian pencurian.\n\nTap tombol di bawah untuk mulai live tracking."
         );
     }
 
     #[test]
     fn formats_theft_location_message_without_location() {
         let text = format_theft_location_message(None);
-        assert!(text.contains("Latest location"));
+        assert!(text.contains("Lokasi Terakhir"));
         assert!(text.contains("Lokasi terakhir belum tersedia"));
     }
 
@@ -4805,10 +4517,10 @@ mod tests {
         );
 
         assert!(message.contains("Heartbeats Basic"));
-        assert!(message.contains("Rp 45.000 - 30 Days"));
+        assert!(message.contains("Rp 45.000 - 30 Hari"));
         assert!(!message.contains("Customer"));
         assert!(!message.contains("add"));
-        assert!(!message.contains("Late sanction"));
+        assert!(!message.contains("Denda telat"));
         assert!(!message.contains("Total:"));
         assert!(message.contains("https://pay.example.test/order?a=1&amp;b=2"));
     }
@@ -4827,8 +4539,8 @@ mod tests {
         );
 
         assert!(message.contains("Heartbeats Ojol"));
-        assert!(message.contains("Rp 45.000 - 30 Days"));
-        assert!(message.contains("Late sanction: Rp 3.000"));
+        assert!(message.contains("Rp 45.000 - 30 Hari"));
+        assert!(message.contains("Denda telat: Rp 3.000"));
         assert!(message.contains("Total: Rp 48.000"));
         assert!(!message.contains("Customer"));
     }
@@ -4846,7 +4558,7 @@ mod tests {
             50_000,
         );
 
-        assert!(message.contains("Shipment fee: Rp 15.000"));
+        assert!(message.contains("Biaya pengiriman: Rp 15.000"));
         assert!(message.contains("Total: Rp 50.000"));
     }
 
@@ -4868,7 +4580,7 @@ mod tests {
         let text = format_theft_engine_off_message(Some(&location), started, newest);
         assert_eq!(
             text,
-            "🚨 THEFT ALERT\n\nYour motorcycle engine was turned OFF during a suspected theft situation.\n\n📍 Last Known Location:\nhttps://maps.google.com/?q=-6.216754,106.768455\n\nGPS tracking is still active in battery mode while device power remains available.\n\nEngine OFF detected at 17 Apr 2026 17:00 WIB.\n\n⚠️ Act immediately: check the live location, share tracking access, or contact local authorities if needed."
+            "🚨 ALERT PENCURIAN\n\nMesin motor kamu baru saja mati di situasi yang terindikasi pencurian.\n\n📍 Lokasi Terakhir Diketahui:\nhttps://maps.google.com/?q=-6.216754,106.768455\n\nGPS masih terus aktif dalam mode baterai selama daya perangkat masih ada.\n\nMesin mati terdeteksi pada 17 Apr 2026 17:00 WIB.\n\n⚠️ Segera ambil tindakan: cek live location, bagikan akses tracking, atau hubungi pihak berwajib kalau diperlukan."
         );
     }
 
@@ -4909,7 +4621,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "Ride Summary — 17 Apr 2026\n\n🏍️ 0.69 km traveled\n⏱️ 4m 36s riding time\n⚡ Average speed: 15.77 km/h\n\n17:00 → 17:05 WIB\n\n🗺️ View Route\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z\n\n📍 Last Location\nhttps://maps.google.com/?q=-6.204066,106.785514"
+            "Ringkasan Perjalanan — 17 Apr 2026\n\n🏍️ Jarak tempuh 0.69 km\n⏱️ Waktu berkendara 4m 36s\n⚡ Kecepatan rata-rata 15.77 km/jam\n\n17:00 → 17:05 WIB\n\n🗺️ Lihat Rute\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-17T10%3A00%3A00Z&end_at=2026-04-17T10%3A05%3A00Z\n\n📍 Lokasi Terakhir\nhttps://maps.google.com/?q=-6.204066,106.785514"
         );
     }
 
@@ -4959,7 +4671,7 @@ mod tests {
         ));
         assert_eq!(
             text,
-            "📍 Live Tracking Ready\n\nTrack your motorcycle in real-time:\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z\n\nYou can share this link with someone you trust to help monitor or track your motorcycle."
+            "📍 Live Tracking Siap\n\nPantau motor kamu secara real-time di sini:\nhttps://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z\n\nLink ini bisa kamu bagikan ke orang yang kamu percaya buat bantu mantau motor."
         );
     }
 
@@ -5133,7 +4845,7 @@ mod tests {
         );
         assert_eq!(
             text,
-            "📍 Motor Status\n\nhttps://maps.google.com/?q=-6.204066,106.785514\n\nSTATIONARY • Updated 12s ago\nEngine: OFF • GPS: OK • Power: UNKNOWN\n\nLast session ended at 17:05:07 WIB."
+            "📍 Status Motor\n\nhttps://maps.google.com/?q=-6.204066,106.785514\n\nDIAM • Diperbarui 12dtk lalu\nMesin: OFF • GPS: BAIK • Daya: TIDAK DIKETAHUI\n\nSesi terakhir selesai pada 17:05:07 WIB."
         );
     }
 
@@ -5153,9 +4865,9 @@ mod tests {
         let requested_at = Utc.with_ymd_and_hms(2026, 4, 17, 10, 1, 2).unwrap();
 
         let text = format_latest_motor_status_initial_message(&session, None, None, requested_at);
-        assert!(text.contains("Location is not available yet."));
-        assert!(text.contains("UNKNOWN • Updated unknown"));
-        assert!(text.contains("Session active since 17:00:00 WIB"));
+        assert!(text.contains("Lokasi belum tersedia."));
+        assert!(text.contains("TIDAK DIKETAHUI • Diperbarui tidak diketahui"));
+        assert!(text.contains("Sesi aktif sejak 17:00:00 WIB"));
     }
 
     #[test]
@@ -5191,9 +4903,9 @@ mod tests {
             None,
             Utc.with_ymd_and_hms(2026, 4, 17, 16, 5, 0).unwrap(),
         );
-        assert!(text.contains("Power: EMPTY"));
+        assert!(text.contains("Daya: HABIS"));
         assert!(text.contains(
-            "⚠️ GPS battery is empty. New updates may resume after the motorcycle is turned ON again."
+            "⚠️ Baterai GPS habis. Update baru kemungkinan akan masuk lagi setelah motor dinyalakan."
         ));
     }
 
