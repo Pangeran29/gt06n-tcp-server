@@ -81,6 +81,7 @@ pub const BTN_12_RANGE_YESTERDAY: &str = "Kemarin";
 pub const BTN_13_RANGE_THIS_MONTH: &str = "Bulan ini";
 pub const BTN_14_RANGE_CUSTOM: &str = "Pilih sendiri";
 pub const BTN_15_SUBSCRIBE: &str = "Berlangganan";
+pub const CALLBACK_1_PAYMENT_SUBSCRIBE: &str = "payment:subscribe";
 pub const STICKER_1_ENGINE_ON_FILE_NAME: &str = "AnimatedSticker.tgs";
 pub const STICKER_2_BIND_SUCCESS_FILE_NAME: &str = "AnimatedSticker - hi.tgs";
 pub const STICKER_3_NOT_SUBSCRIBED_FILE_NAME: &str = "AnimatedSticker - no.tgs";

@@ -536,9 +536,9 @@ pub async fn apply_midtrans_webhook(
         return Ok(MidtransWebhookApplyOutcome::Ignored);
     }
 
-    let _existing_subscription = sqlx::query(
+    let existing_subscription = sqlx::query(
         r#"
-        SELECT id, current_period_end_at, plan_code
+        SELECT id, current_period_start_at, current_period_end_at, plan_code
         FROM telegram_subscriptions
         WHERE telegram_user_id = $1
         FOR UPDATE
@@ -548,8 +548,28 @@ pub async fn apply_midtrans_webhook(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let base_time = received_at;
-    let period_end = base_time + chrono::Duration::days(i64::from(period_days));
+    let (period_start, period_end) = if let Some(subscription_row) = existing_subscription.as_ref() {
+        let current_period_start_at =
+            subscription_row.get::<Option<DateTime<Utc>>, _>("current_period_start_at");
+        let current_period_end_at =
+            subscription_row.get::<Option<DateTime<Utc>>, _>("current_period_end_at");
+
+        match current_period_end_at {
+            Some(current_period_end_at) if current_period_end_at > received_at => (
+                current_period_start_at.unwrap_or(received_at),
+                current_period_end_at + chrono::Duration::days(i64::from(period_days)),
+            ),
+            _ => (
+                received_at,
+                received_at + chrono::Duration::days(i64::from(period_days)),
+            ),
+        }
+    } else {
+        (
+            received_at,
+            received_at + chrono::Duration::days(i64::from(period_days)),
+        )
+    };
 
     let subscription_row = sqlx::query(
         r#"
@@ -571,7 +591,7 @@ pub async fn apply_midtrans_webhook(
     .bind(telegram_user_id)
     .bind(chat_id)
     .bind(&plan_code)
-    .bind(base_time)
+    .bind(period_start)
     .bind(period_end)
     .fetch_one(&mut *tx)
     .await?;

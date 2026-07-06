@@ -2148,7 +2148,7 @@ fn subscription_payment_keyboard() -> InlineKeyboardMarkup {
     InlineKeyboardMarkup {
         inline_keyboard: vec![vec![InlineKeyboardButton {
             text: messages::BTN_15_SUBSCRIBE.to_string(),
-            callback_data: "payment:subscribe".to_string(),
+            callback_data: messages::CALLBACK_1_PAYMENT_SUBSCRIBE.to_string(),
         }]],
     }
 }
@@ -6251,9 +6251,10 @@ mod tests {
             .expect("second payment should set period end");
 
         assert_eq!(
-            second_end.signed_duration_since(second_paid_at).num_days(),
+            second_end.signed_duration_since(first_end).num_days(),
             30
         );
+        assert!(second_end > first_end);
 
         let subscription_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM telegram_subscriptions WHERE telegram_user_id = $1",
@@ -6270,6 +6271,14 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(current_plan_code, MIDTRANS_OJOL_PLAN_CODE);
+
+        let current_period_start_at: DateTime<Utc> = sqlx::query_scalar(
+            "SELECT current_period_start_at FROM telegram_subscriptions WHERE telegram_user_id = $1",
+        )
+        .bind(telegram_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(current_period_start_at, first_paid_at);
 
         let expired_at = first_paid_at + chrono::Duration::hours(2);
         let expired_order_id = build_midtrans_order_id(telegram_user_id, expired_at);

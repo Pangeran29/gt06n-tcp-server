@@ -70,6 +70,19 @@ struct SubscriptionMaintenanceRecord {
 struct TelegramSendMessageRequest {
     chat_id: i64,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reply_markup: Option<TelegramInlineKeyboardMarkup>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TelegramInlineKeyboardMarkup {
+    inline_keyboard: Vec<Vec<TelegramInlineKeyboardButton>>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TelegramInlineKeyboardButton {
+    text: String,
+    callback_data: String,
 }
 
 pub async fn run_subscription_maintenance_from_config(
@@ -110,6 +123,7 @@ pub async fn run_subscription_maintenance(
                     telegram_bot_token,
                     record.chat_id,
                     format_pre_expiry_subscription_reminder_message(),
+                    Some(subscription_payment_keyboard()),
                 )
                 .await?;
                 mark_pre_expiry_reminder_sent(pool, &record, record.current_period_end_at, now)
@@ -124,6 +138,7 @@ pub async fn run_subscription_maintenance(
                     telegram_bot_token,
                     record.chat_id,
                     &format_overdue_subscription_reminder_message(fine_amount_idr),
+                    Some(subscription_payment_keyboard()),
                 )
                 .await?;
                 mark_overdue_reminder_sent(pool, &record, overdue_days, fine_amount_idr, now)
@@ -488,10 +503,12 @@ async fn send_telegram_message(
     token: &str,
     chat_id: i64,
     text: &str,
+    reply_markup: Option<TelegramInlineKeyboardMarkup>,
 ) -> Result<(), reqwest::Error> {
     let request = TelegramSendMessageRequest {
         chat_id,
         text: text.to_string(),
+        reply_markup,
     };
 
     let response = client
@@ -502,6 +519,15 @@ async fn send_telegram_message(
         .error_for_status()?;
     let _ = response.bytes().await?;
     Ok(())
+}
+
+fn subscription_payment_keyboard() -> TelegramInlineKeyboardMarkup {
+    TelegramInlineKeyboardMarkup {
+        inline_keyboard: vec![vec![TelegramInlineKeyboardButton {
+            text: messages::BTN_15_SUBSCRIBE.to_string(),
+            callback_data: messages::CALLBACK_1_PAYMENT_SUBSCRIBE.to_string(),
+        }]],
+    }
 }
 
 pub async fn resolve_subscription_sanction(
@@ -596,5 +622,20 @@ mod tests {
     fn formats_subscription_reminders() {
         assert!(format_pre_expiry_subscription_reminder_message().contains("Rp 1.000 per hari"));
         assert!(format_overdue_subscription_reminder_message(3_000).contains("Denda saat ini: Rp 3.000"));
+    }
+
+    #[test]
+    fn subscription_reminder_keyboard_uses_subscribe_callback() {
+        let keyboard = subscription_payment_keyboard();
+        assert_eq!(keyboard.inline_keyboard.len(), 1);
+        assert_eq!(keyboard.inline_keyboard[0].len(), 1);
+        assert_eq!(
+            keyboard.inline_keyboard[0][0].text,
+            messages::BTN_15_SUBSCRIBE
+        );
+        assert_eq!(
+            keyboard.inline_keyboard[0][0].callback_data,
+            messages::CALLBACK_1_PAYMENT_SUBSCRIBE
+        );
     }
 }
