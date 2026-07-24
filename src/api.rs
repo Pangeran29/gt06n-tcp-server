@@ -156,6 +156,8 @@ struct SubscriptionResponse {
     telegram_user_id: i64,
     chat_id: i64,
     bound_imei: Option<String>,
+    customer_name: Option<String>,
+    customer_phone_number: Option<String>,
     pricing_tier: String,
     plan_code: String,
     status: String,
@@ -241,6 +243,8 @@ async fn get_subscriptions(
         SELECT ts.telegram_user_id,
                ts.chat_id,
                tu.bound_imei,
+               customer.name AS customer_name,
+               customer.phone_number AS customer_phone_number,
                COALESCE(d.pricing_tier, 'basic') AS pricing_tier,
                ts.plan_code,
                ts.status,
@@ -252,6 +256,13 @@ async fn get_subscriptions(
           ON tu.telegram_user_id = ts.telegram_user_id
         LEFT JOIN devices d
           ON d.imei = tu.bound_imei
+        LEFT JOIN LATERAL (
+            SELECT name, phone_number
+            FROM customers
+            WHERE imei = tu.bound_imei
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+        ) customer ON TRUE
         LEFT JOIN (
             SELECT telegram_user_id, MIN(paid_at) AS first_subscribed_at
             FROM telegram_payment_events
@@ -284,6 +295,8 @@ async fn get_subscriptions(
                 telegram_user_id: row.get("telegram_user_id"),
                 chat_id: row.get("chat_id"),
                 bound_imei: row.get("bound_imei"),
+                customer_name: row.get("customer_name"),
+                customer_phone_number: row.get("customer_phone_number"),
                 pricing_tier: row.get("pricing_tier"),
                 plan_code: row.get("plan_code"),
                 status: row.get("status"),
