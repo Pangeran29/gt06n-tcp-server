@@ -59,6 +59,8 @@ pub const MSG_44_PLAN_LABEL_OJOL: &str = "Heartbeats Ojol";
 pub const MSG_46_PAYMENT_SUCCESS: &str = "Pembayaran Berhasil\n\nAkses Heartbeats kamu sudah aktif sampai {active_until}.\n\nSekarang kamu sudah bisa mulai pantau motor kamu.\nKetik /start untuk mulai atau /help kalau mau lihat fiturnya.";
 pub const MSG_47_SUBSCRIPTION_PRE_EXPIRY_REMINDER: &str =
     "Langganan Heartbeats kamu akan segera habis.\n\nPerpanjang dulu sebelum masa aktifnya berakhir ya.\nKalau telat perpanjang, ada denda Rp 1.000 per hari.";
+pub const MSG_50_SUBSCRIPTION_EXPIRY_DAY_REMINDER: &str =
+    "Langganan Heartbeats kamu berakhir hari ini.\n\nPerpanjang sekarang supaya akses pemantauan motor tidak terputus.\nMulai besok, keterlambatan dikenakan denda Rp 1.000 per hari.";
 pub const TOAST_1_OPEN_BOT_CHAT: &str = "Buka chat bot-nya dulu lalu coba lagi ya.";
 pub const TOAST_2_SUBSCRIPTION_REQUIRED: &str = "Langganan aktif dibutuhkan.";
 pub const TOAST_3_BIND_FIRST: &str = "Hubungkan perangkat dulu lewat /start ya.";

@@ -47,6 +47,7 @@ pub enum SubscriptionMaintenanceAction {
     PreExpiryReminder {
         days_until_expiry: i64,
     },
+    ExpiryDayReminder,
     OverdueReminder {
         overdue_days: i64,
         fine_amount_idr: i64,
@@ -137,6 +138,24 @@ pub async fn run_subscription_maintenance(
                     &record,
                     record.current_period_end_at,
                     days_until_expiry,
+                    now,
+                )
+                .await?;
+            }
+            SubscriptionMaintenanceAction::ExpiryDayReminder => {
+                send_telegram_message(
+                    &client,
+                    telegram_bot_token,
+                    record.chat_id,
+                    format_expiry_day_subscription_reminder_message(),
+                    Some(subscription_payment_keyboard()),
+                )
+                .await?;
+                mark_pre_expiry_reminder_sent(
+                    pool,
+                    &record,
+                    record.current_period_end_at,
+                    0,
                     now,
                 )
                 .await?;
@@ -292,6 +311,13 @@ pub fn resolve_subscription_maintenance_action(
         }
     }
 
+    if days_until_expiry == 0
+        && (last_pre_expiry_reminded_for_period_end_at != Some(current_period_end_at)
+            || last_pre_expiry_reminded_day != Some(0))
+    {
+        return SubscriptionMaintenanceAction::ExpiryDayReminder;
+    }
+
     let overdue_days = overdue_days_wib(current_period_end_at, now);
     if overdue_days == 0 {
         return SubscriptionMaintenanceAction::None;
@@ -320,6 +346,10 @@ pub fn resolve_subscription_maintenance_action(
 
 pub fn format_pre_expiry_subscription_reminder_message() -> &'static str {
     messages::MSG_47_SUBSCRIPTION_PRE_EXPIRY_REMINDER
+}
+
+pub fn format_expiry_day_subscription_reminder_message() -> &'static str {
+    messages::MSG_50_SUBSCRIPTION_EXPIRY_DAY_REMINDER
 }
 
 pub fn format_overdue_subscription_reminder_message(fine_amount_idr: i64) -> String {
@@ -669,6 +699,35 @@ mod tests {
     }
 
     #[test]
+    fn resolves_expiry_day_reminder_once() {
+        let period_end = Utc.with_ymd_and_hms(2026, 6, 30, 10, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 29, 18, 0, 0).unwrap();
+
+        assert_eq!(
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                Some(period_end),
+                Some(1),
+                None,
+                false,
+            ),
+            SubscriptionMaintenanceAction::ExpiryDayReminder
+        );
+        assert_eq!(
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                Some(period_end),
+                Some(0),
+                None,
+                false,
+            ),
+            SubscriptionMaintenanceAction::None
+        );
+    }
+
+    #[test]
     fn resolves_overdue_reminders_for_days_one_to_seven_once_per_day() {
         let period_end = Utc.with_ymd_and_hms(2026, 6, 29, 17, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 3, 1, 0, 0).unwrap();
@@ -729,6 +788,7 @@ mod tests {
     #[test]
     fn formats_subscription_reminders() {
         assert!(format_pre_expiry_subscription_reminder_message().contains("Rp 1.000 per hari"));
+        assert!(format_expiry_day_subscription_reminder_message().contains("berakhir hari ini"));
         assert!(format_overdue_subscription_reminder_message(3_000).contains("Denda saat ini: Rp 3.000"));
     }
 

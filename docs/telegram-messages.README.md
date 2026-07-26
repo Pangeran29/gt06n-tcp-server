@@ -626,6 +626,17 @@ Please renew before it expires.
 Late renewal is subject to a Rp 1.000/day sanction.
 ```
 
+### `BOT_MSG_SUBSCRIPTION_EXPIRY_DAY_REMINDER`
+
+Source: [src/subscription_maintenance.rs](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/src/subscription_maintenance.rs)
+
+```text
+Your Heartbeats subscription ends today.
+
+Renew now so motorcycle monitoring access is not interrupted.
+Starting tomorrow, late renewal is subject to a Rp 1.000/day sanction.
+```
+
 ### `BOT_MSG_SUBSCRIPTION_OVERDUE_REMINDER`
 
 Source: [src/subscription_maintenance.rs](/Users/jojojow/Projects/heartbeats/gt06n-tcp-server/src/subscription_maintenance.rs:284)
