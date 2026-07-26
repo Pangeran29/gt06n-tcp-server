@@ -155,7 +155,7 @@ Daily reminder and sanction logic is not executed by the bot loop itself. It is 
 
 User-visible behavior:
 
-- reminder at D-5 before expiry
+- one reminder per day from D-5 through D-1 before expiry
 - overdue reminders once per day
 - sanction increases Rp 1.000 per day
 - protected features stay blocked while inactive

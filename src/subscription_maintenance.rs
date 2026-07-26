@@ -44,7 +44,9 @@ pub struct SubscriptionPaymentQuote {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionMaintenanceAction {
     None,
-    PreExpiryReminder,
+    PreExpiryReminder {
+        days_until_expiry: i64,
+    },
     OverdueReminder {
         overdue_days: i64,
         fine_amount_idr: i64,
@@ -62,6 +64,7 @@ struct SubscriptionMaintenanceRecord {
     chat_id: i64,
     current_period_end_at: DateTime<Utc>,
     last_pre_expiry_reminded_for_period_end_at: Option<DateTime<Utc>>,
+    last_pre_expiry_reminded_day: Option<i32>,
     last_overdue_reminded_day: Option<i32>,
     withdrawal_required: bool,
 }
@@ -111,13 +114,16 @@ pub async fn run_subscription_maintenance(
             record.current_period_end_at,
             now,
             record.last_pre_expiry_reminded_for_period_end_at,
+            record.last_pre_expiry_reminded_day,
             record.last_overdue_reminded_day,
             record.withdrawal_required,
         );
 
         match action {
             SubscriptionMaintenanceAction::None => {}
-            SubscriptionMaintenanceAction::PreExpiryReminder => {
+            SubscriptionMaintenanceAction::PreExpiryReminder {
+                days_until_expiry,
+            } => {
                 send_telegram_message(
                     &client,
                     telegram_bot_token,
@@ -126,8 +132,14 @@ pub async fn run_subscription_maintenance(
                     Some(subscription_payment_keyboard()),
                 )
                 .await?;
-                mark_pre_expiry_reminder_sent(pool, &record, record.current_period_end_at, now)
-                    .await?;
+                mark_pre_expiry_reminder_sent(
+                    pool,
+                    &record,
+                    record.current_period_end_at,
+                    days_until_expiry,
+                    now,
+                )
+                .await?;
             }
             SubscriptionMaintenanceAction::OverdueReminder {
                 overdue_days,
@@ -255,14 +267,29 @@ pub fn resolve_subscription_maintenance_action(
     current_period_end_at: DateTime<Utc>,
     now: DateTime<Utc>,
     last_pre_expiry_reminded_for_period_end_at: Option<DateTime<Utc>>,
+    last_pre_expiry_reminded_day: Option<i32>,
     last_overdue_reminded_day: Option<i32>,
     withdrawal_required: bool,
 ) -> SubscriptionMaintenanceAction {
     let days_until_expiry = days_until_expiry_wib(current_period_end_at, now);
-    if days_until_expiry == SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS
-        && last_pre_expiry_reminded_for_period_end_at != Some(current_period_end_at)
-    {
-        return SubscriptionMaintenanceAction::PreExpiryReminder;
+    if (1..=SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS).contains(&days_until_expiry) {
+        let reminder_was_sent_for_period =
+            last_pre_expiry_reminded_for_period_end_at == Some(current_period_end_at);
+        let reminder_was_sent_for_day =
+            last_pre_expiry_reminded_day == Some(days_until_expiry as i32);
+        // Existing rows from before daily reminders have no day value, but did
+        // record that D-5 was sent for the current period.
+        let legacy_d_minus_five_was_sent = reminder_was_sent_for_period
+            && last_pre_expiry_reminded_day.is_none()
+            && days_until_expiry == SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS;
+
+        if !reminder_was_sent_for_period
+            || (!reminder_was_sent_for_day && !legacy_d_minus_five_was_sent)
+        {
+            return SubscriptionMaintenanceAction::PreExpiryReminder {
+                days_until_expiry,
+            };
+        }
     }
 
     let overdue_days = overdue_days_wib(current_period_end_at, now);
@@ -337,6 +364,7 @@ async fn fetch_subscription_maintenance_records(
                ts.chat_id,
                ts.current_period_end_at,
                tss.last_pre_expiry_reminded_for_period_end_at,
+               tss.last_pre_expiry_reminded_day,
                tss.last_overdue_reminded_day,
                COALESCE(tss.withdrawal_required, FALSE) AS withdrawal_required
         FROM telegram_subscriptions ts
@@ -364,6 +392,7 @@ async fn fetch_subscription_maintenance_records(
                     .get::<Option<DateTime<Utc>>, _>("current_period_end_at")?,
                 last_pre_expiry_reminded_for_period_end_at: row
                     .get("last_pre_expiry_reminded_for_period_end_at"),
+                last_pre_expiry_reminded_day: row.get("last_pre_expiry_reminded_day"),
                 last_overdue_reminded_day: row.get("last_overdue_reminded_day"),
                 withdrawal_required: row.get("withdrawal_required"),
             })
@@ -375,9 +404,21 @@ async fn mark_pre_expiry_reminder_sent(
     pool: &sqlx::PgPool,
     record: &SubscriptionMaintenanceRecord,
     period_end_at: DateTime<Utc>,
+    days_until_expiry: i64,
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
-    upsert_sanction_state(pool, record, Some(period_end_at), None, 0, false, None, now).await
+    upsert_sanction_state(
+        pool,
+        record,
+        Some(period_end_at),
+        Some(days_until_expiry as i32),
+        None,
+        0,
+        false,
+        None,
+        now,
+    )
+    .await
 }
 
 async fn mark_overdue_reminder_sent(
@@ -392,6 +433,7 @@ async fn mark_overdue_reminder_sent(
         pool,
         record,
         record.last_pre_expiry_reminded_for_period_end_at,
+        record.last_pre_expiry_reminded_day,
         Some(overdue_days as i32),
         fine_amount_idr,
         false,
@@ -413,6 +455,7 @@ async fn mark_withdrawal_required(
         pool,
         record,
         record.last_pre_expiry_reminded_for_period_end_at,
+        record.last_pre_expiry_reminded_day,
         Some(overdue_days as i32),
         fine_amount_idr,
         true,
@@ -447,6 +490,7 @@ async fn upsert_sanction_state(
     pool: &sqlx::PgPool,
     record: &SubscriptionMaintenanceRecord,
     last_pre_expiry_reminded_for_period_end_at: Option<DateTime<Utc>>,
+    last_pre_expiry_reminded_day: Option<i32>,
     last_overdue_reminded_day: Option<i32>,
     fine_amount_idr: i64,
     withdrawal_required: bool,
@@ -457,17 +501,22 @@ async fn upsert_sanction_state(
         r#"
         INSERT INTO telegram_subscription_sanctions (
             subscription_id, telegram_user_id, chat_id,
-            last_pre_expiry_reminded_for_period_end_at, last_overdue_reminded_day,
+            last_pre_expiry_reminded_for_period_end_at, last_pre_expiry_reminded_day,
+            last_overdue_reminded_day,
             fine_amount_idr, withdrawal_required, withdrawal_required_at,
             resolved_at, created_at, updated_at
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL, NOW(), $9)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NOW(), $10)
         ON CONFLICT (subscription_id) DO UPDATE
         SET telegram_user_id = EXCLUDED.telegram_user_id,
             chat_id = EXCLUDED.chat_id,
             last_pre_expiry_reminded_for_period_end_at = COALESCE(
                 EXCLUDED.last_pre_expiry_reminded_for_period_end_at,
                 telegram_subscription_sanctions.last_pre_expiry_reminded_for_period_end_at
+            ),
+            last_pre_expiry_reminded_day = COALESCE(
+                EXCLUDED.last_pre_expiry_reminded_day,
+                telegram_subscription_sanctions.last_pre_expiry_reminded_day
             ),
             last_overdue_reminded_day = COALESCE(
                 EXCLUDED.last_overdue_reminded_day,
@@ -487,6 +536,7 @@ async fn upsert_sanction_state(
     .bind(record.telegram_user_id)
     .bind(record.chat_id)
     .bind(last_pre_expiry_reminded_for_period_end_at)
+    .bind(last_pre_expiry_reminded_day)
     .bind(last_overdue_reminded_day)
     .bind(fine_amount_idr)
     .bind(withdrawal_required)
@@ -567,16 +617,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_pre_expiry_reminder_once_at_d_minus_five() {
+    fn resolves_pre_expiry_reminders_once_each_day_from_d_minus_five_to_d_minus_one() {
         let period_end = Utc.with_ymd_and_hms(2026, 6, 29, 17, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 6, 25, 1, 0, 0).unwrap();
+
+        for days_until_expiry in (1..=SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS).rev() {
+            let now = period_end - chrono::Duration::days(days_until_expiry);
+
+            assert_eq!(
+                resolve_subscription_maintenance_action(
+                    period_end,
+                    now,
+                    None,
+                    None,
+                    None,
+                    false,
+                ),
+                SubscriptionMaintenanceAction::PreExpiryReminder {
+                    days_until_expiry,
+                }
+            );
+            assert_eq!(
+                resolve_subscription_maintenance_action(
+                    period_end,
+                    now,
+                    Some(period_end),
+                    Some(days_until_expiry as i32),
+                    None,
+                    false,
+                ),
+                SubscriptionMaintenanceAction::None
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_repeat_legacy_d_minus_five_reminder() {
+        let period_end = Utc.with_ymd_and_hms(2026, 6, 29, 17, 0, 0).unwrap();
+        let now = period_end - chrono::Duration::days(5);
 
         assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, None, None, false),
-            SubscriptionMaintenanceAction::PreExpiryReminder
-        );
-        assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, Some(period_end), None, false),
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                Some(period_end),
+                None,
+                None,
+                false,
+            ),
             SubscriptionMaintenanceAction::None
         );
     }
@@ -587,14 +674,21 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 3, 1, 0, 0).unwrap();
 
         assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, None, None, false),
+            resolve_subscription_maintenance_action(period_end, now, None, None, None, false),
             SubscriptionMaintenanceAction::OverdueReminder {
                 overdue_days: 3,
                 fine_amount_idr: 3_000,
             }
         );
         assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, None, Some(3), false),
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                None,
+                None,
+                Some(3),
+                false,
+            ),
             SubscriptionMaintenanceAction::None
         );
     }
@@ -606,14 +700,28 @@ mod tests {
 
         assert_eq!(fine_amount_for_overdue_days(9), SUBSCRIPTION_MAX_FINE_IDR);
         assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, None, Some(7), false),
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                None,
+                None,
+                Some(7),
+                false,
+            ),
             SubscriptionMaintenanceAction::MarkWithdrawalRequired {
                 overdue_days: 8,
                 fine_amount_idr: SUBSCRIPTION_MAX_FINE_IDR,
             }
         );
         assert_eq!(
-            resolve_subscription_maintenance_action(period_end, now, None, Some(7), true),
+            resolve_subscription_maintenance_action(
+                period_end,
+                now,
+                None,
+                None,
+                Some(7),
+                true,
+            ),
             SubscriptionMaintenanceAction::None
         );
     }
