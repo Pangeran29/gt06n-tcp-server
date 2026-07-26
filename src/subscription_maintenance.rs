@@ -41,6 +41,36 @@ pub struct SubscriptionPaymentQuote {
     pub withdrawal_required: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionLifecycleStage {
+    Active,
+    PreExpiry,
+    ExpiryDay,
+    Overdue,
+    WithdrawalRequired,
+}
+
+impl SubscriptionLifecycleStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::PreExpiry => "pre_expiry",
+            Self::ExpiryDay => "expiry_day",
+            Self::Overdue => "overdue",
+            Self::WithdrawalRequired => "withdrawal_required",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubscriptionLifecycleState {
+    pub stage: SubscriptionLifecycleStage,
+    pub day: Option<i64>,
+    pub reminder_sent: Option<bool>,
+    pub fine_amount_idr: i64,
+    pub withdrawal_required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubscriptionMaintenanceAction {
     None,
@@ -68,6 +98,7 @@ struct SubscriptionMaintenanceRecord {
     last_pre_expiry_reminded_day: Option<i32>,
     last_overdue_reminded_day: Option<i32>,
     withdrawal_required: bool,
+    resolved_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -111,12 +142,20 @@ pub async fn run_subscription_maintenance(
     let records = fetch_subscription_maintenance_records(pool).await?;
 
     for record in records {
+        let last_overdue_reminded_day = if record.resolved_at.is_some()
+            || record.last_pre_expiry_reminded_for_period_end_at
+                != Some(record.current_period_end_at)
+        {
+            None
+        } else {
+            record.last_overdue_reminded_day
+        };
         let action = resolve_subscription_maintenance_action(
             record.current_period_end_at,
             now,
             record.last_pre_expiry_reminded_for_period_end_at,
             record.last_pre_expiry_reminded_day,
-            record.last_overdue_reminded_day,
+            last_overdue_reminded_day,
             record.withdrawal_required,
         );
 
@@ -364,6 +403,93 @@ pub fn fine_amount_for_overdue_days(overdue_days: i64) -> i64 {
     overdue_days.clamp(0, SUBSCRIPTION_MAX_FINE_DAYS) * SUBSCRIPTION_DAILY_FINE_IDR
 }
 
+pub fn subscription_lifecycle_state(
+    current_period_end_at: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    last_pre_expiry_reminded_for_period_end_at: Option<DateTime<Utc>>,
+    last_pre_expiry_reminded_day: Option<i32>,
+    last_overdue_reminded_day: Option<i32>,
+    withdrawal_required: bool,
+    resolved_at: Option<DateTime<Utc>>,
+) -> SubscriptionLifecycleState {
+    let Some(period_end) = current_period_end_at else {
+        return SubscriptionLifecycleState {
+            stage: SubscriptionLifecycleStage::Active,
+            day: None,
+            reminder_sent: None,
+            fine_amount_idr: 0,
+            withdrawal_required,
+        };
+    };
+
+    let days_until_expiry = days_until_expiry_wib(period_end, now);
+    let reminder_matches_period =
+        last_pre_expiry_reminded_for_period_end_at == Some(period_end);
+
+    if days_until_expiry > SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS {
+        return SubscriptionLifecycleState {
+            stage: SubscriptionLifecycleStage::Active,
+            day: None,
+            reminder_sent: None,
+            fine_amount_idr: 0,
+            withdrawal_required,
+        };
+    }
+
+    if days_until_expiry > 0 {
+        let legacy_d_minus_five_was_sent = reminder_matches_period
+            && last_pre_expiry_reminded_day.is_none()
+            && days_until_expiry == SUBSCRIPTION_PRE_EXPIRY_REMINDER_DAYS;
+        return SubscriptionLifecycleState {
+            stage: SubscriptionLifecycleStage::PreExpiry,
+            day: Some(days_until_expiry),
+            reminder_sent: Some(
+                legacy_d_minus_five_was_sent
+                    || (reminder_matches_period
+                        && last_pre_expiry_reminded_day == Some(days_until_expiry as i32)),
+            ),
+            fine_amount_idr: 0,
+            withdrawal_required,
+        };
+    }
+
+    if days_until_expiry == 0 {
+        return SubscriptionLifecycleState {
+            stage: SubscriptionLifecycleStage::ExpiryDay,
+            day: Some(0),
+            reminder_sent: Some(
+                reminder_matches_period && last_pre_expiry_reminded_day == Some(0),
+            ),
+            fine_amount_idr: 0,
+            withdrawal_required,
+        };
+    }
+
+    let overdue_days = overdue_days_wib(period_end, now);
+    let fine_amount_idr = fine_amount_for_overdue_days(overdue_days);
+    if overdue_days <= SUBSCRIPTION_MAX_FINE_DAYS {
+        return SubscriptionLifecycleState {
+            stage: SubscriptionLifecycleStage::Overdue,
+            day: Some(overdue_days),
+            reminder_sent: Some(
+                resolved_at.is_none()
+                    && reminder_matches_period
+                    && last_overdue_reminded_day == Some(overdue_days as i32),
+            ),
+            fine_amount_idr,
+            withdrawal_required,
+        };
+    }
+
+    SubscriptionLifecycleState {
+        stage: SubscriptionLifecycleStage::WithdrawalRequired,
+        day: Some(overdue_days),
+        reminder_sent: None,
+        fine_amount_idr,
+        withdrawal_required,
+    }
+}
+
 fn days_until_expiry_wib(current_period_end_at: DateTime<Utc>, now: DateTime<Utc>) -> i64 {
     let current_date = wib_date(now);
     let expiry_date = wib_date(current_period_end_at);
@@ -396,7 +522,8 @@ async fn fetch_subscription_maintenance_records(
                tss.last_pre_expiry_reminded_for_period_end_at,
                tss.last_pre_expiry_reminded_day,
                tss.last_overdue_reminded_day,
-               COALESCE(tss.withdrawal_required, FALSE) AS withdrawal_required
+               COALESCE(tss.withdrawal_required, FALSE) AS withdrawal_required,
+               tss.resolved_at
         FROM telegram_subscriptions ts
         LEFT JOIN telegram_subscription_sanctions tss
           ON tss.subscription_id = ts.id
@@ -425,6 +552,7 @@ async fn fetch_subscription_maintenance_records(
                 last_pre_expiry_reminded_day: row.get("last_pre_expiry_reminded_day"),
                 last_overdue_reminded_day: row.get("last_overdue_reminded_day"),
                 withdrawal_required: row.get("withdrawal_required"),
+                resolved_at: row.get("resolved_at"),
             })
         })
         .collect())
@@ -459,11 +587,19 @@ async fn mark_overdue_reminder_sent(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     set_subscription_status(pool, record.subscription_id, "past_due").await?;
+    let last_pre_expiry_reminded_day = if record
+        .last_pre_expiry_reminded_for_period_end_at
+        == Some(record.current_period_end_at)
+    {
+        record.last_pre_expiry_reminded_day
+    } else {
+        None
+    };
     upsert_sanction_state(
         pool,
         record,
-        record.last_pre_expiry_reminded_for_period_end_at,
-        record.last_pre_expiry_reminded_day,
+        Some(record.current_period_end_at),
+        last_pre_expiry_reminded_day,
         Some(overdue_days as i32),
         fine_amount_idr,
         false,
@@ -481,11 +617,19 @@ async fn mark_withdrawal_required(
     now: DateTime<Utc>,
 ) -> Result<(), sqlx::Error> {
     set_subscription_status(pool, record.subscription_id, "past_due").await?;
+    let last_pre_expiry_reminded_day = if record
+        .last_pre_expiry_reminded_for_period_end_at
+        == Some(record.current_period_end_at)
+    {
+        record.last_pre_expiry_reminded_day
+    } else {
+        None
+    };
     upsert_sanction_state(
         pool,
         record,
-        record.last_pre_expiry_reminded_for_period_end_at,
-        record.last_pre_expiry_reminded_day,
+        Some(record.current_period_end_at),
+        last_pre_expiry_reminded_day,
         Some(overdue_days as i32),
         fine_amount_idr,
         true,
@@ -544,14 +688,24 @@ async fn upsert_sanction_state(
                 EXCLUDED.last_pre_expiry_reminded_for_period_end_at,
                 telegram_subscription_sanctions.last_pre_expiry_reminded_for_period_end_at
             ),
-            last_pre_expiry_reminded_day = COALESCE(
-                EXCLUDED.last_pre_expiry_reminded_day,
-                telegram_subscription_sanctions.last_pre_expiry_reminded_day
-            ),
-            last_overdue_reminded_day = COALESCE(
-                EXCLUDED.last_overdue_reminded_day,
-                telegram_subscription_sanctions.last_overdue_reminded_day
-            ),
+            last_pre_expiry_reminded_day = CASE
+                WHEN EXCLUDED.last_pre_expiry_reminded_for_period_end_at IS DISTINCT FROM
+                     telegram_subscription_sanctions.last_pre_expiry_reminded_for_period_end_at
+                    THEN EXCLUDED.last_pre_expiry_reminded_day
+                ELSE COALESCE(
+                    EXCLUDED.last_pre_expiry_reminded_day,
+                    telegram_subscription_sanctions.last_pre_expiry_reminded_day
+                )
+            END,
+            last_overdue_reminded_day = CASE
+                WHEN EXCLUDED.last_pre_expiry_reminded_for_period_end_at IS DISTINCT FROM
+                     telegram_subscription_sanctions.last_pre_expiry_reminded_for_period_end_at
+                    THEN EXCLUDED.last_overdue_reminded_day
+                ELSE COALESCE(
+                    EXCLUDED.last_overdue_reminded_day,
+                    telegram_subscription_sanctions.last_overdue_reminded_day
+                )
+            END,
             fine_amount_idr = EXCLUDED.fine_amount_idr,
             withdrawal_required = EXCLUDED.withdrawal_required,
             withdrawal_required_at = COALESCE(
@@ -617,7 +771,10 @@ pub async fn resolve_subscription_sanction(
     if let Err(error) = sqlx::query(
         r#"
         UPDATE telegram_subscription_sanctions
-        SET fine_amount_idr = 0,
+        SET last_pre_expiry_reminded_for_period_end_at = NULL,
+            last_pre_expiry_reminded_day = NULL,
+            last_overdue_reminded_day = NULL,
+            fine_amount_idr = 0,
             withdrawal_required = FALSE,
             withdrawal_required_at = NULL,
             resolved_at = NOW(),
@@ -725,6 +882,106 @@ mod tests {
             ),
             SubscriptionMaintenanceAction::None
         );
+    }
+
+    #[test]
+    fn projects_subscription_lifecycle_and_reminder_delivery() {
+        let period_end = Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+
+        let active = subscription_lifecycle_state(
+            Some(period_end),
+            period_end - chrono::Duration::days(10),
+            None,
+            None,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(active.stage, SubscriptionLifecycleStage::Active);
+        assert_eq!(active.reminder_sent, None);
+
+        let pre_expiry = subscription_lifecycle_state(
+            Some(period_end),
+            period_end - chrono::Duration::days(3),
+            Some(period_end),
+            Some(3),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(pre_expiry.stage, SubscriptionLifecycleStage::PreExpiry);
+        assert_eq!(pre_expiry.day, Some(3));
+        assert_eq!(pre_expiry.reminder_sent, Some(true));
+
+        let expiry_day = subscription_lifecycle_state(
+            Some(period_end),
+            period_end - chrono::Duration::hours(8),
+            Some(period_end),
+            Some(1),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(expiry_day.stage, SubscriptionLifecycleStage::ExpiryDay);
+        assert_eq!(expiry_day.reminder_sent, Some(false));
+
+        let overdue = subscription_lifecycle_state(
+            Some(period_end),
+            period_end + chrono::Duration::days(4),
+            Some(period_end),
+            Some(0),
+            Some(4),
+            false,
+            None,
+        );
+        assert_eq!(overdue.stage, SubscriptionLifecycleStage::Overdue);
+        assert_eq!(overdue.day, Some(4));
+        assert_eq!(overdue.reminder_sent, Some(true));
+        assert_eq!(overdue.fine_amount_idr, 4_000);
+
+        let withdrawal = subscription_lifecycle_state(
+            Some(period_end),
+            period_end + chrono::Duration::days(8),
+            Some(period_end),
+            Some(0),
+            Some(7),
+            true,
+            None,
+        );
+        assert_eq!(
+            withdrawal.stage,
+            SubscriptionLifecycleStage::WithdrawalRequired
+        );
+        assert_eq!(withdrawal.fine_amount_idr, SUBSCRIPTION_MAX_FINE_IDR);
+        assert_eq!(withdrawal.reminder_sent, None);
+    }
+
+    #[test]
+    fn ignores_stale_reminder_state_from_an_earlier_period() {
+        let current_period_end = Utc.with_ymd_and_hms(2026, 8, 10, 10, 0, 0).unwrap();
+        let previous_period_end = current_period_end - chrono::Duration::days(30);
+
+        let pre_expiry = subscription_lifecycle_state(
+            Some(current_period_end),
+            current_period_end - chrono::Duration::days(2),
+            Some(previous_period_end),
+            Some(2),
+            Some(2),
+            false,
+            Some(previous_period_end),
+        );
+        assert_eq!(pre_expiry.reminder_sent, Some(false));
+
+        let overdue = subscription_lifecycle_state(
+            Some(current_period_end),
+            current_period_end + chrono::Duration::days(2),
+            Some(previous_period_end),
+            Some(0),
+            Some(2),
+            false,
+            Some(previous_period_end),
+        );
+        assert_eq!(overdue.reminder_sent, Some(false));
     }
 
     #[test]

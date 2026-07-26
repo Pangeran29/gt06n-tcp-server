@@ -6205,6 +6205,24 @@ mod tests {
         .await?;
         assert_eq!(duplicate_subscription, MidtransWebhookApplyOutcome::Ignored);
 
+        sqlx::query(
+            r#"
+            INSERT INTO telegram_subscription_sanctions (
+                subscription_id, telegram_user_id, chat_id,
+                last_pre_expiry_reminded_for_period_end_at,
+                last_pre_expiry_reminded_day, last_overdue_reminded_day,
+                fine_amount_idr, withdrawal_required, created_at, updated_at
+            )
+            VALUES ($1, $2, $3, $4, 0, 3, 3000, FALSE, NOW(), NOW())
+            "#,
+        )
+        .bind(first_subscription_id)
+        .bind(telegram_user_id)
+        .bind(chat_id)
+        .bind(first_end)
+        .execute(database.pool())
+        .await?;
+
         let second_paid_at = first_paid_at + chrono::Duration::days(1);
         sqlx::query("UPDATE devices SET pricing_tier = 'ojol', updated_at = NOW() WHERE imei = '999888777666555'")
             .execute(database.pool())
@@ -6255,6 +6273,42 @@ mod tests {
             30
         );
         assert!(second_end > first_end);
+
+        let sanction_row = sqlx::query(
+            r#"
+            SELECT last_pre_expiry_reminded_for_period_end_at,
+                   last_pre_expiry_reminded_day,
+                   last_overdue_reminded_day,
+                   fine_amount_idr,
+                   withdrawal_required,
+                   resolved_at
+            FROM telegram_subscription_sanctions
+            WHERE subscription_id = $1
+            "#,
+        )
+        .bind(first_subscription_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            sanction_row
+                .get::<Option<DateTime<Utc>>, _>("last_pre_expiry_reminded_for_period_end_at"),
+            None
+        );
+        assert_eq!(
+            sanction_row.get::<Option<i32>, _>("last_pre_expiry_reminded_day"),
+            None
+        );
+        assert_eq!(
+            sanction_row.get::<Option<i32>, _>("last_overdue_reminded_day"),
+            None
+        );
+        assert_eq!(sanction_row.get::<i64, _>("fine_amount_idr"), 0);
+        assert!(!sanction_row.get::<bool, _>("withdrawal_required"));
+        assert!(
+            sanction_row
+                .get::<Option<DateTime<Utc>>, _>("resolved_at")
+                .is_some()
+        );
 
         let subscription_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM telegram_subscriptions WHERE telegram_user_id = $1",

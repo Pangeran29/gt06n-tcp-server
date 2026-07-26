@@ -19,6 +19,7 @@ use crate::midtrans::{
     apply_midtrans_webhook, map_midtrans_status, verify_midtrans_signature,
     MidtransWebhookApplyOutcome, MidtransWebhookNotification,
 };
+use crate::subscription_maintenance::subscription_lifecycle_state;
 use crate::telegram_messages::{self, msg_46_payment_success};
 
 const PAYMENT_SUCCESS_STICKER_BYTES: &[u8] =
@@ -165,6 +166,11 @@ struct SubscriptionResponse {
     current_period_end_at: Option<String>,
     first_subscribed_at: Option<String>,
     subscribed_days: Option<i64>,
+    lifecycle_stage: &'static str,
+    lifecycle_day: Option<i64>,
+    reminder_sent: Option<bool>,
+    fine_amount_idr: i64,
+    withdrawal_required: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -262,7 +268,12 @@ async fn get_subscriptions(
                ts.status,
                ts.current_period_start_at,
                ts.current_period_end_at,
-               payments.first_subscribed_at
+               payments.first_subscribed_at,
+               sanctions.last_pre_expiry_reminded_for_period_end_at,
+               sanctions.last_pre_expiry_reminded_day,
+               sanctions.last_overdue_reminded_day,
+               COALESCE(sanctions.withdrawal_required, FALSE) AS withdrawal_required,
+               sanctions.resolved_at AS sanction_resolved_at
         FROM telegram_subscriptions ts
         JOIN telegram_users tu
           ON tu.telegram_user_id = ts.telegram_user_id
@@ -283,6 +294,8 @@ async fn get_subscriptions(
             GROUP BY telegram_user_id
         ) payments
           ON payments.telegram_user_id = ts.telegram_user_id
+        LEFT JOIN telegram_subscription_sanctions sanctions
+          ON sanctions.subscription_id = ts.id
         ORDER BY
             CASE WHEN $1 = 'asc' THEN ts.current_period_end_at END ASC NULLS LAST,
             CASE WHEN $1 = 'desc' THEN ts.current_period_end_at END DESC NULLS LAST,
@@ -302,6 +315,15 @@ async fn get_subscriptions(
             let period_end = row.get::<Option<DateTime<Utc>>, _>("current_period_end_at");
             let first_subscribed_at =
                 row.get::<Option<DateTime<Utc>>, _>("first_subscribed_at");
+            let lifecycle = subscription_lifecycle_state(
+                period_end,
+                now,
+                row.get("last_pre_expiry_reminded_for_period_end_at"),
+                row.get("last_pre_expiry_reminded_day"),
+                row.get("last_overdue_reminded_day"),
+                row.get("withdrawal_required"),
+                row.get("sanction_resolved_at"),
+            );
 
             SubscriptionResponse {
                 telegram_user_id: row.get("telegram_user_id"),
@@ -317,6 +339,11 @@ async fn get_subscriptions(
                 first_subscribed_at: first_subscribed_at.map(|value| value.to_rfc3339()),
                 subscribed_days: first_subscribed_at
                     .map(|value| complete_subscribed_days(value, now)),
+                lifecycle_stage: lifecycle.stage.as_str(),
+                lifecycle_day: lifecycle.day,
+                reminder_sent: lifecycle.reminder_sent,
+                fine_amount_idr: lifecycle.fine_amount_idr,
+                withdrawal_required: lifecycle.withdrawal_required,
             }
         })
         .collect();
