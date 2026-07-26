@@ -175,6 +175,17 @@ struct DeviceSimCardResponse {
     sim_card_expiration_date: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct DeviceMonitoringResponse {
+    id: i64,
+    imei: String,
+    customer_name: Option<String>,
+    customer_phone_number: Option<String>,
+    latest_latitude: Option<f64>,
+    latest_longitude: Option<f64>,
+    last_seen_at: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct UpdateSimCardExpirationRequest {
     sim_card_expiration_date: Option<String>,
@@ -193,6 +204,7 @@ impl HttpApiServer {
         });
 
         let router = Router::new()
+            .route("/api/devices", get(get_devices))
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
             .route(
@@ -310,6 +322,50 @@ async fn get_subscriptions(
         .collect();
 
     Ok(Json(subscriptions))
+}
+
+async fn get_devices(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<DeviceMonitoringResponse>>, ApiError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT d.id,
+               d.imei,
+               customer.name AS customer_name,
+               customer.phone_number AS customer_phone_number,
+               d.latest_latitude,
+               d.latest_longitude,
+               d.last_seen_at
+        FROM devices d
+        LEFT JOIN LATERAL (
+            SELECT name, phone_number
+            FROM customers
+            WHERE imei = d.imei
+            ORDER BY updated_at DESC, id DESC
+            LIMIT 1
+        ) customer ON TRUE
+        ORDER BY d.last_seen_at DESC, d.imei ASC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let devices = rows
+        .into_iter()
+        .map(|row| DeviceMonitoringResponse {
+            id: row.get("id"),
+            imei: row.get("imei"),
+            customer_name: row.get("customer_name"),
+            customer_phone_number: row.get("customer_phone_number"),
+            latest_latitude: row.get("latest_latitude"),
+            latest_longitude: row.get("latest_longitude"),
+            last_seen_at: row
+                .get::<DateTime<Utc>, _>("last_seen_at")
+                .to_rfc3339(),
+        })
+        .collect();
+
+    Ok(Json(devices))
 }
 
 async fn get_device_sim_cards(

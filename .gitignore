@@ -3,3 +3,4 @@
 
 .env
 .DS_Store
+scripts/deploy.sh
