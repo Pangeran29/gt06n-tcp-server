@@ -6,13 +6,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::bot::fetch_ride_summary;
 use crate::config::Config;
 use crate::db::{Database, DatabaseError};
 use crate::midtrans::{
@@ -24,6 +25,7 @@ use crate::telegram_messages::{self, msg_46_payment_success};
 
 const PAYMENT_SUCCESS_STICKER_BYTES: &[u8] =
     include_bytes!("../asset/AnimatedSticker - payment success.tgs");
+const WIB_OFFSET_SECONDS: i32 = 7 * 60 * 60;
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -37,6 +39,8 @@ pub enum ApiError {
     InvalidStartAt,
     #[error("invalid end_at query parameter")]
     InvalidEndAt,
+    #[error("invalid date query parameter; expected YYYY-MM-DD")]
+    InvalidDate,
     #[error("invalid sort_order query parameter; expected asc or desc")]
     InvalidSortOrder,
     #[error("invalid sim_card_expiration_date; expected YYYY-MM-DD or null")]
@@ -60,6 +64,7 @@ impl IntoResponse for ApiError {
         let status = match self {
             Self::InvalidStartAt
             | Self::InvalidEndAt
+            | Self::InvalidDate
             | Self::InvalidSortOrder
             | Self::InvalidSimCardExpirationDate
             | Self::InvalidMidtransSignature
@@ -103,6 +108,11 @@ struct ApiErrorBody {
 struct LocationsQuery {
     start_at: String,
     end_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsQuery {
+    date: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +160,24 @@ struct LocationPoint {
     speed_kph: i32,
     course: i32,
     satellite_count: i32,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceSessionsResponse {
+    imei: String,
+    date: String,
+    timezone: &'static str,
+    sessions: Vec<DeviceSessionResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceSessionResponse {
+    id: i64,
+    started_at: String,
+    ended_at: Option<String>,
+    state: &'static str,
+    duration_seconds: i64,
+    distance_km: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +239,7 @@ impl HttpApiServer {
 
         let router = Router::new()
             .route("/api/devices", get(get_devices))
+            .route("/api/devices/{imei}/sessions", get(get_device_sessions))
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
             .route(
@@ -473,6 +502,84 @@ fn complete_subscribed_days(first_subscribed_at: DateTime<Utc>, now: DateTime<Ut
         .max(0)
 }
 
+fn wib_day_bounds(
+    date: &str,
+) -> Result<(NaiveDate, DateTime<Utc>, DateTime<Utc>), ApiError> {
+    let date = NaiveDate::parse_from_str(date, "%Y-%m-%d").map_err(|_| ApiError::InvalidDate)?;
+    let wib = FixedOffset::east_opt(WIB_OFFSET_SECONDS).expect("WIB offset must be valid");
+    let local_start = date
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight must be valid");
+    let start_at = wib
+        .from_local_datetime(&local_start)
+        .single()
+        .expect("fixed WIB offset must resolve one local datetime")
+        .with_timezone(&Utc);
+    let end_at = start_at + Duration::days(1);
+
+    Ok((date, start_at, end_at))
+}
+
+async fn get_device_sessions(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<DeviceSessionsResponse>, ApiError> {
+    let (date, day_start, day_end) = wib_day_bounds(&query.date)?;
+    let now = Utc::now();
+    let rows = sqlx::query(
+        r#"
+        SELECT id, created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND created_at < $3
+          AND COALESCE(resolved_at, $4) > $2
+        ORDER BY created_at DESC, id DESC
+        "#,
+    )
+    .bind(&imei)
+    .bind(day_start)
+    .bind(day_end)
+    .bind(now)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut sessions = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let id = row.get("id");
+        let started_at = row.get::<DateTime<Utc>, _>("created_at");
+        let ended_at = row.get::<Option<DateTime<Utc>>, _>("resolved_at");
+        let effective_end = ended_at.unwrap_or(now);
+        let summary = fetch_ride_summary(&state.pool, &imei, started_at, effective_end).await?;
+
+        sessions.push(DeviceSessionResponse {
+            id,
+            started_at: started_at.to_rfc3339(),
+            ended_at: ended_at.map(|value| value.to_rfc3339()),
+            state: if ended_at.is_some() {
+                "completed"
+            } else {
+                "ongoing"
+            },
+            duration_seconds: effective_end
+                .signed_duration_since(started_at)
+                .num_seconds()
+                .max(0),
+            distance_km: summary
+                .map(|value| value.total_distance_km)
+                .unwrap_or(0.0),
+        });
+    }
+
+    Ok(Json(DeviceSessionsResponse {
+        imei,
+        date: date.format("%Y-%m-%d").to_string(),
+        timezone: "Asia/Jakarta",
+        sessions,
+    }))
+}
+
 async fn get_device_locations(
     State(state): State<Arc<AppState>>,
     Path(imei): Path<String>,
@@ -616,7 +723,10 @@ async fn send_telegram_message(
 mod tests {
     use chrono::{TimeZone, Utc};
 
-    use super::{complete_subscribed_days, parse_optional_expiration_date, ApiError, SortOrder};
+    use super::{
+        complete_subscribed_days, parse_optional_expiration_date, wib_day_bounds, ApiError,
+        SortOrder,
+    };
 
     #[test]
     fn subscription_sort_order_defaults_to_ascending() {
@@ -666,6 +776,29 @@ mod tests {
         assert!(matches!(
             parse_optional_expiration_date(Some("31-08-2026".to_string())),
             Err(ApiError::InvalidSimCardExpirationDate)
+        ));
+    }
+
+    #[test]
+    fn converts_wib_date_to_exclusive_utc_bounds() {
+        let (date, start_at, end_at) = wib_day_bounds("2026-07-28").unwrap();
+
+        assert_eq!(date.to_string(), "2026-07-28");
+        assert_eq!(
+            start_at,
+            Utc.with_ymd_and_hms(2026, 7, 27, 17, 0, 0).unwrap()
+        );
+        assert_eq!(
+            end_at,
+            Utc.with_ymd_and_hms(2026, 7, 28, 17, 0, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_session_date() {
+        assert!(matches!(
+            wib_day_bounds("28-07-2026"),
+            Err(ApiError::InvalidDate)
         ));
     }
 }
