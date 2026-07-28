@@ -171,6 +171,12 @@ struct DeviceSessionsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct DeviceActivityResponse {
+    imei: String,
+    last_seen_at: String,
+}
+
+#[derive(Debug, Serialize)]
 struct DeviceSessionResponse {
     id: i64,
     started_at: String,
@@ -239,6 +245,7 @@ impl HttpApiServer {
 
         let router = Router::new()
             .route("/api/devices", get(get_devices))
+            .route("/api/devices/{imei}/activity", get(get_device_activity))
             .route("/api/devices/{imei}/sessions", get(get_device_sessions))
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
@@ -518,6 +525,29 @@ fn wib_day_bounds(
     let end_at = start_at + Duration::days(1);
 
     Ok((date, start_at, end_at))
+}
+
+async fn get_device_activity(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+) -> Result<Json<DeviceActivityResponse>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT last_seen_at
+        FROM devices
+        WHERE imei = $1
+        "#,
+    )
+    .bind(&imei)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(ApiError::DeviceNotFound)?;
+    let last_seen_at = row.get::<DateTime<Utc>, _>("last_seen_at");
+
+    Ok(Json(DeviceActivityResponse {
+        imei,
+        last_seen_at: last_seen_at.to_rfc3339(),
+    }))
 }
 
 async fn get_device_sessions(
