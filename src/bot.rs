@@ -1604,14 +1604,8 @@ impl TelegramBot {
 
         match action {
             TheftAlertAction::StreamLocation { .. } => {
-                let latest_location =
-                    fetch_latest_location_for_imei(self.database.pool(), imei).await?;
-                // Live Tracking begins at the newest location received from this device.
-                let start_at = select_stream_location_start_at(
-                    latest_location
-                        .as_ref()
-                        .and_then(|value| value.last_seen_at),
-                );
+                // Use a timestamp from device_locations so the URL always includes a GPS point.
+                let start_at = fetch_latest_location_received_at(self.database.pool(), imei).await?;
                 let live_tracking_link =
                     start_at.and_then(|value| build_live_tracking_link(imei, value));
                 let text = format_stream_location_message(live_tracking_link.as_deref());
@@ -2349,12 +2343,6 @@ fn build_live_tracking_link(imei: &str, start_at: DateTime<Utc>) -> Option<Strin
     let start_at = start_at.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     url.query_pairs_mut().append_pair("start_at", &start_at);
     Some(url.into())
-}
-
-fn select_stream_location_start_at(
-    latest_location_last_seen_at: Option<DateTime<Utc>>,
-) -> Option<DateTime<Utc>> {
-    latest_location_last_seen_at
 }
 
 pub fn format_latest_motor_status_message(
@@ -3832,6 +3820,24 @@ pub async fn fetch_latest_location_for_imei(
     }))
 }
 
+pub async fn fetch_latest_location_received_at(
+    pool: &sqlx::PgPool,
+    imei: &str,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar(
+        r#"
+        SELECT server_received_at
+        FROM device_locations
+        WHERE imei = $1
+        ORDER BY server_received_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn fetch_ride_summary(
     pool: &sqlx::PgPool,
     imei: &str,
@@ -4684,23 +4690,6 @@ mod tests {
             link,
             "https://hearthbeats-client.vercel.app/live-tracking/866221070478388?start_at=2026-04-18T10%3A00%3A00Z&end_at=2026-04-18T11%3A00%3A00Z"
         );
-    }
-
-    #[test]
-    fn selects_stream_location_start_time_from_latest_device_location() {
-        let latest_location_last_seen_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
-
-        let start_at = select_stream_location_start_at(latest_location_last_seen_at);
-
-        assert_eq!(start_at, latest_location_last_seen_at);
-    }
-
-    #[test]
-    fn has_no_stream_location_start_time_without_a_device_location() {
-        let start_at = select_stream_location_start_at(None);
-
-        assert_eq!(start_at, None);
     }
 
     #[test]
@@ -6042,6 +6031,69 @@ mod tests {
         assert!(raw_range_summary.total_distance_km > ride_only_summary.total_distance_km * 10.0);
         assert!((ride_only_summary.average_speed_kph - (expected_distance * 2.0)).abs() < 0.001);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fetches_latest_live_tracking_start_from_location_history(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database_url) = database_url() else {
+            return Ok(());
+        };
+
+        let config = Config::from_pairs([
+            ("DATABASE_URL", database_url.as_str()),
+            ("DATABASE_MAX_CONNECTIONS", "1"),
+        ]);
+        let database = Database::connect(&config)
+            .await?
+            .expect("database configured");
+        let imei = "999888777666558";
+        let location_received_at = Utc.with_ymd_and_hms(2026, 7, 28, 1, 43, 16).unwrap();
+        let later_heartbeat_at = Utc.with_ymd_and_hms(2026, 7, 28, 2, 8, 17).unwrap();
+
+        sqlx::query("DELETE FROM device_locations WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("DELETE FROM devices WHERE imei = $1")
+            .bind(imei)
+            .execute(database.pool())
+            .await?;
+
+        let device_id: i64 = sqlx::query_scalar(
+            r#"
+            INSERT INTO devices (imei, first_seen_at, last_seen_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $2, $3)
+            RETURNING id
+            "#,
+        )
+        .bind(imei)
+        .bind(location_received_at)
+        .bind(later_heartbeat_at)
+        .fetch_one(database.pool())
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO device_locations (
+                device_id, imei, server_received_at, gps_timestamp, protocol_number,
+                packet_family, latitude, longitude, speed_kph, course, course_status,
+                satellite_count, gps_info_length, extra_data_hex, peer_addr
+            )
+            VALUES ($1, $2, $3, $3::timestamp, 18, 'location', -6.204066, 106.785514, 0, 0, 0, 8, 12, '', '127.0.0.1:5000')
+            "#,
+        )
+        .bind(device_id)
+        .bind(imei)
+        .bind(location_received_at)
+        .execute(database.pool())
+        .await?;
+
+        let start_at = fetch_latest_location_received_at(database.pool(), imei).await?;
+
+        assert_eq!(start_at, Some(location_received_at));
+        assert_ne!(start_at, Some(later_heartbeat_at));
         Ok(())
     }
 
