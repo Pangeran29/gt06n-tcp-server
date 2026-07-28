@@ -1606,16 +1606,8 @@ impl TelegramBot {
             TheftAlertAction::StreamLocation { .. } => {
                 let latest_location =
                     fetch_latest_location_for_imei(self.database.pool(), imei).await?;
-                let latest_session_created_at = if session.is_some() {
-                    None
-                } else {
-                    fetch_latest_engine_session_for_imei_chat(self.database.pool(), imei, chat_id)
-                        .await?
-                        .map(|value| value.created_at)
-                };
+                // Live Tracking begins at the newest location received from this device.
                 let start_at = select_stream_location_start_at(
-                    session.as_ref().map(|value| value.created_at),
-                    latest_session_created_at,
                     latest_location
                         .as_ref()
                         .and_then(|value| value.last_seen_at),
@@ -2360,13 +2352,9 @@ fn build_live_tracking_link(imei: &str, start_at: DateTime<Utc>) -> Option<Strin
 }
 
 fn select_stream_location_start_at(
-    explicit_session_created_at: Option<DateTime<Utc>>,
-    latest_session_created_at: Option<DateTime<Utc>>,
     latest_location_last_seen_at: Option<DateTime<Utc>>,
 ) -> Option<DateTime<Utc>> {
-    explicit_session_created_at
-        .or(latest_session_created_at)
-        .or(latest_location_last_seen_at)
+    latest_location_last_seen_at
 }
 
 pub fn format_latest_motor_status_message(
@@ -4699,50 +4687,18 @@ mod tests {
     }
 
     #[test]
-    fn selects_stream_location_start_time_preferring_explicit_session() {
-        let explicit_session_created_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 10, 0, 0).unwrap());
-        let latest_session_created_at = Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
+    fn selects_stream_location_start_time_from_latest_device_location() {
         let latest_location_last_seen_at =
             Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
 
-        let start_at = select_stream_location_start_at(
-            explicit_session_created_at,
-            latest_session_created_at,
-            latest_location_last_seen_at,
-        );
-
-        assert_eq!(start_at, explicit_session_created_at);
-    }
-
-    #[test]
-    fn selects_stream_location_start_time_preferring_latest_session_for_start_menu() {
-        let latest_session_created_at = Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 30, 0).unwrap());
-        let latest_location_last_seen_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
-
-        let start_at = select_stream_location_start_at(
-            None,
-            latest_session_created_at,
-            latest_location_last_seen_at,
-        );
-
-        assert_eq!(start_at, latest_session_created_at);
-    }
-
-    #[test]
-    fn selects_stream_location_start_time_falling_back_to_location_last_seen() {
-        let latest_location_last_seen_at =
-            Some(Utc.with_ymd_and_hms(2026, 4, 18, 9, 45, 0).unwrap());
-
-        let start_at = select_stream_location_start_at(None, None, latest_location_last_seen_at);
+        let start_at = select_stream_location_start_at(latest_location_last_seen_at);
 
         assert_eq!(start_at, latest_location_last_seen_at);
     }
 
     #[test]
-    fn selects_stream_location_start_time_none_when_all_sources_missing() {
-        let start_at = select_stream_location_start_at(None, None, None);
+    fn has_no_stream_location_start_time_without_a_device_location() {
+        let start_at = select_stream_location_start_at(None);
 
         assert_eq!(start_at, None);
     }
