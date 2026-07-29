@@ -295,6 +295,10 @@ impl HttpApiServer {
             )
             .route("/api/devices/{imei}/service", get(get_device_service))
             .route("/api/devices/{imei}/sessions", get(get_device_sessions))
+            .route(
+                "/api/devices/{imei}/locations/latest",
+                get(get_device_latest_location),
+            )
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
             .route(
@@ -1003,6 +1007,52 @@ async fn get_device_locations(
         start_at: start_at.to_rfc3339(),
         latest_server_received_at,
         points,
+    }))
+}
+
+async fn get_device_latest_location(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+) -> Result<Json<LocationHistoryResponse>, ApiError> {
+    let row = sqlx::query(
+        r#"
+        SELECT server_received_at, gps_timestamp, latitude, longitude, speed_kph, course, satellite_count
+        FROM device_locations
+        WHERE imei = $1
+        ORDER BY server_received_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&imei)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let point = row.map(|row| LocationPoint {
+        server_received_at: row
+            .get::<DateTime<Utc>, _>("server_received_at")
+            .to_rfc3339(),
+        gps_timestamp: row
+            .get::<chrono::NaiveDateTime, _>("gps_timestamp")
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string(),
+        latitude: row.get("latitude"),
+        longitude: row.get("longitude"),
+        speed_kph: row.get("speed_kph"),
+        course: row.get("course"),
+        satellite_count: row.get("satellite_count"),
+    });
+    let latest_server_received_at = point
+        .as_ref()
+        .map(|location| location.server_received_at.clone());
+    let start_at = latest_server_received_at
+        .clone()
+        .unwrap_or_else(|| Utc::now().to_rfc3339());
+
+    Ok(Json(LocationHistoryResponse {
+        imei,
+        start_at,
+        latest_server_received_at,
+        points: point.into_iter().collect(),
     }))
 }
 
