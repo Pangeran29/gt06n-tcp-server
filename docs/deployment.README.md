@@ -22,10 +22,17 @@ cd /root/gt06n-tcp-server
 git pull
 cargo build --release
 
+sudo systemctl stop gt06n.service
+./target/release/service_distance_backfill
+
 sudo systemctl restart gt06n.service
 sudo systemctl restart gt06n-telegram-bot.service
 sudo systemctl restart gt06n-http-api.service
 ```
+
+`service_distance_backfill` is idempotent. Run it after migrations are available
+and while TCP ingestion is stopped so existing GPS history and live updates
+cannot race.
 
 If you want the reminder/sanction job to run immediately after deploy:
 

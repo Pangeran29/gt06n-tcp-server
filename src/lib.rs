@@ -6,5 +6,6 @@ pub mod events;
 pub mod midtrans;
 pub mod protocol;
 pub mod server;
+pub mod service_distance;
 pub mod subscription_maintenance;
 pub mod telegram_messages;

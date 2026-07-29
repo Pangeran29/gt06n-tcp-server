@@ -190,6 +190,35 @@ struct DeviceActivityResponse {
     battery_reported_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ServiceRecommendationResponse {
+    code: &'static str,
+    interval_km: i64,
+    title: &'static str,
+    items: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ServiceMilestoneResponse {
+    milestone_number: i64,
+    milestone_km: i64,
+    achieved_on: String,
+    recommendation_code: &'static str,
+    recommendation_label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceServiceResponse {
+    imei: String,
+    timezone: &'static str,
+    generated_at: String,
+    total_tracked_distance_km: f64,
+    next_milestone_km: i64,
+    distance_remaining_km: f64,
+    next_recommendation: ServiceRecommendationResponse,
+    milestones: Vec<ServiceMilestoneResponse>,
+}
+
 #[derive(Debug, Serialize)]
 struct DeviceSessionResponse {
     id: i64,
@@ -264,6 +293,7 @@ impl HttpApiServer {
                 "/api/devices/{imei}/daily-summary",
                 get(get_device_daily_summary),
             )
+            .route("/api/devices/{imei}/service", get(get_device_service))
             .route("/api/devices/{imei}/sessions", get(get_device_sessions))
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
@@ -650,6 +680,71 @@ async fn get_device_daily_summary(
     }))
 }
 
+async fn get_device_service(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+) -> Result<Json<DeviceServiceResponse>, ApiError> {
+    let device_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM devices WHERE imei = $1)")
+            .bind(&imei)
+            .fetch_one(&state.pool)
+            .await?;
+    if !device_exists {
+        return Err(ApiError::DeviceNotFound);
+    }
+
+    let total_distance_meters = sqlx::query_scalar::<_, f64>(
+        r#"
+        SELECT total_distance_meters
+        FROM device_distance_odometer
+        WHERE imei = $1
+        "#,
+    )
+    .bind(&imei)
+    .fetch_optional(&state.pool)
+    .await?
+    .unwrap_or(0.0)
+    .max(0.0);
+    let daily_rows = sqlx::query(
+        r#"
+        SELECT distance_date, distance_meters
+        FROM device_distance_daily
+        WHERE imei = $1
+        ORDER BY distance_date ASC
+        "#,
+    )
+    .bind(&imei)
+    .fetch_all(&state.pool)
+    .await?;
+    let daily_distances = daily_rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.get::<NaiveDate, _>("distance_date"),
+                row.get::<f64, _>("distance_meters").max(0.0),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let total_tracked_distance_km = total_distance_meters / 1000.0;
+    let completed_milestones = (total_tracked_distance_km / 1000.0).floor() as i64;
+    let next_milestone_number = completed_milestones + 1;
+    let next_milestone_km = next_milestone_number * 1000;
+    let distance_remaining_km =
+        (next_milestone_km as f64 - total_tracked_distance_km).max(0.0);
+
+    Ok(Json(DeviceServiceResponse {
+        imei,
+        timezone: "Asia/Jakarta",
+        generated_at: Utc::now().to_rfc3339(),
+        total_tracked_distance_km,
+        next_milestone_km,
+        distance_remaining_km,
+        next_recommendation: service_recommendation(next_milestone_km),
+        milestones: build_service_milestones(&daily_distances, completed_milestones),
+    }))
+}
+
 async fn get_device_sessions(
     State(state): State<Arc<AppState>>,
     Path(imei): Path<String>,
@@ -708,6 +803,143 @@ async fn get_device_sessions(
         timezone: "Asia/Jakarta",
         sessions,
     }))
+}
+
+fn build_service_milestones(
+    daily_distances: &[(NaiveDate, f64)],
+    completed_milestones: i64,
+) -> Vec<ServiceMilestoneResponse> {
+    let mut cumulative_km = 0.0;
+    let mut next_milestone_number = 1_i64;
+    let mut milestones = Vec::new();
+
+    for (date, distance_meters) in daily_distances {
+        cumulative_km += distance_meters / 1000.0;
+
+        while next_milestone_number <= completed_milestones
+            && cumulative_km + f64::EPSILON >= (next_milestone_number * 1000) as f64
+        {
+            let milestone_km = next_milestone_number * 1000;
+            let recommendation = service_recommendation(milestone_km);
+            milestones.push(ServiceMilestoneResponse {
+                milestone_number: next_milestone_number,
+                milestone_km,
+                achieved_on: date.format("%Y-%m-%d").to_string(),
+                recommendation_code: recommendation.code,
+                recommendation_label: format!(
+                    "Rekomendasi interval {} km",
+                    format_km_grouped(recommendation.interval_km)
+                ),
+            });
+            next_milestone_number += 1;
+        }
+    }
+
+    milestones.into_iter().rev().take(20).collect()
+}
+
+fn service_recommendation(milestone_km: i64) -> ServiceRecommendationResponse {
+    if milestone_km % 20_000 == 0 {
+        return ServiceRecommendationResponse {
+            code: "service_20000",
+            interval_km: 20_000,
+            title: "Rekomendasi servis besar 20.000 km",
+            items: vec![
+                "Ganti V-belt (untuk motor matic)",
+                "Ganti roller CVT jika aus (untuk motor matic)",
+                "Ganti coolant (jika menggunakan radiator)",
+                "Ganti filter udara",
+                "Ganti busi",
+                "Cek bearing roda",
+                "Cek shockbreaker",
+                "Cek kompresi mesin",
+                "Cek rantai keteng",
+                "Lakukan pemeriksaan menyeluruh seluruh sistem motor",
+                "Servis besar direkomendasikan pada rentang 20.000–25.000 km",
+            ],
+        };
+    }
+
+    if milestone_km % 10_000 == 0 {
+        return ServiceRecommendationResponse {
+            code: "service_10000",
+            interval_km: 10_000,
+            title: "Rekomendasi servis 10.000 km",
+            items: vec![
+                "Lakukan semua pemeriksaan interval 5.000 km",
+                "Ganti filter udara jika diperlukan",
+                "Ganti busi jika diperlukan",
+                "Ganti minyak rem",
+                "Setel celah klep (valve clearance)",
+                "Servis throttle body atau injektor",
+                "Cek coolant (jika menggunakan radiator)",
+            ],
+        };
+    }
+
+    if milestone_km % 5_000 == 0 {
+        return ServiceRecommendationResponse {
+            code: "service_5000",
+            interval_km: 5_000,
+            title: "Rekomendasi servis 5.000 km",
+            items: vec![
+                "Lakukan semua pemeriksaan interval 3.000 km",
+                "Ganti oli gardan (untuk motor matic)",
+                "Cek V-belt dan roller CVT (untuk motor matic)",
+                "Cek gear dan rantai (untuk motor manual)",
+                "Cek suspensi depan dan belakang",
+                "Cek bearing roda",
+                "Cek sistem kemudi",
+            ],
+        };
+    }
+
+    if milestone_km % 3_000 == 0 {
+        return ServiceRecommendationResponse {
+            code: "service_3000",
+            interval_km: 3_000,
+            title: "Rekomendasi servis 3.000 km",
+            items: vec![
+                "Lakukan semua pemeriksaan interval 1.000 km",
+                "Ganti oli mesin",
+                "Bersihkan filter udara",
+                "Cek busi",
+                "Cek throttle body atau karburator",
+                "Setel rantai (untuk motor manual)",
+                "Cek kampas rem",
+                "Cek baut-baut penting",
+            ],
+        };
+    }
+
+    ServiceRecommendationResponse {
+        code: "service_1000",
+        interval_km: 1_000,
+        title: "Rekomendasi servis 1.000 km",
+        items: vec![
+            "Cek kondisi dan ganti oli mesin sesuai kebutuhan",
+            "Cek tekanan dan kondisi ban",
+            "Cek rem depan dan belakang",
+            "Cek lampu, klakson, dan sein",
+            "Cek aki atau baterai",
+            "Cek kebocoran oli atau cairan",
+            "Cek rantai dan pelumas rantai (untuk motor manual)",
+        ],
+    }
+}
+
+fn format_km_grouped(value: i64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (index, character) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push('.');
+        }
+        grouped.push(character);
+    }
+
+    grouped
 }
 
 async fn get_device_locations(
@@ -851,11 +1083,11 @@ async fn send_telegram_message(
 
 #[cfg(test)]
 mod tests {
-    use chrono::{TimeZone, Utc};
+    use chrono::{NaiveDate, TimeZone, Utc};
 
     use super::{
-        complete_subscribed_days, parse_optional_expiration_date, wib_day_bounds, ApiError,
-        SortOrder,
+        build_service_milestones, complete_subscribed_days, parse_optional_expiration_date,
+        service_recommendation, wib_day_bounds, ApiError, SortOrder,
     };
 
     #[test]
@@ -930,6 +1162,45 @@ mod tests {
             wib_day_bounds("28-07-2026"),
             Err(ApiError::InvalidDate)
         ));
+    }
+
+    #[test]
+    fn service_recommendation_uses_highest_matching_interval() {
+        assert_eq!(service_recommendation(1_000).code, "service_1000");
+        assert_eq!(service_recommendation(3_000).code, "service_3000");
+        assert_eq!(service_recommendation(15_000).code, "service_5000");
+        assert_eq!(service_recommendation(30_000).code, "service_10000");
+        assert_eq!(service_recommendation(40_000).code, "service_20000");
+    }
+
+    #[test]
+    fn service_milestones_use_crossing_date_and_keep_latest_twenty() {
+        let daily = vec![
+            (
+                NaiveDate::from_ymd_opt(2026, 7, 28).unwrap(),
+                2_500_000.0,
+            ),
+            (
+                NaiveDate::from_ymd_opt(2026, 7, 29).unwrap(),
+                22_500_000.0,
+            ),
+        ];
+        let milestones = build_service_milestones(&daily, 25);
+
+        assert_eq!(milestones.len(), 20);
+        assert_eq!(milestones[0].milestone_km, 25_000);
+        assert_eq!(milestones[0].achieved_on, "2026-07-29");
+        assert_eq!(milestones[19].milestone_km, 6_000);
+    }
+
+    #[test]
+    fn service_milestones_are_empty_before_first_threshold() {
+        let daily = vec![(
+            NaiveDate::from_ymd_opt(2026, 7, 29).unwrap(),
+            999_000.0,
+        )];
+
+        assert!(build_service_milestones(&daily, 0).is_empty());
     }
 }
 

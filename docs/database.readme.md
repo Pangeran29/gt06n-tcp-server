@@ -63,6 +63,25 @@ Main fields:
 - `engine_status_guess`
 - `protocol_number`
 
+### `device_distance_odometer`
+
+Current tracked-distance total and processing checkpoint per device.
+
+Business meaning:
+
+- updated transactionally with each persisted GPS location
+- counts only plausible movement segments
+- represents distance observed by Heartbeats, not the motorcycle's physical odometer
+
+### `device_distance_daily`
+
+Accepted tracked distance grouped by WIB calendar date.
+
+Business meaning:
+
+- provides stable dates for each 1.000 km service milestone
+- supports fast service-history responses without scanning raw GPS history
+
 ## Telegram State
 
 ### `telegram_users`

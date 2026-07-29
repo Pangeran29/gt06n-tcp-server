@@ -14,6 +14,7 @@ use crate::protocol::{
     decode_terminal_info_flags, format_bytes_hex, resolve_acc_high, resolve_engine_status_guess,
     EngineStatus, GpsTimestamp,
 };
+use crate::service_distance::{process_location_distance, DistanceLocationPoint};
 
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
@@ -169,13 +170,25 @@ async fn persist_event(pool: &PgPool, event: DeviceEvent) -> Result<(), sqlx::Er
             let device_pk =
                 upsert_device_last_seen(&mut tx, &imei, &peer_addr.to_string(), server_received_at)
                     .await?;
-            insert_location(
+            let location_id = insert_location(
                 &mut tx,
                 device_pk,
                 &imei,
                 &peer_addr.to_string(),
                 server_received_at,
                 &packet,
+            )
+            .await?;
+            process_location_distance(
+                &mut tx,
+                &imei,
+                DistanceLocationPoint {
+                    id: location_id,
+                    server_received_at,
+                    latitude: packet.latitude,
+                    longitude: packet.longitude,
+                    speed_kph: i32::from(packet.speed_kph),
+                },
             )
             .await?;
             update_device_latest_location(
@@ -257,8 +270,8 @@ async fn insert_location(
     peer_addr: &str,
     server_received_at: DateTime<Utc>,
     packet: &crate::protocol::LocationPacket,
-) -> Result<PgQueryResult, sqlx::Error> {
-    sqlx::query(
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query(
         r#"
         INSERT INTO device_locations (
             device_id, imei, server_received_at, gps_timestamp, protocol_number, packet_family,
@@ -266,6 +279,7 @@ async fn insert_location(
             extra_data_hex, peer_addr
         )
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+        RETURNING id
         "#,
     )
     .bind(device_pk)
@@ -283,8 +297,10 @@ async fn insert_location(
     .bind(i32::from(packet.gps_info_length))
     .bind(format_bytes_hex(&packet.extra_data))
     .bind(peer_addr)
-    .execute(&mut **tx)
-    .await
+    .fetch_one(&mut **tx)
+    .await?;
+
+    Ok(row.get("id"))
 }
 
 async fn update_device_latest_location(
