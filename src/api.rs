@@ -171,6 +171,18 @@ struct DeviceSessionsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct DeviceDailySummaryResponse {
+    imei: String,
+    date: String,
+    timezone: &'static str,
+    generated_at: String,
+    customer_name: Option<String>,
+    total_distance_km: f64,
+    riding_seconds: u64,
+    average_speed_kph: f64,
+}
+
+#[derive(Debug, Serialize)]
 struct DeviceActivityResponse {
     imei: String,
     last_seen_at: String,
@@ -248,6 +260,10 @@ impl HttpApiServer {
         let router = Router::new()
             .route("/api/devices", get(get_devices))
             .route("/api/devices/{imei}/activity", get(get_device_activity))
+            .route(
+                "/api/devices/{imei}/daily-summary",
+                get(get_device_daily_summary),
+            )
             .route("/api/devices/{imei}/sessions", get(get_device_sessions))
             .route("/api/devices/{imei}/locations", get(get_device_locations))
             .route("/api/devices/sim-cards", get(get_device_sim_cards))
@@ -553,6 +569,84 @@ async fn get_device_activity(
         last_seen_at: last_seen_at.to_rfc3339(),
         latest_voltage_level,
         battery_reported_at: last_heartbeat_at.map(|value| value.to_rfc3339()),
+    }))
+}
+
+async fn get_device_daily_summary(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+    Query(query): Query<SessionsQuery>,
+) -> Result<Json<DeviceDailySummaryResponse>, ApiError> {
+    let (date, day_start, day_end) = wib_day_bounds(&query.date)?;
+    let now = Utc::now();
+    let effective_day_end = day_end.min(now);
+    let customer_name = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT name
+        FROM customers
+        WHERE imei = $1
+        ORDER BY updated_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(&imei)
+    .fetch_optional(&state.pool)
+    .await?;
+    let rows = sqlx::query(
+        r#"
+        SELECT created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND created_at < $3
+          AND COALESCE(resolved_at, $4) > $2
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(&imei)
+    .bind(day_start)
+    .bind(day_end)
+    .bind(now)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut total_distance_km = 0.0;
+    let mut riding_seconds = 0_u64;
+
+    for row in rows {
+        let started_at = row.get::<DateTime<Utc>, _>("created_at").max(day_start);
+        let ended_at = row
+            .get::<Option<DateTime<Utc>>, _>("resolved_at")
+            .unwrap_or(effective_day_end)
+            .min(effective_day_end);
+
+        if started_at >= ended_at {
+            continue;
+        }
+
+        if let Some(summary) =
+            fetch_ride_summary(&state.pool, &imei, started_at, ended_at).await?
+        {
+            total_distance_km += summary.total_distance_km;
+            riding_seconds += summary.riding_seconds;
+        }
+    }
+
+    let riding_hours = riding_seconds as f64 / 3600.0;
+    let average_speed_kph = if riding_hours > 0.0 {
+        total_distance_km / riding_hours
+    } else {
+        0.0
+    };
+
+    Ok(Json(DeviceDailySummaryResponse {
+        imei,
+        date: date.format("%Y-%m-%d").to_string(),
+        timezone: "Asia/Jakarta",
+        generated_at: now.to_rfc3339(),
+        customer_name,
+        total_distance_km,
+        riding_seconds,
+        average_speed_kph,
     }))
 }
 
