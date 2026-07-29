@@ -206,6 +206,8 @@ struct ServiceMilestoneResponse {
     achieved_on: String,
     recommendation_code: &'static str,
     recommendation_label: String,
+    recommendation_title: &'static str,
+    recommendation_items: Vec<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -837,6 +839,8 @@ fn build_service_milestones(
                     "Rekomendasi interval {} km",
                     format_km_grouped(recommendation.interval_km)
                 ),
+                recommendation_title: recommendation.title,
+                recommendation_items: recommendation.items,
             });
             next_milestone_number += 1;
         }
