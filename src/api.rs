@@ -186,6 +186,7 @@ struct DeviceDailySummaryResponse {
 struct DeviceActivityResponse {
     imei: String,
     last_seen_at: String,
+    latest_engine_status: Option<String>,
     latest_voltage_level: Option<i32>,
     battery_reported_at: Option<String>,
 }
@@ -585,7 +586,7 @@ async fn get_device_activity(
 ) -> Result<Json<DeviceActivityResponse>, ApiError> {
     let row = sqlx::query(
         r#"
-        SELECT last_seen_at, last_heartbeat_at, latest_voltage_level
+        SELECT last_seen_at, last_heartbeat_at, latest_engine_status_guess, latest_voltage_level
         FROM devices
         WHERE imei = $1
         "#,
@@ -596,11 +597,13 @@ async fn get_device_activity(
     .ok_or(ApiError::DeviceNotFound)?;
     let last_seen_at = row.get::<DateTime<Utc>, _>("last_seen_at");
     let last_heartbeat_at = row.get::<Option<DateTime<Utc>>, _>("last_heartbeat_at");
+    let latest_engine_status = row.get::<Option<String>, _>("latest_engine_status_guess");
     let latest_voltage_level = row.get::<Option<i32>, _>("latest_voltage_level");
 
     Ok(Json(DeviceActivityResponse {
         imei,
         last_seen_at: last_seen_at.to_rfc3339(),
+        latest_engine_status,
         latest_voltage_level,
         battery_reported_at: last_heartbeat_at.map(|value| value.to_rfc3339()),
     }))
