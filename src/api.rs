@@ -45,6 +45,12 @@ pub enum ApiError {
     InvalidSortOrder,
     #[error("invalid sim_card_expiration_date; expected YYYY-MM-DD or null")]
     InvalidSimCardExpirationDate,
+    #[error("invalid fuel calibration: {0}")]
+    InvalidFuelCalibration(String),
+    #[error("an active fuel calibration already exists")]
+    FuelCalibrationAlreadyActive,
+    #[error("active fuel calibration not found")]
+    FuelCalibrationNotFound,
     #[error("device not found")]
     DeviceNotFound,
     #[error("database query failed: {0}")]
@@ -67,9 +73,11 @@ impl IntoResponse for ApiError {
             | Self::InvalidDate
             | Self::InvalidSortOrder
             | Self::InvalidSimCardExpirationDate
+            | Self::InvalidFuelCalibration(_)
             | Self::InvalidMidtransSignature
             | Self::UnsupportedMidtransStatus => StatusCode::BAD_REQUEST,
-            Self::DeviceNotFound => StatusCode::NOT_FOUND,
+            Self::DeviceNotFound | Self::FuelCalibrationNotFound => StatusCode::NOT_FOUND,
+            Self::FuelCalibrationAlreadyActive => StatusCode::CONFLICT,
             Self::MissingDatabase | Self::MissingMidtransServerKey => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
@@ -222,6 +230,63 @@ struct DeviceServiceResponse {
     milestones: Vec<ServiceMilestoneResponse>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StartFuelCalibrationRequest {
+    fuel_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteFuelCalibrationRequest {
+    liters: f64,
+    total_cost_idr: Option<i64>,
+    fuel_type: Option<String>,
+    tank_full: bool,
+    no_missed_refuels: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FuelCalibrationProgressResponse {
+    id: i64,
+    started_at: String,
+    start_distance_km: f64,
+    current_distance_km: f64,
+    distance_traveled_km: f64,
+    riding_seconds: u64,
+    engine_on_seconds: i64,
+    trip_count: i64,
+    elapsed_days: i64,
+    fuel_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FuelCalibrationResultResponse {
+    id: i64,
+    started_at: String,
+    completed_at: String,
+    start_distance_km: f64,
+    end_distance_km: f64,
+    distance_traveled_km: f64,
+    liters: f64,
+    total_cost_idr: Option<i64>,
+    fuel_type: Option<String>,
+    efficiency_km_per_liter: f64,
+    cost_per_km_idr: Option<f64>,
+    riding_seconds: u64,
+    engine_on_seconds: i64,
+    trip_count: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceFuelCalibrationResponse {
+    imei: String,
+    timezone: &'static str,
+    generated_at: String,
+    state: &'static str,
+    active_calibration: Option<FuelCalibrationProgressResponse>,
+    latest_result: Option<FuelCalibrationResultResponse>,
+    history: Vec<FuelCalibrationResultResponse>,
+}
+
 #[derive(Debug, Serialize)]
 struct DeviceSessionResponse {
     id: i64,
@@ -297,6 +362,18 @@ impl HttpApiServer {
                 get(get_device_daily_summary),
             )
             .route("/api/devices/{imei}/service", get(get_device_service))
+            .route(
+                "/api/devices/{imei}/fuel-calibrations",
+                get(get_device_fuel_calibrations).post(start_fuel_calibration),
+            )
+            .route(
+                "/api/devices/{imei}/fuel-calibrations/restart",
+                post(restart_fuel_calibration),
+            )
+            .route(
+                "/api/devices/{imei}/fuel-calibrations/{calibration_id}/complete",
+                post(complete_fuel_calibration),
+            )
             .route("/api/devices/{imei}/sessions", get(get_device_sessions))
             .route(
                 "/api/devices/{imei}/locations/latest",
@@ -754,6 +831,471 @@ async fn get_device_service(
     }))
 }
 
+async fn get_device_fuel_calibrations(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+) -> Result<Json<DeviceFuelCalibrationResponse>, ApiError> {
+    Ok(Json(
+        load_device_fuel_calibrations(&state.pool, &imei).await?,
+    ))
+}
+
+async fn start_fuel_calibration(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+    Json(request): Json<StartFuelCalibrationRequest>,
+) -> Result<(StatusCode, Json<DeviceFuelCalibrationResponse>), ApiError> {
+    let fuel_type = normalize_optional_fuel_type(request.fuel_type)?;
+    let now = Utc::now();
+    let mut tx = state.pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&imei)
+        .execute(&mut *tx)
+        .await?;
+
+    let device_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM devices WHERE imei = $1)")
+            .bind(&imei)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !device_exists {
+        return Err(ApiError::DeviceNotFound);
+    }
+
+    let active_exists = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM fuel_calibrations WHERE imei = $1 AND status = 'active'
+        )",
+    )
+    .bind(&imei)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_exists {
+        return Err(ApiError::FuelCalibrationAlreadyActive);
+    }
+
+    let start_distance_meters = current_tracked_distance_meters(&mut tx, &imei).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO fuel_calibrations (
+            imei, status, started_at, start_distance_meters, fuel_type,
+            created_at, updated_at
+        )
+        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+        "#,
+    )
+    .bind(&imei)
+    .bind(now)
+    .bind(start_distance_meters)
+    .bind(fuel_type)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(load_device_fuel_calibrations(&state.pool, &imei).await?),
+    ))
+}
+
+async fn restart_fuel_calibration(
+    State(state): State<Arc<AppState>>,
+    Path(imei): Path<String>,
+    Json(request): Json<StartFuelCalibrationRequest>,
+) -> Result<(StatusCode, Json<DeviceFuelCalibrationResponse>), ApiError> {
+    let fuel_type = normalize_optional_fuel_type(request.fuel_type)?;
+    let now = Utc::now();
+    let mut tx = state.pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&imei)
+        .execute(&mut *tx)
+        .await?;
+
+    let device_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM devices WHERE imei = $1)")
+            .bind(&imei)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !device_exists {
+        return Err(ApiError::DeviceNotFound);
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE fuel_calibrations
+        SET status = 'invalidated', updated_at = NOW()
+        WHERE imei = $1 AND status = 'active'
+        "#,
+    )
+    .bind(&imei)
+    .execute(&mut *tx)
+    .await?;
+
+    let start_distance_meters = current_tracked_distance_meters(&mut tx, &imei).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO fuel_calibrations (
+            imei, status, started_at, start_distance_meters, fuel_type,
+            created_at, updated_at
+        )
+        VALUES ($1, 'active', $2, $3, $4, NOW(), NOW())
+        "#,
+    )
+    .bind(&imei)
+    .bind(now)
+    .bind(start_distance_meters)
+    .bind(fuel_type)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(load_device_fuel_calibrations(&state.pool, &imei).await?),
+    ))
+}
+
+async fn complete_fuel_calibration(
+    State(state): State<Arc<AppState>>,
+    Path((imei, calibration_id)): Path<(String, i64)>,
+    Json(request): Json<CompleteFuelCalibrationRequest>,
+) -> Result<Json<DeviceFuelCalibrationResponse>, ApiError> {
+    validate_complete_fuel_calibration(&request)?;
+    let fuel_type = normalize_optional_fuel_type(request.fuel_type)?;
+    let completed_at = Utc::now();
+    let mut tx = state.pool.begin().await?;
+
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        .bind(&imei)
+        .execute(&mut *tx)
+        .await?;
+
+    let calibration = sqlx::query(
+        r#"
+        SELECT started_at, start_distance_meters, fuel_type
+        FROM fuel_calibrations
+        WHERE id = $1 AND imei = $2 AND status = 'active'
+        FOR UPDATE
+        "#,
+    )
+    .bind(calibration_id)
+    .bind(&imei)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(ApiError::FuelCalibrationNotFound)?;
+    let started_at = calibration.get::<DateTime<Utc>, _>("started_at");
+    let start_distance_meters = calibration.get::<f64, _>("start_distance_meters");
+    let original_fuel_type = calibration.get::<Option<String>, _>("fuel_type");
+    let end_distance_meters = current_tracked_distance_meters(&mut tx, &imei).await?;
+    let distance_meters = (end_distance_meters - start_distance_meters).max(0.0);
+    let metrics =
+        fetch_fuel_window_metrics(&state.pool, &imei, started_at, completed_at).await?;
+
+    sqlx::query(
+        r#"
+        UPDATE fuel_calibrations
+        SET status = 'completed',
+            completed_at = $3,
+            end_distance_meters = $4,
+            distance_meters = $5,
+            liters = $6,
+            total_cost_idr = $7,
+            fuel_type = $8,
+            riding_seconds = $9,
+            engine_on_seconds = $10,
+            trip_count = $11,
+            updated_at = NOW()
+        WHERE id = $1 AND imei = $2
+        "#,
+    )
+    .bind(calibration_id)
+    .bind(&imei)
+    .bind(completed_at)
+    .bind(end_distance_meters)
+    .bind(distance_meters)
+    .bind(request.liters)
+    .bind(request.total_cost_idr)
+    .bind(fuel_type.or(original_fuel_type))
+    .bind(i64::try_from(metrics.riding_seconds).unwrap_or(i64::MAX))
+    .bind(metrics.engine_on_seconds)
+    .bind(metrics.trip_count)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    Ok(Json(
+        load_device_fuel_calibrations(&state.pool, &imei).await?,
+    ))
+}
+
+async fn load_device_fuel_calibrations(
+    pool: &sqlx::PgPool,
+    imei: &str,
+) -> Result<DeviceFuelCalibrationResponse, ApiError> {
+    let device_exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM devices WHERE imei = $1)")
+            .bind(imei)
+            .fetch_one(pool)
+            .await?;
+    if !device_exists {
+        return Err(ApiError::DeviceNotFound);
+    }
+
+    let now = Utc::now();
+    let active_row = sqlx::query(
+        r#"
+        SELECT id, started_at, start_distance_meters, fuel_type
+        FROM fuel_calibrations
+        WHERE imei = $1 AND status = 'active'
+        ORDER BY id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(imei)
+    .fetch_optional(pool)
+    .await?;
+    let active_calibration = if let Some(row) = active_row {
+        let id = row.get::<i64, _>("id");
+        let started_at = row.get::<DateTime<Utc>, _>("started_at");
+        let start_distance_meters = row.get::<f64, _>("start_distance_meters");
+        let current_distance_meters = sqlx::query_scalar::<_, f64>(
+            "SELECT total_distance_meters FROM device_distance_odometer WHERE imei = $1",
+        )
+        .bind(imei)
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(0.0)
+        .max(0.0);
+        let metrics = fetch_fuel_window_metrics(pool, imei, started_at, now).await?;
+        let elapsed_seconds = now
+            .signed_duration_since(started_at)
+            .num_seconds()
+            .max(0);
+
+        Some(FuelCalibrationProgressResponse {
+            id,
+            started_at: started_at.to_rfc3339(),
+            start_distance_km: start_distance_meters / 1000.0,
+            current_distance_km: current_distance_meters / 1000.0,
+            distance_traveled_km: (current_distance_meters - start_distance_meters).max(0.0)
+                / 1000.0,
+            riding_seconds: metrics.riding_seconds,
+            engine_on_seconds: metrics.engine_on_seconds,
+            trip_count: metrics.trip_count,
+            elapsed_days: if elapsed_seconds == 0 {
+                0
+            } else {
+                (elapsed_seconds + 86_399) / 86_400
+            },
+            fuel_type: row.get("fuel_type"),
+        })
+    } else {
+        None
+    };
+
+    let result_rows = sqlx::query(
+        r#"
+        SELECT id, started_at, completed_at, start_distance_meters,
+               end_distance_meters, distance_meters, liters, total_cost_idr,
+               fuel_type, riding_seconds, engine_on_seconds, trip_count
+        FROM fuel_calibrations
+        WHERE imei = $1 AND status = 'completed'
+        ORDER BY completed_at DESC, id DESC
+        LIMIT 20
+        "#,
+    )
+    .bind(imei)
+    .fetch_all(pool)
+    .await?;
+    let history = result_rows
+        .into_iter()
+        .map(fuel_calibration_result_from_row)
+        .collect::<Vec<_>>();
+    let latest_result = history.first().map(clone_fuel_calibration_result);
+    let state = if active_calibration.is_some() {
+        "active"
+    } else if latest_result.is_some() {
+        "completed"
+    } else {
+        "not_started"
+    };
+
+    Ok(DeviceFuelCalibrationResponse {
+        imei: imei.to_string(),
+        timezone: "Asia/Jakarta",
+        generated_at: now.to_rfc3339(),
+        state,
+        active_calibration,
+        latest_result,
+        history,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FuelWindowMetrics {
+    riding_seconds: u64,
+    engine_on_seconds: i64,
+    trip_count: i64,
+}
+
+async fn fetch_fuel_window_metrics(
+    pool: &sqlx::PgPool,
+    imei: &str,
+    started_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
+) -> Result<FuelWindowMetrics, ApiError> {
+    let riding_seconds = fetch_ride_summary(pool, imei, started_at, ended_at)
+        .await?
+        .map(|summary| summary.riding_seconds)
+        .unwrap_or(0);
+    let rows = sqlx::query(
+        r#"
+        SELECT created_at, resolved_at
+        FROM telegram_engine_sessions
+        WHERE imei = $1
+          AND created_at < $3
+          AND COALESCE(resolved_at, $3) > $2
+        ORDER BY created_at ASC, id ASC
+        "#,
+    )
+    .bind(imei)
+    .bind(started_at)
+    .bind(ended_at)
+    .fetch_all(pool)
+    .await?;
+    let mut engine_on_seconds = 0_i64;
+
+    for row in &rows {
+        let session_start = row.get::<DateTime<Utc>, _>("created_at").max(started_at);
+        let session_end = row
+            .get::<Option<DateTime<Utc>>, _>("resolved_at")
+            .unwrap_or(ended_at)
+            .min(ended_at);
+        engine_on_seconds += session_end
+            .signed_duration_since(session_start)
+            .num_seconds()
+            .max(0);
+    }
+
+    Ok(FuelWindowMetrics {
+        riding_seconds,
+        engine_on_seconds,
+        trip_count: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+    })
+}
+
+async fn current_tracked_distance_meters(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    imei: &str,
+) -> Result<f64, sqlx::Error> {
+    Ok(sqlx::query_scalar::<_, f64>(
+        "SELECT total_distance_meters FROM device_distance_odometer WHERE imei = $1",
+    )
+    .bind(imei)
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(0.0)
+    .max(0.0))
+}
+
+fn normalize_optional_fuel_type(value: Option<String>) -> Result<Option<String>, ApiError> {
+    let value = value.map(|item| item.trim().to_string());
+
+    match value {
+        Some(item) if item.len() > 40 => Err(ApiError::InvalidFuelCalibration(
+            "fuel_type must be at most 40 characters".to_string(),
+        )),
+        Some(item) if item.is_empty() => Ok(None),
+        other => Ok(other),
+    }
+}
+
+fn validate_complete_fuel_calibration(
+    request: &CompleteFuelCalibrationRequest,
+) -> Result<(), ApiError> {
+    if !request.liters.is_finite() || request.liters <= 0.0 || request.liters > 100.0 {
+        return Err(ApiError::InvalidFuelCalibration(
+            "liters must be greater than 0 and at most 100".to_string(),
+        ));
+    }
+    if request.total_cost_idr.is_some_and(|value| value < 0) {
+        return Err(ApiError::InvalidFuelCalibration(
+            "total_cost_idr cannot be negative".to_string(),
+        ));
+    }
+    if !request.tank_full {
+        return Err(ApiError::InvalidFuelCalibration(
+            "the second refuel must fill the tank".to_string(),
+        ));
+    }
+    if !request.no_missed_refuels {
+        return Err(ApiError::InvalidFuelCalibration(
+            "restart calibration when another refuel was missed".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn fuel_calibration_result_from_row(
+    row: sqlx::postgres::PgRow,
+) -> FuelCalibrationResultResponse {
+    let distance_meters = row.get::<f64, _>("distance_meters").max(0.0);
+    let liters = row.get::<f64, _>("liters");
+    let distance_km = distance_meters / 1000.0;
+    let total_cost_idr = row.get::<Option<i64>, _>("total_cost_idr");
+
+    FuelCalibrationResultResponse {
+        id: row.get("id"),
+        started_at: row
+            .get::<DateTime<Utc>, _>("started_at")
+            .to_rfc3339(),
+        completed_at: row
+            .get::<DateTime<Utc>, _>("completed_at")
+            .to_rfc3339(),
+        start_distance_km: row.get::<f64, _>("start_distance_meters") / 1000.0,
+        end_distance_km: row.get::<f64, _>("end_distance_meters") / 1000.0,
+        distance_traveled_km: distance_km,
+        liters,
+        total_cost_idr,
+        fuel_type: row.get("fuel_type"),
+        efficiency_km_per_liter: if liters > 0.0 {
+            distance_km / liters
+        } else {
+            0.0
+        },
+        cost_per_km_idr: total_cost_idr
+            .filter(|_| distance_km > 0.0)
+            .map(|cost| cost as f64 / distance_km),
+        riding_seconds: u64::try_from(row.get::<i64, _>("riding_seconds")).unwrap_or(0),
+        engine_on_seconds: row.get("engine_on_seconds"),
+        trip_count: row.get("trip_count"),
+    }
+}
+
+fn clone_fuel_calibration_result(
+    result: &FuelCalibrationResultResponse,
+) -> FuelCalibrationResultResponse {
+    FuelCalibrationResultResponse {
+        id: result.id,
+        started_at: result.started_at.clone(),
+        completed_at: result.completed_at.clone(),
+        start_distance_km: result.start_distance_km,
+        end_distance_km: result.end_distance_km,
+        distance_traveled_km: result.distance_traveled_km,
+        liters: result.liters,
+        total_cost_idr: result.total_cost_idr,
+        fuel_type: result.fuel_type.clone(),
+        efficiency_km_per_liter: result.efficiency_km_per_liter,
+        cost_per_km_idr: result.cost_per_km_idr,
+        riding_seconds: result.riding_seconds,
+        engine_on_seconds: result.engine_on_seconds,
+        trip_count: result.trip_count,
+    }
+}
+
 async fn get_device_sessions(
     State(state): State<Arc<AppState>>,
     Path(imei): Path<String>,
@@ -1144,7 +1686,8 @@ mod tests {
 
     use super::{
         build_service_milestones, complete_subscribed_days, parse_optional_expiration_date,
-        service_recommendation, wib_day_bounds, ApiError, SortOrder,
+        service_recommendation, validate_complete_fuel_calibration, wib_day_bounds, ApiError,
+        CompleteFuelCalibrationRequest, SortOrder,
     };
 
     #[test]
@@ -1258,6 +1801,46 @@ mod tests {
         )];
 
         assert!(build_service_milestones(&daily, 0).is_empty());
+    }
+
+    #[test]
+    fn validates_complete_full_tank_calibration() {
+        let request = CompleteFuelCalibrationRequest {
+            liters: 6.4,
+            total_cost_idr: Some(89_600),
+            fuel_type: Some("Pertamax".to_string()),
+            tank_full: true,
+            no_missed_refuels: true,
+        };
+
+        assert!(validate_complete_fuel_calibration(&request).is_ok());
+    }
+
+    #[test]
+    fn rejects_incomplete_or_contaminated_calibration() {
+        let missed_refuel = CompleteFuelCalibrationRequest {
+            liters: 6.4,
+            total_cost_idr: None,
+            fuel_type: None,
+            tank_full: true,
+            no_missed_refuels: false,
+        };
+        let invalid_liters = CompleteFuelCalibrationRequest {
+            liters: 0.0,
+            total_cost_idr: None,
+            fuel_type: None,
+            tank_full: true,
+            no_missed_refuels: true,
+        };
+
+        assert!(matches!(
+            validate_complete_fuel_calibration(&missed_refuel),
+            Err(ApiError::InvalidFuelCalibration(_))
+        ));
+        assert!(matches!(
+            validate_complete_fuel_calibration(&invalid_liters),
+            Err(ApiError::InvalidFuelCalibration(_))
+        ));
     }
 }
 
