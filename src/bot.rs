@@ -776,7 +776,8 @@ impl TelegramBot {
             return Ok(message_id);
         }
 
-        self.send_message(chat_id, format_session_finished_message())
+        let session_finished_message_id = self
+            .send_message(chat_id, format_session_finished_message())
             .await?;
         let ride_summary =
             fetch_ride_summary(self.database.pool(), imei, session.created_at, ended_at).await?;
@@ -790,19 +791,29 @@ impl TelegramBot {
             .await?;
         }
 
-        let message_id = self
-            .send_message(
-                chat_id,
-                &format_ride_summary_message(
-                    session,
-                    ended_at,
-                    ride_summary.as_ref(),
-                    latest_location.as_ref(),
-                ),
-            )
-            .await?;
-        set_engine_session_ride_status_message_id(self.database.pool(), session.id, message_id)
-            .await?;
+        let message_id = if should_send_ride_summary(ride_summary.as_ref()) {
+            let message_id = self
+                .send_message(
+                    chat_id,
+                    &format_ride_summary_message(
+                        session,
+                        ended_at,
+                        ride_summary.as_ref(),
+                        latest_location.as_ref(),
+                    ),
+                )
+                .await?;
+            set_engine_session_ride_status_message_id(self.database.pool(), session.id, message_id)
+                .await?;
+            message_id
+        } else {
+            info!(
+                imei = %imei,
+                session_id = session.id,
+                "skipping ride summary because GPS data cannot calculate distance and riding time"
+            );
+            session_finished_message_id
+        };
         resolve_engine_session(self.database.pool(), session.id, "finished").await?;
 
         Ok(message_id)
@@ -2833,6 +2844,10 @@ fn total_riding_seconds(points: &[(DateTime<Utc>, i32)]) -> u64 {
         .sum()
 }
 
+fn should_send_ride_summary(summary: Option<&RideSummary>) -> bool {
+    summary.is_some_and(|summary| summary.total_distance_km > 0.0 && summary.riding_seconds > 0)
+}
+
 fn filter_gps_spike_outliers(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
     if points.len() < 3 {
         return points.to_vec();
@@ -4623,6 +4638,26 @@ mod tests {
     fn computes_haversine_distance() {
         let distance = haversine_distance_km(-6.204066, 106.785514, -6.204500, 106.786000);
         assert!(distance > 0.05);
+    }
+
+    #[test]
+    fn sends_ride_summary_only_when_gps_data_calculates_distance_and_time() {
+        assert!(should_send_ride_summary(Some(&RideSummary {
+            total_distance_km: 0.69,
+            riding_seconds: 276,
+            average_speed_kph: 15.77,
+        })));
+        assert!(!should_send_ride_summary(Some(&RideSummary {
+            total_distance_km: 0.0,
+            riding_seconds: 0,
+            average_speed_kph: 0.0,
+        })));
+        assert!(!should_send_ride_summary(Some(&RideSummary {
+            total_distance_km: 0.69,
+            riding_seconds: 0,
+            average_speed_kph: 0.0,
+        })));
+        assert!(!should_send_ride_summary(None));
     }
 
     #[test]
